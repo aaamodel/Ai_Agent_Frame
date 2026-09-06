@@ -1,0 +1,1403 @@
+================================================================================
+  repo_map.txt - Agent编排层 问题改写 + 意图识别 + 模式决策 改动骨架
+  （基于真实 app/ 目录运行代码校准版，已删除无关 WORKFLOW/legacy 内容）
+================================================================================
+
+【改动背景（真实代码现状）】
+  当前调用链：
+    /chat/with_agent (chat.py:L85)
+      → 直接实例化 AgentOrchestrator
+        → orchestrator.run(user_input, session_id, mode="react")   ← ⚠️ mode 写死 react！
+          → if mode == "plan_execute": _run_plan_execute() else: _run_react()
+            → _run_reflection() (可选)
+  问题：
+    1. 编排模式（react vs plan_execute）目前由调用方传默认值，**完全没有**根据用户
+       问题的复杂度/意图做决策。
+    2. Agent 入口处**没有**跑"问题改写 + 意图识别"流程。
+    3. 根目录 query_intent/ 下的 LLM 改写 + 意图分类（MultiQuestionRewriteService/
+       DefaultIntentClassifier）目前**完全未接入** Agent 编排层。
+    4. app/core/intent/recognizer.py 是关键词规则版 IntentRecognizer，
+       只在非 Agent 的 /chat 接口使用，/chat/with_agent 未使用。
+
+【改动目标】
+  在 /chat/with_agent → AgentOrchestrator.run 之间插入一个 Pipeline：
+    用户原始问题
+      → 问题改写（含子问题拆分+复杂度分析+工具建议）
+      → 意图识别（KB/MCP/系统意图）
+      → 编排模式决策（react vs plan_execute）
+      → 产出 IntentContext(preferred_mode, allowed_tools, slots)
+      → 喂给现有 AgentOrchestrator.run(... , mode=..., intent=IntentContext)
+
+  目标是：不改 ReActAgent / PlannerAgent / ReflectionAgent 三大执行引擎内部实现，
+  只在"入口决策层"补齐能力，对执行层零侵入。
+
+================================================================================
+一、真实类型对齐（避免新增冲突类型）
+================================================================================
+
+✅ 已有类型，直接复用，**不要重复定义**：
+  - 模式枚举：app/models/enums.py 的 AgentMode("react", "plan_execute")
+  - 模式 Literal：app/core/agent/orchestrator.py:L28 OrchestrationMode
+  - 意图上下文：app/core/agent/orchestrator.py:L54 IntentContext
+      ├─ intent: str
+      ├─ confidence: float
+      ├─ slots: Dict[str, Any]
+      ├─ preferred_mode: Optional[OrchestrationMode]  ← ✅ 这是我们的写入目标
+      └─ allowed_tools: Optional[List[str]]            ← ✅ 可由改写阶段的工具建议填充
+  - 编排器最终输出：AgentResponse(mode_used, intent, steps, reflection, degraded)
+
+❌ 原骨架中定义的，确认**不需要**（已从本骨架移除）：
+  - OrchestrationExecutionMode 枚举（重复定义，用 AgentMode 或 Literal 即可）
+  - WORKFLOW_FALLBACK 模式（项目无 WORKFLOW 层）
+  - legacy_* 兼容字段（没有老链路要兼容）
+  - guidance_decision 嵌入 OrchestrationDecision（歧义澄清在 RAG 工具内部处理，
+    不阻塞模式决策）
+
+================================================================================
+二、Python 文件改动清单（按推荐实现顺序编号）
+================================================================================
+
+--------------------------------------------------------------------------------
+① rag_constant.py  —— 常量（【待补充-①】）
+  对标文件：自身
+  现状：只有 RAG 相关常量 + 3 条 prompt path
+--------------------------------------------------------------------------------
+
+```python
+# ===== 原有常量（保持不变） =====
+INTENT_MIN_SCORE: float = 0.35
+MAX_INTENT_COUNT: int = 3
+INTENT_CLASSIFIER_PROMPT_PATH: str = "query_intent/prompts/intent-classifier.st"
+QUERY_REWRITE_AND_SPLIT_PROMPT_PATH: str = "query_intent/prompts/user-question-rewrite.st"
+GUIDANCE_PROMPT_PATH: str = "query_intent/prompts/guidance-prompt.st"
+GUIDANCE_AMBIGUITY_CHECK_PROMPT_PATH: str = "query_intent/prompts/guidance-ambiguity-check.st"
+
+# ===== 【待补充-①】新增 Agent 编排模式决策常量 =====
+# Agent 改写 + 复杂度分析 prompt 路径
+AGENT_QUESTION_REWRITE_PROMPT_PATH: str = (
+    "query_intent/prompts/agent-question-rewrite.st"      # 新增 prompt 文件
+)
+# 模式决策（react vs plan_execute）prompt 路径
+ORCHESTRATION_MODE_DECIDER_PROMPT_PATH: str = (
+    "query_intent/prompts/orchestration-mode-decider.st"   # 新增 prompt 文件
+)
+# 模式决策阈值（规则判断用，低于阈值不切 plan）
+MODE_DECISION_STEP_THRESHOLD: int = 3     # 预估步骤 >= 3 → 倾向 plan_execute
+MODE_DECISION_TOOL_THRESHOLD: int = 2     # 预估工具调用 >= 2 → 倾向 plan_execute
+MODE_DECISION_DEFAULT: str = "react"      # 所有规则/LLM都无法判断时的保守默认
+
+# ===== 【待补充-①-B】真实 ToolRegistry 工具清单（已从 bootstrap_tools 核验）=====
+# 用途 1：Pipeline 在填充 allowed_tools 时做白名单过滤的对照参考；
+# 用途 2：Prompt P2(agent-question-rewrite.st) 中示例 suggested_tools 字面量必须从此集合取；
+# 用途 3：orchestrator L125 已声明的 3 个"原子基础设施工具"兜底集与此处完全一致，无需再改 orchestrator。
+#
+# 【线上实际启用】（当前 init_tools.bootstrap_tools() 未被注释掉的 registry.register）：
+#   - 本地数据：local_excel_tool / feishu_bitable_tool
+#   - 检索类：  rag_knowledge_search  （Milvus 向量知识库精准检索）
+#              knowledge_graph_search （LightRAG 全局图谱/跨文档关系检索）
+#              web_search             （Tavily 互联网公开信息检索）
+#   - 编排辅助：write_todos          （Agent 任务待办规划工具，见 todo_list.py:L40）
+#   - 原子基础设施（Pipeline 不建议移除；orchestrator 也会自动补回）：
+#              file_read_tool / file_list_tool / file_grep_tool
+#
+# 【已声明但当前未启用】（init_tools.py 中 registry.register 被注释）：
+#   - calculator / list_tables / describe_table / database_query
+#     → 不要在 Prompt 示例中出现，也不要作为 Pipeline 白名单的默认项。
+#
+# 【原子基础设施兜底集合（与 orchestrator.py:L125 对齐）】：
+PIPELINE_INFRASTRUCTURE_TOOL_SET: list[str] = [
+    "file_read_tool",
+    "file_list_tool",
+    "file_grep_tool",
+]
+```
+
+================================================================================
+② intent_data_base.py  —— 基础枚举/请求模型（【待补充-②】）
+  对标文件：自身
+  现状：IntentKind / IntentLevel / IntentChoiceTier / ChatRequest
+  注意：不要新增 OrchestrationExecutionMode，复用 AgentMode / Literal
+--------------------------------------------------------------------------------
+
+```python
+# ===== 原有枚举（保持不变） =====
+class IntentKind(Enum):
+    KB = 0
+    SYSTEM = 1
+    MCP = 2
+    # 【疑问-A】要不要新增一种 kind 用于"非 RAG/MCP 的纯 Agent 任务"？
+    # 推荐：不新增，把这类情况交给后续 ModeDecider 根据复杂度判断，
+    #       而不是靠意图节点 kind 来识别。侵入更小。
+
+class IntentLevel(Enum):
+    DOMAIN = 0
+    CATEGORY = 1
+    TOPIC = 2
+
+class IntentChoiceTier(Enum):
+    FAST = "FAST"
+    DEFAULT = "DEFAULT"
+
+# ===== 原有数据类（保持不变） =====
+@dataclass
+class IntentChatMessage: ...
+@dataclass
+class IntentChatRequest: ...
+class ChatRequestBuilder: ...
+@dataclass
+class IntentResult: ...
+@dataclass
+class IntentPage: ...
+
+# ===== 【待补充-②】新增：Agent 编排层上下文（传给改写和意图识别） =====
+@dataclass
+class AgentChatContext:
+    """
+    Agent 编排层在调用改写和意图识别时，透传给 Pipeline 的附加信息。
+    与 orchestrator.py:IntentContext 不同——那是编排器内部的"意图识别结果容器"，
+    这个是"调用入口传给 Pipeline 的入参"。
+    """
+    available_tool_ids: Optional[List[str]] = None
+        # 来自 ToolRegistry.list_tool_names() —— 供改写阶段工具建议做匹配
+    session_id: Optional[str] = None
+        # 会话 ID，供后续接入短期记忆做指代消解（可选）
+    max_plan_steps: Optional[int] = None
+        # 允许的最大计划步骤，后续传给 Planner（可选）
+
+# ===== 【待补充-②】新增：模式决策结果类型（和下游类型字符串对齐） =====
+#   直接用下面的字面量字符串，不新造枚举：
+#   OrchestrationMode = Literal["react", "plan_execute"]
+#   （定义在 orchestrator.py:L28，这里不重复 import 以免循环依赖）
+```
+
+================================================================================
+③ intent_dto.py  —— DTO（【待补充-③】）
+  对标文件：自身
+  现状：IntentCandidate / Status / RecommendedQuestionsPayload /
+        IntentGroup / SubQuestionIntent
+--------------------------------------------------------------------------------
+
+```python
+# ===== 原有 DTO（保持不变） =====
+@dataclass
+class IntentCandidate: ...
+class Status(Enum): ...
+@dataclass
+class RecommendedQuestionsPayload: ...
+@dataclass
+class IntentGroup:
+    mcp_intents: list[NodeScore] = field(default_factory=list)
+    kb_intents: list[NodeScore] = field(default_factory=list)
+@dataclass
+class SubQuestionIntent:
+    sub_question: str = ""
+    node_scores: list[NodeScore] = field(default_factory=list)
+
+# ===== 【待补充-③-1】复杂度分析 DTO =====
+@dataclass
+class TaskComplexityAnalysis:
+    """由 Agent 改写阶段 LLM 输出的结构化任务复杂度评估"""
+    estimated_steps: int = 1                        # 预估解决该问题所需步骤数
+    estimated_tool_calls: int = 0                   # 预估工具调用次数
+    has_multi_step_dependency: bool = False         # 是否存在 A→B 先后依赖
+    has_external_data_dependency: bool = False      # 是否需要调用外部工具/数据源
+    need_creative_output: bool = False              # 是否需要方案/写作类创造输出
+    reasoning_notes: Optional[str] = None           # 判断理由（仅日志/trace 用）
+
+# ===== 【待补充-③-2】Agent 改写结果 DTO =====
+@dataclass
+class AgentRewriteResult:
+    """Agent 级改写输出，比 RAG 层 RewriteResult 多了复杂度与工具建议"""
+    rewritten_question: str = ""
+    sub_questions: list[str] = field(default_factory=list)
+    complexity: Optional[TaskComplexityAnalysis] = None
+    suggested_tools: list[str] = field(default_factory=list)
+        # 建议使用的工具 ID（和 ToolRegistry 返回的名称一致，可直接给 allowed_tools）
+    explicit_plan_hint: Optional[str] = None
+        # 用户问题中抽取的显式步骤提示（如"先查A再对比B"），命中则强制 plan_execute
+
+# ===== 【待补充-③-3】Agent 意图聚合 DTO =====
+@dataclass
+class AgentIntents:
+    """对 SubQuestionIntent 列表做聚合后的高层意图信息"""
+    kb_intents: list[NodeScore] = field(default_factory=list)
+    mcp_intents: list[NodeScore] = field(default_factory=list)
+    system_intents: list[NodeScore] = field(default_factory=list)
+    # 主意图标签：给 IntentContext.intent 字段填值（如 "问答/知识问答"、"任务/搜索" 等）
+    primary_intent_label: str = "general"
+    # 主意图置信度
+    primary_confidence: float = 0.0
+    # 命中的槽位（数字、时间范围、实体等，后续可以扩展）
+    slots: Dict[str, Any] = field(default_factory=dict)
+
+# ===== 【待补充-③-4】模式决策结果 DTO =====
+@dataclass
+class ModeDecision:
+    """编排模式决策最终结果，可直接映射为 IntentContext.preferred_mode"""
+    mode: Literal["react", "plan_execute"]   # 注意字面量和 orchestrator.py 保持一致
+    confidence: float = 0.0
+    reason: str = ""
+    # 可选：计划执行模式的初始步骤建议（传给 Planner 当 hint）
+    initial_plan_hint: Optional[str] = None
+    # 可选：ReAct 模式推荐的第一个工具名
+    first_tool_hint: Optional[str] = None
+
+# ===== 【待补充-③-5】Pipeline 最终输出 =====
+@dataclass
+class AgentQueryIntentPipelineOutput:
+    """
+    Pipeline 的最终返回值——可直接对接 AgentOrchestrator.run 的参数：
+      mode  → 直接传 orchestrator.run(mode=...)
+      intent → 直接传 orchestrator.run(intent=build_intent_context(pipeline_output))
+    """
+    # 1) 改写结果（也可回写短期记忆/追踪用）
+    rewrite: AgentRewriteResult
+    # 2) 意图结果（生成 IntentContext 填充值）
+    intents: AgentIntents
+    # 3) 模式决策（生成 preferred_mode）
+    mode_decision: ModeDecision
+    # 4) 每个子问题的原始意图明细（追踪/日志用）
+    sub_intents: list[SubQuestionIntent] = field(default_factory=list)
+```
+
+================================================================================
+④ rewrite/query_rewrite.py  —— 改写抽象（【待补充-④】）
+  对标文件：自身
+  对标类：RewriteResult / QueryRewriteService / QueryTermMappingService
+--------------------------------------------------------------------------------
+
+```python
+# ===== 原有类（全部保持不变）=====
+@dataclass
+class RewriteResult: ...
+class QueryTermMappingUtil: ...
+@dataclass
+class QueryTermMappingCacheManager: ...
+@dataclass
+class QueryTermMappingService: ...
+class QueryRewriteService(ABC):  # RAG 层改写抽象
+    @abstractmethod
+    def rewrite(self, user_question: str) -> str: ...
+    def rewrite_with_split(self, user_question, history=None) -> RewriteResult: ...
+
+# ===== 【待补充-④】新增 Agent 改写抽象（独立抽象，不破坏 RAG 路径） =====
+class AgentQueryRewriteService(ABC):
+    """Agent 级改写服务：输出 AgentRewriteResult（含复杂度+工具建议）"""
+    @abstractmethod
+    def agent_rewrite(
+        self,
+        user_question: str,
+        history: Optional[List[IntentChatMessage]] = None,
+        agent_context: Optional[AgentChatContext] = None,
+    ) -> AgentRewriteResult:
+        """【待补充-④ 核心方法】待后续实现"""
+        ...
+```
+
+================================================================================
+⑤ rewrite/multi_question_rewrite_service.py  —— 改写实现（【待补充-⑤】）
+  对标文件：自身
+  对标类：MultiQuestionRewriteService（继承 QueryRewriteService）
+  注意：原有 RAG 改写方法保持不动，新增 Agent 改写子类
+--------------------------------------------------------------------------------
+
+```python
+# ===== 原有类 —— 【保持不变】（不改动 RAG 路径） =====
+@dataclass
+class RAGConfigProperties: ...
+@dataclass
+class MultiQuestionRewriteService(QueryRewriteService):
+    def rewrite(self, user_question): ...
+    def rewrite_with_split(self, user_question, history=None): ...
+    def _rewrite_with_split_history(self, user_question, history): ...
+    def _rewrite_and_split(self, user_question): ...
+    def _call_llm_rewrite_and_split(self, normalized, original, history): ...
+    def _build_rewrite_request(self, system_prompt, question, history): ...
+    def _parse_rewrite_and_split(self, raw): ...        # 不重写！Agent 版单独解析
+    def _rule_based_split(self, question): ...
+
+# ===== 【待补充-⑤】新增：AgentMultiQuestionRewriteService =====
+from query_intent.intent_data_base import AgentChatContext
+from query_intent.intent_dto import AgentRewriteResult, TaskComplexityAnalysis
+
+@dataclass
+class AgentMultiQuestionRewriteService(AgentQueryRewriteService):
+    """Agent 级改写：问题归一化 → LLM（改写+复杂度+工具建议）→ AgentRewriteResult"""
+    llm_service: IntentLLMService
+    rag_config_properties: RAGConfigProperties
+        # 复用 RAG 的 query_rewrite_enabled 开关（LLM 改写是否开启）
+    query_term_mapping_service: QueryTermMappingService
+    prompt_template_loader: PromptTemplateLoader
+
+    @rag_trace_node(name="agent-query-rewrite", type="AGENT_REWRITE")
+    def agent_rewrite(
+        self,
+        user_question: str,
+        history: Optional[List[IntentChatMessage]] = None,
+        agent_context: Optional[AgentChatContext] = None,
+    ) -> AgentRewriteResult:
+        """【待补充-⑤ 核心方法】"""
+        # 骨架逻辑：
+        #  1) query_term_mapping_service.normalize(user_question) → 归一化
+        #  2) 如果 query_rewrite_enabled=False → 规则拆分 + 默认复杂度（预估1步，无工具）
+        #     否则：加载 AGENT_QUESTION_REWRITE_PROMPT_PATH → 调 FAST tier LLM
+        #  3) 解析 JSON → AgentRewriteResult（含 complexity / suggested_tools / plan_hint）
+        #  4) 失败兜底：规则拆分 + 默认复杂度
+        ...
+
+    def _build_agent_rewrite_request(
+        self,
+        system_prompt: str,
+        question: str,
+        history: List[IntentChatMessage],
+        agent_context: Optional[AgentChatContext],
+    ) -> IntentChatRequest:
+        """【待补充-⑤】构造 Agent 改写请求。
+        与 RAG 改写请求的区别：在 prompt 中注入可用工具 ID 列表，
+        让 LLM 做工具建议时能匹配真实工具名。
+        """
+        ...
+
+    def _parse_agent_rewrite(self, raw: str) -> Optional[AgentRewriteResult]:
+        """【待补充-⑤】解析 Agent 改写 JSON。
+        与 RAG 版 _parse_rewrite_and_split 的区别：多解析 complexity_analysis /
+        suggested_tools / explicit_plan_hint 三个字段。
+        """
+        ...
+
+    def _agent_rule_based_fallback(self, normalized: str) -> AgentRewriteResult:
+        """【待补充-⑤】LLM 失败兜底：规则拆分 + 默认保守复杂度"""
+        # 默认复杂度：estimated_steps=1, tools=[], no plan_hint
+        ...
+```
+
+================================================================================
+⑥ intent/intent_model.py  —— 意图模型（【不改动，确认】）
+  对标文件：自身
+  结论：现有的 IntentNode / NodeScore + 三种 IntentKind 已足够支撑
+        Agent 意图识别。不需要扩展 ORCHESTRATION kind。
+  （建议采纳 疑问-A 推荐：不新增 kind，由 ModeDecider 做模式决策）
+================================================================================
+
+（无改动内容）
+
+================================================================================
+⑦ intent/intent_classify.py  —— 意图分类（【待重写-⑦-1】 + 【待补充-⑦-2】）
+  对标文件：自身
+  对标类：DefaultIntentClassifier
+--------------------------------------------------------------------------------
+
+```python
+# ===== 原有接口 =====
+class IntentClassifier(ABC):
+    @abstractmethod
+    def classify_targets(self, question: str) -> list[NodeScore]: ...
+class IntentNodeRegistry(ABC):
+    @abstractmethod
+    def get_node_by_id(self, node_id) -> IntentNode | None: ...
+    @abstractmethod
+    def list_mcp_tool_nodes(self) -> list[IntentNode]: ...
+
+# ===== 原有 DefaultIntentClassifier —— 【待重写-⑦-1】小改动一处 =====
+class DefaultIntentClassifier(IntentClassifier, IntentNodeRegistry):
+    """原有流程（加载意图树 → 构建分类 prompt → LLM → 解析 NodeScore）保持不变"""
+
+    # 【待重写-⑦-1】classify_targets
+    # 对标：行121-128 当前 request 直接构造 dict 并传 self._llm_service.chat(request)，
+    #       没有传 tier 参数，和 MultiQuestionRewriteService 的调用风格不一致。
+    # 改动点：改为构造 IntentChatRequest，并显式指定 IntentChoiceTier.FAST。
+    #
+    # 原代码：
+    #   request = {"messages": [...], "temperature": 0.1, "top_p": 0.3, "thinking": False}
+    #   self._llm_service.chat(request)
+    #
+    # 改为：
+    #   from query_intent.intent_data_base import IntentChatRequest, IntentChatMessage, IntentChoiceTier
+    #   req = IntentChatRequest(
+    #       messages=[IntentChatMessage.system(system_prompt), IntentChatMessage.user(question)],
+    #       temperature=0.1, top_p=0.3, thinking=False
+    #   )
+    #   raw = self._llm_service.chat(req, IntentChoiceTier.FAST)
+    #
+    # 【疑问-B】：当前 IntentLLMService.chat 的签名接收 (request, tier)，但
+    #            classify_targets 传 dict，实际线上是否有适配层？
+    #            如果线上 chat() 方法签名其实支持 dict，那可以先不改此处。
+
+    def classify_targets(self, question: str) -> list[NodeScore]:
+        ...  # （内部做上述 request 构造统一）
+
+    def _parse_scores(self, raw, data, question): ...          # 保持不变
+    def top_k_above_threshold(self, question, top_n, min_score): ...  # 保持不变
+    def _build_prompt(self, leaf_nodes): ...                   # 保持不变
+    def _load_intent_tree_from_db(self): ...                   # 保持不变
+    @staticmethod
+    def _do_to_node(each): ...                                 # 保持不变（疑问-A 若选 B 再改）
+
+# ===== 【待补充-⑦-2】新增：AgentIntentAggregator =====
+@dataclass
+class AgentIntentAggregator:
+    """
+    把 IntentResolver 返回的 sub_intents 明细 + 原始 kb/mcp 分数，
+    聚合为 AgentIntents（给 IntentContext 填充用）。
+    不调 LLM，纯代码聚合。
+    """
+    base_classifier: DefaultIntentClassifier
+
+    def aggregate(
+        self,
+        sub_intents: list[SubQuestionIntent],
+    ) -> AgentIntents:
+        """【待补充-⑦-2】"""
+        # 骨架逻辑：
+        #  1) 遍历 sub_intents，合并 kb/mcp/system 三类 NodeScore
+        #  2) 找分数最高的节点 → 作为主意图，提取 primary_intent_label（如 name/full_path）
+        #  3) 计算 primary_confidence = 最高分数（低于阈值时降级 general）
+        #  4) 从问题文本中抽取简单 slots（数字、@提及等，先用简单规则）
+        #  5) 返回 AgentIntents
+        ...
+```
+
+================================================================================
+⑧ intent/intent_resolver.py  —— 意图解析器（【保持不变】+【待补充-⑧】）
+  对标文件：自身
+  对标类：IntentResolver.resolve → list[SubQuestionIntent]
+  结论：原 IntentResolver（子问题→并行分类→限流裁剪）逻辑可直接复用在
+        Agent 改写输出的 sub_questions 上。不改动它。只需新增便捷方法。
+--------------------------------------------------------------------------------
+
+```python
+# ===== 原有类（保持不变） =====
+class NodeScoreFilters:
+    @staticmethod
+    def mcp(scores): ...
+    @staticmethod
+    def kb(scores, min_score=None): ...
+    @staticmethod
+    def kb_collections(scores): ...
+
+class IntentResolver:
+    def resolve(self, rewrite_result: RewriteResult) -> list[SubQuestionIntent]: ...
+    def merge_intent_group(self, sub_intents) -> IntentGroup: ...
+    # ... 其余私有方法保持不变
+
+# ===== 【待补充-⑧】新增便捷方法：直接处理 AgentRewriteResult =====
+# 作为 IntentResolver 的新方法（因为 AgentRewriteResult 包含 sub_questions），
+# 不需要新类，直接在现有类上加方法即可。
+#
+# 建议：在原有 IntentResolver 类中追加：
+
+class IntentResolver:
+    # ... 原有所有方法保持不变 ...
+
+    def resolve_for_agent(
+        self,
+        agent_rewrite: AgentRewriteResult,
+    ) -> list[SubQuestionIntent]:
+        """
+        【待补充-⑧】处理 AgentRewriteResult：
+        将 sub_questions 映射为 RewriteResult（只为适配 resolve 签名），
+        内部直接调 self.resolve()。
+        """
+        compat = RewriteResult(
+            rewritten_question=agent_rewrite.rewritten_question,
+            sub_questions=agent_rewrite.sub_questions,
+        )
+        return self.resolve(compat)
+```
+
+================================================================================
+⑨ 【新增文件】 orchestration/mode_decider.py  —— 编排模式决策器（【待补充-⑨】）
+  对标文件：全新文件
+  对标下游：IntentContext.preferred_mode (Literal["react", "plan_execute"])
+  对应 prompt：orchestration-mode-decider.st（后续新增）
+--------------------------------------------------------------------------------
+
+```python
+"""
+orchestration/mode_decider.py
+【待补充-⑨】核心：基于 Agent 改写结果 + 意图聚合信息 + 规则 + LLM 兜底，
+              决策走 "react" 还是 "plan_execute"。
+              输出 ModeDecision（字面量和现有类型 100% 对齐）。
+"""
+
+from dataclasses import dataclass
+from typing import Optional, Literal
+
+from query_intent.intent_dto import (
+    AgentRewriteResult, AgentIntents, ModeDecision, TaskComplexityAnalysis,
+)
+from query_intent.intent_data_base import AgentChatContext
+from query_intent.intent_service import IntentLLMService
+from query_intent.intent_prompt.prompt_template_loader import PromptTemplateLoader
+from query_intent.intent_utils import rag_trace_node
+from query_intent.rag_constant import (
+    ORCHESTRATION_MODE_DECIDER_PROMPT_PATH,
+    MODE_DECISION_STEP_THRESHOLD,
+    MODE_DECISION_TOOL_THRESHOLD,
+    MODE_DECISION_DEFAULT,
+)
+
+@dataclass
+class ModeDecider:
+    """
+    决策优先级（越高越先命中，不再走后续判断）：
+      1. 用户明确步骤提示 explicit_plan_hint → plan_execute
+      2. 规则阈值命中（步骤数/工具数）→ 若 enable_llm_confirmation 则调 LLM 二次确认
+      3. LLM 综合判断（改写结果 + 意图 + 可用工具）
+      4. 兜底 → 默认 react（保守低延迟）
+    """
+    llm_service: Optional[IntentLLMService] = None
+    prompt_template_loader: Optional[PromptTemplateLoader] = None
+    step_threshold: int = MODE_DECISION_STEP_THRESHOLD
+    tool_threshold: int = MODE_DECISION_TOOL_THRESHOLD
+    default_mode: Literal["react", "plan_execute"] = MODE_DECISION_DEFAULT
+    # 是否启用 LLM 二次确认（关闭则纯规则，延迟最低）
+    enable_llm_confirmation: bool = True
+    # LLM 置信度低于该值时，回落 default_mode
+    llm_confidence_floor: float = 0.6
+
+    @rag_trace_node(name="mode-decide", type="MODE_DECIDE")
+    def decide(
+        self,
+        rewrite: AgentRewriteResult,
+        intents: AgentIntents,
+        agent_context: Optional[AgentChatContext] = None,
+    ) -> ModeDecision:
+        """【待补充-⑨ 核心方法】返回 ModeDecision（mode 字面量与下游完全对齐）"""
+        # 骨架：
+        #  1. explicit_plan_hint 命中 → mode=plan_execute (confidence=0.95)
+        #  2. 规则判断 _rule_based_decide(rewrite.complexity) → 若命中：
+        #     - 若 enable_llm_confirmation=False → 直接返回
+        #     - 否则调 LLM 二次确认（防止误切）
+        #  3. 若 _rule_based_decide 未命中 → 调 LLM 综合判断
+        #  4. LLM 失败/置信度过低 → fallback default_mode
+        ...
+
+    def _rule_based_decide(
+        self,
+        complexity: Optional[TaskComplexityAnalysis],
+    ) -> Optional[tuple[Literal["react", "plan_execute"], str]]:
+        """【待补充-⑨】基于阈值的规则判断。返回 (mode, reason) 或 None。"""
+        # 规则：
+        #  - estimated_steps >= step_threshold → plan_execute
+        #  - estimated_tool_calls >= tool_threshold → plan_execute
+        #  - has_multi_step_dependency and estimated_steps >= 2 → plan_execute
+        #  - estimated_steps == 1 and estimated_tool_calls <= 1 → react
+        #  - 其他 → None（无法判定，交给 LLM）
+        ...
+
+    def _llm_decide(
+        self,
+        rewrite: AgentRewriteResult,
+        intents: AgentIntents,
+        agent_context: Optional[AgentChatContext],
+    ) -> tuple[Literal["react", "plan_execute"], str, float, Optional[str], Optional[str]]:
+        """
+        【待补充-⑨】LLM 判定。
+        返回：(mode, reason, confidence, initial_plan_hint or None, first_tool_hint or None)
+        """
+        # 加载 ORCHESTRATION_MODE_DECIDER_PROMPT_PATH
+        # 填充 slots: rewritten_question, sub_questions, complexity字段,
+        #            intent_summary(从 intents 生成), available_tools(从 agent_context)
+        # 调 IntentChoiceTier.FAST tier LLM
+        # 解析 JSON（字段：mode, confidence, reason, initial_plan_hint, first_tool_hint）
+        ...
+```
+
+================================================================================
+⑩ 【新增文件】 orchestration/__init__.py（【待补充-⑩】）
+================================================================================
+
+```python
+# orchestration/__init__.py
+from .mode_decider import ModeDecider
+from .agent_query_intent_pipeline import AgentQueryIntentPipeline
+
+__all__ = ["ModeDecider", "AgentQueryIntentPipeline"]
+```
+
+================================================================================
+⑪ 【新增文件】 orchestration/agent_query_intent_pipeline.py —— Pipeline 总入口（【待补充-⑪】）
+  真实对接点：
+    输入：user_question, session_id, available_tool_ids, history(可选)
+    输出：AgentQueryIntentPipelineOutput → 可直接转换成：
+          mode="react" / "plan_execute"
+          intent=IntentContext(preferred_mode=mode, allowed_tools=..., intent=..., slots=...)
+          然后喂给现有 AgentOrchestrator.run(... , mode=mode, intent=intent)
+--------------------------------------------------------------------------------
+
+```python
+"""
+orchestration/agent_query_intent_pipeline.py
+【待补充-⑪】Agent 编排层入口 Pipeline（串联改写→意图→模式决策）
+
+【真实调用位置】：app/api/routes/chat.py handle_agent_chat()
+在调用 agent_orchestrator.run(user_input=..., session_id=...) 之前，
+先跑本 Pipeline 的 run()，把产出的 mode/intent 透传下去。
+"""
+
+from dataclasses import dataclass
+from typing import Optional, List, Literal, Dict, Any
+
+from query_intent.intent_data_base import IntentChatMessage, AgentChatContext
+from query_intent.intent_dto import (
+    AgentRewriteResult, AgentIntents, ModeDecision,
+    AgentQueryIntentPipelineOutput, SubQuestionIntent,
+)
+from query_intent.rewrite.query_rewrite import AgentQueryRewriteService
+from query_intent.intent.intent_resolver import IntentResolver
+from query_intent.intent.intent_classify import AgentIntentAggregator
+from query_intent.orchestration.mode_decider import ModeDecider
+from query_intent.intent_utils import rag_trace_node
+
+# 👇 下游真实类型（直接导入做类型标注，避免字面量错误）
+try:
+    from app.core.agent.orchestrator import IntentContext, OrchestrationMode
+except ImportError:  # 测试环境可能未装 app 包
+    OrchestrationMode = Literal["react", "plan_execute"]  # type: ignore
+
+
+@dataclass
+class AgentQueryIntentPipeline:
+    rewrite_service: AgentQueryRewriteService
+    intent_resolver: IntentResolver
+    intent_aggregator: AgentIntentAggregator
+    mode_decider: ModeDecider
+
+    @rag_trace_node(name="agent-query-intent-pipeline", type="AGENT_PIPELINE")
+    def run(
+        self,
+        user_question: str,
+        available_tool_ids: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        history: Optional[List[IntentChatMessage]] = None,
+    ) -> AgentQueryIntentPipelineOutput:
+        """【待补充-⑪ 核心入口方法】待后续实现"""
+        # 骨架步骤：
+        #  1. 构造 AgentChatContext(available_tool_ids, session_id)
+        #  2. rewrite_service.agent_rewrite(user_question, history, ctx) → AgentRewriteResult
+        #  3. intent_resolver.resolve_for_agent(rewrite) → list[SubQuestionIntent]
+        #  4. intent_aggregator.aggregate(sub_intents) → AgentIntents
+        #  5. mode_decider.decide(rewrite, intents, ctx) → ModeDecision
+        #  6. 组装 AgentQueryIntentPipelineOutput 返回
+        ...
+
+    # ---- 【待补充-⑪】便捷转换：直接生成下游 IntentContext + mode ----
+    def build_orchestrator_input(
+        self,
+        output: AgentQueryIntentPipelineOutput,
+    ) -> tuple[OrchestrationMode, "IntentContext"]:
+        """
+        将 Pipeline 输出转换为可直接喂给 AgentOrchestrator.run 的参数二元组：
+          (mode, IntentContext)
+
+        使用示例：
+          pipeline_output = pipeline.run(user_question, available_tool_ids=...)
+          mode, intent_ctx = pipeline.build_orchestrator_input(pipeline_output)
+          result = await agent_orchestrator.run(
+              user_input=pipeline_output.rewrite.rewritten_question,
+              session_id=session_id,
+              mode=mode,          # ← 这里是关键！不再写死 "react"
+              intent=intent_ctx,  # ← 含 preferred_mode(兜底) + allowed_tools + slots
+          )
+        """
+        # 组装逻辑：
+        #  mode = output.mode_decision.mode
+        #  intent_ctx = IntentContext(
+        #      intent=output.intents.primary_intent_label,
+        #      confidence=output.intents.primary_confidence,
+        #      slots=output.intents.slots,
+        #      preferred_mode=mode,          # 编排器 run() 内 if preferred_mode 会覆盖
+        #      allowed_tools=self._derive_allowed_tools(output),
+        #  )
+        #  return (mode, intent_ctx)
+        ...
+
+    def _derive_allowed_tools(self, output: AgentQueryIntentPipelineOutput) -> List[str]:
+        """
+        【待补充-⑪】从改写建议工具 + 命中的 MCP 意图节点 中求并集，
+        作为本问题允许使用的工具白名单。
+        好处：把 orchestrator._tool_names(intent) 的过滤从"全量工具"缩小为
+              "和当前问题相关的工具子集"，降低 LLM 幻觉调用率。
+        """
+        ...
+```
+
+================================================================================
+⑫ app/api/routes/chat.py  —— Agent 入口路由（【待重写-⑫】真实调用对接点）
+  对标文件：自身
+  对标函数：handle_agent_chat (L85)
+  这是整个改动在 app/ 侧的唯一真实插入点！
+--------------------------------------------------------------------------------
+
+```python
+# app/api/routes/chat.py（只看和 Agent 编排相关的 handle_agent_chat 函数）
+
+from app.core.intent.recognizer import IntentRecognizer   # 目前已 import
+# 👇 【待重写-⑫-1】新增 import
+from query_intent.orchestration.agent_query_intent_pipeline import AgentQueryIntentPipeline
+
+router = APIRouter(tags=["chat"])
+_tracer = Tracer()
+_intent = IntentRecognizer()
+
+# 👇 【待重写-⑫-2】新增全局 Pipeline 单例（和 _intent 同级）
+#   注意：这里的构造仅为骨架，实际依赖注入建议走 Depends。
+#   这里只展示调用关系。
+_pipeline: Optional[AgentQueryIntentPipeline] = None  # 由依赖注入在启动时实例化
+
+# =========================================================
+@router.post("/chat/with_agent", response_model=AgentChatResponse)
+async def handle_agent_chat(
+        request: AgentChatRequest,
+        memory_manager: MemoryManager = Depends(get_memory_manager),
+        model_router: ModelRouter = Depends(get_model_router),
+        tool_registry: ToolRegistry = Depends(get_tool_registry),
+        skill_manager: SkillManager = Depends(get_skill_manager),
+        db_session: AsyncSession = Depends(get_async_session),
+        # 👇 【待重写-⑫-3】新增依赖注入（请在 dependencies.py 补充 get_pipeline）
+        pipeline: AgentQueryIntentPipeline = Depends(get_pipeline),
+) -> AgentChatResponse:
+
+    active_session_id = request.session_id or f"session_{uuid.uuid4().hex[:12]}"
+    logger.info("接收到 Agent 编排会话请求. Session ID: {}, 策略: {}", active_session_id, request.strategy)
+
+    agent_orchestrator = AgentOrchestrator(
+        config={"default_strategy": request.strategy},
+        model_router=model_router,
+        memory_manager=memory_manager,
+        tool_registry=tool_registry,
+        tracer=_tracer,
+        skill_manager=skill_manager,
+    )
+
+    # ==============================================================
+    # 【待重写-⑫-4】新增：在 run() 之前跑 Pipeline → 得到模式决策
+    # 说明：Pipeline 保持"同步 def"（不改动 query_intent 现有大量服务签名）。
+    #       按【疑问-D 推荐 D-1】用 asyncio.to_thread 包装，并显式把异步
+    #       拉取到的记忆上下文 → 同步 list[Message] 传入，避免 Pipeline 里
+    #       出现 await，确保最小侵入。
+    # ==============================================================
+    import asyncio  # 若顶部已 import 则省
+
+    # a) 获取当前可用工具名列表（传给改写阶段做工具建议）
+    #    【真实契约】tool_registry.list_tool_names() → list[str]（见 registry.py:L50）
+    available_tool_ids: list[str] = tool_registry.list_tool_names()
+
+    # b) 拉短期记忆历史（用于改写阶段的指代消解）
+    #    【真实契约】MemoryManager.get_context 返回 MemoryContext dataclass，
+    #    字段 short_term_messages: list[Message]，Message.role 是 MessageRole。
+    try:
+        memory_ctx = await memory_manager.get_context(
+            session_id=active_session_id, query=request.query, limit=6
+        )
+        short_term_msgs = getattr(memory_ctx, "short_term_messages", None) or []
+        # 转换为 query_intent 侧的 IntentChatMessage（chat.py 顶部再加 import）
+        from query_intent.intent_data_base import IntentChatMessage
+        history_for_rewrite = [
+            IntentChatMessage(
+                role=(str(m.role.value)
+                      if hasattr(getattr(m, "role", None), "value")
+                      else str(getattr(m, "role", "user"))),
+                content=str(getattr(m, "content", "")),
+            )
+            for m in short_term_msgs
+        ]
+    except Exception as hist_err:
+        logger.warning("拉取短期记忆用于改写失败（忽略，继续）：{}", hist_err)
+        history_for_rewrite = []
+
+    # c) 跑 Pipeline（同步 → 用 asyncio.to_thread 包装，保持 async 路由契约）
+    #    【真实契约】AgentQueryIntentPipeline.run 是同步 def：
+    #       def run(self, user_question, available_tool_ids, session_id, history)
+    #       → AgentQueryIntentPipelineOutput
+    pipeline_output = await asyncio.to_thread(
+        pipeline.run,
+        request.query,                 # user_question
+        available_tool_ids,            # available_tool_ids
+        active_session_id,             # session_id
+        history_for_rewrite,           # history: list[IntentChatMessage]
+    )
+
+    # d) 转换为编排器可接收的入参
+    mode, intent_ctx = pipeline.build_orchestrator_input(pipeline_output)
+
+    logger.info(
+        "【模式决策】问题={} → mode={}, confidence={}, reason={}",
+        request.query[:40], mode, pipeline_output.mode_decision.confidence,
+        pipeline_output.mode_decision.reason,
+    )
+
+    # e) 将改写后的问题作为实际输入（指代消解后模型效果更好）
+    #    如果改写失败或为空则回退原始问题
+    effective_user_input = pipeline_output.rewrite.rewritten_question or request.query
+
+    # ==============================================================
+    # 【待重写-⑫-5】改动原调用：从无 mode/intent → 显式传入
+    # ==============================================================
+    # 原代码（需替换）：
+    #   orchestrator_result = await agent_orchestrator.run(
+    #       user_input=request.query,
+    #       session_id=active_session_id
+    #   )
+    #
+    # 改为：
+    orchestrator_result = await agent_orchestrator.run(
+        user_input=effective_user_input,  # 改写后的问题
+        session_id=active_session_id,
+        mode=mode,                        # Pipeline 决策的模式（react/plan_execute）
+        intent=intent_ctx,                # 含 preferred_mode(兜底) + allowed_tools + slots
+    )
+
+    # ===== 以下保持不变 =====
+    if not orchestrator_result.success:
+        logger.error("底层智能体决策树执行失败...")
+        raise HTTPException(status_code=500, detail=orchestrator_result.error or "...")
+
+    return AgentChatResponse(
+        status="success",
+        session_id=active_session_id,
+        trace_id=orchestrator_result.trace_id,
+        final_answer=orchestrator_result.answer,
+        steps_executed=len(orchestrator_result.steps),
+    )
+```
+
+================================================================================
+⑬ app/api/depends/dependencies.py  —— 依赖注入（【待补充-⑬】）
+  对标文件：自身（见 L1-118 已核实风格）
+  对标参照：get_tool_registry / get_memory_manager 两个函数的写法
+    - 用 request.app.state.xxx 拿全局单例
+    - 可以嵌套 Depends(get_rag_service) 等其他依赖
+  目的：新增 get_pipeline 依赖，构造 AgentQueryIntentPipeline 并注入到路由
+  说明：【疑问-C 已解除】——已通过真实 dependencies.py 风格核验。
+        新增 2 个 FastAPI 依赖（按顺序实现）：
+          ① get_intent_llm_service   —— 把 app 的 ModelRouter 适配为 query_intent
+                                         包可直接调用的同步 chat() 门面。
+          ② get_pipeline             —— 组装 rewrite/classifier/resolver/
+                                         aggregator/decider → Pipeline。
+        同时在 app/main.py lifespan 中把 prompt_loader 单例挂到 app.state
+        （与 skill_manager / fs_backend 同级）。
+--------------------------------------------------------------------------------
+
+```python
+# ========================================================================
+# app/api/depends/dependencies.py
+# 【待补充-⑬-1】顶部新增 imports（放在现有 import 之后）
+# ========================================================================
+from typing import Optional
+from fastapi import Depends, Request
+
+# 【已有 import】不需要改，仅作为上下文对照：
+# from app.core.tools.builtin.init_tools import bootstrap_tools
+# from app.core.tools.registry import ToolRegistry
+# from app.infrastructure.llm.model_router import ModelRouter
+
+# 👇 新增：query_intent 包侧的类型
+from query_intent.intent_prompt.prompt_template_loader import PromptTemplateLoader
+from query_intent.intent_service import IntentLLMService
+from query_intent.rewrite.query_rewrite import (
+    QueryTermMappingService,
+    QueryTermMappingCacheManager,
+)
+from query_intent.rewrite.multi_question_rewrite_service import (
+    AgentMultiQuestionRewriteService,
+    RAGConfigProperties,
+)
+from query_intent.intent.intent_classify import (
+    DefaultIntentClassifier,
+    AgentIntentAggregator,
+)
+from query_intent.intent.intent_resolver import IntentResolver
+from query_intent.orchestration.mode_decider import ModeDecider
+from query_intent.orchestration.agent_query_intent_pipeline import (
+    AgentQueryIntentPipeline,
+)
+
+# ========================================================================
+# 【待补充-⑬-2】将 app 的 ModelRouter 适配成 query_intent 的同步门面
+#   因为现有 query_intent 所有服务都在走同步 llm_service.chat()，
+#   我们用 asyncio.get_event_loop().run_until_complete() 或者
+#   asyncio.to_thread 方式在适配层里调 model_router 的异步方法。
+#   （与 orchestrator.py:L79 _LLMAdapter 完全相同的思路）
+# ========================================================================
+class _AppModelRouterIntentLLMAdapter(IntentLLMService):
+    """把 app 的 ModelRouter + _PurposeLLMAdapter 桥接为 query_intent 同步接口。
+
+    【对标文件】app/core/agent/orchestrator.py 的 _LLMAdapter.acomplete(L75-88)
+    这里反过来：同步 chat() → 内部跑 model_router 异步 acomplete/complete。
+    """
+
+    def __init__(self, model_router: "ModelRouter") -> None:
+        self._router = model_router
+
+    def chat(self, messages: list[dict], **kwargs) -> str:
+        """【待补充-⑬-2 实现】
+        步骤：
+          1. self._router.for_purpose(...) 拿到 _PurposeLLMAdapter；
+             Purpose 用 "chat" 即可（或新增 "intent_analysis"，不强制）。
+          2. adapter.acomplete(messages, **kwargs) 是 async；
+             用 asyncio.run() 或新建事件循环同步等待。
+          3. 捕获异常 → 字符串返回（保持 query_intent 原有容错风格）。
+        """
+        ...
+
+
+# ========================================================================
+# 【待补充-⑬-3】依赖 1：获取 IntentLLMService 适配实例
+# ========================================================================
+async def get_intent_llm_service(
+    request: Request,
+    model_router: ModelRouter = Depends(get_model_router),
+) -> IntentLLMService:
+    """FastAPI 依赖：返回适配后的同步 LLM 门面（供 Pipeline 所有子服务复用）。
+
+    【对标】dependencies.py:L63 get_model_router 风格——直接复用 request.app.state
+    里的全局 ModelRouter 单例。这里不缓存，因为实例化 adapter 非常轻。
+    """
+    return _AppModelRouterIntentLLMAdapter(model_router=model_router)
+
+
+# ========================================================================
+# 【待补充-⑬-4】依赖 2：获取 AgentQueryIntentPipeline
+#   风格对齐 get_tool_registry(L101-118)：每次请求构造一份（因为 classifier
+#   内部可能存请求级状态；若确认无状态可在后续改为 app.state 单例以优化）。
+# ========================================================================
+async def get_pipeline(
+    request: Request,
+    llm_svc: IntentLLMService = Depends(get_intent_llm_service),
+) -> AgentQueryIntentPipeline:
+    """FastAPI 依赖：组装 Pipeline 实例。
+
+    【真实契约参照】
+      - Prompt 模板加载器：优先从 request.app.state.prompt_loader 取（单例）；
+        若为空则现场实例化 PromptTemplateLoader。
+      - QueryTermMappingService / QueryTermMappingCacheManager：
+        目前在 query_intent/query_intent_controller/ 下未接入 DB，
+        【待补充-⑬-4-A】若后续要启用术语映射，需要在这里注入 DB Session + Mapper；
+        首版可直接传 None / 空实例，mapping_svc 直接走空实现。
+      - intent_node_mapper / intent_tree：首版直接使用
+        query_intent/intent/intent_tree.py 中的全局意图树。
+    """
+
+    # 1) Prompt 模板加载器（跨请求共用，建议挂到 app.state，见下方 ⑬-5 lifespan）
+    prompt_loader: PromptTemplateLoader = getattr(
+        request.app.state, "prompt_loader", None
+    ) or PromptTemplateLoader()
+
+    # 2) 术语映射服务（首版可空，保留接口方便后续接 DB 映射表）
+    #    【待补充-⑬-4-A】占位：后续接入 mapper 时替换为真实实现
+    cache_mgr = QueryTermMappingCacheManager()            # 首版空实现
+    mapping_svc = QueryTermMappingService(                # 首版空实现
+        mapping_mapper=None, cache_manager=cache_mgr,     # None → 映射走空
+    )
+
+    # 3) RAG 配置属性（Agent 改写专用）
+    cfg = RAGConfigProperties(
+        # 保持与 MultiQuestionRewriteService 原有默认值一致即可
+        query_rewrite_enabled=True,
+        # 其他字段按需补，不强制
+    )
+
+    # 4) 改写服务（Agent 专用子类）
+    rewrite_svc = AgentMultiQuestionRewriteService(
+        llm_service=llm_svc,
+        rag_config_properties=cfg,
+        query_term_mapping_service=mapping_svc,
+        prompt_template_loader=prompt_loader,
+    )
+
+    # 5) 意图分类器 + Resolver + Agent 专用聚合器
+    #    【疑问-B 待确认后调整】
+    #      若选择 B-1（chat 实际支持 dict）：classify_targets 不改动；
+    #      若选择 B-2（只支持 IntentChatRequest）：在这里构造 classifier 前
+    #        先执行【待重写-⑦-1】统一请求格式。
+    classifier = DefaultIntentClassifier(
+        llm_service=llm_svc,
+        intent_node_mapper=None,    # 【待补充-⑬-4-B】= 意图树 mapper 单例；
+                                    # 若 intent_tree 已全局暴露则传 None 也 OK
+        prompt_template_loader=prompt_loader,
+    )
+    resolver = IntentResolver(intent_classifier=classifier)
+    aggregator = AgentIntentAggregator(base_classifier=classifier)
+
+    # 6) 模式决策器
+    decider = ModeDecider(
+        llm_service=llm_svc,
+        prompt_template_loader=prompt_loader,
+    )
+
+    # 7) 组装 → Pipeline
+    return AgentQueryIntentPipeline(
+        rewrite_service=rewrite_svc,
+        intent_resolver=resolver,
+        intent_aggregator=aggregator,
+        mode_decider=decider,
+    )
+```
+
+================================================================================
+⑬-B（骨架拆分） app/main.py lifespan   —— 挂载 PromptTemplateLoader 单例
+  【待补充-⑬-5】小改动，非必须但强烈建议：
+    让 PromptTemplateLoader 作为全局单例与 model_router/skill_manager 等同级，
+    避免每次 get_pipeline 请求都重新解析 .st 文件 IO。
+--------------------------------------------------------------------------------
+
+```python
+# app/main.py → lifespan 中，L82 技能树初始化后追加：
+#
+#     # 👇【待补充-⑬-5】挂载 Agent 编排的 prompt 模板加载器（单例）
+#     from query_intent.intent_prompt.prompt_template_loader import PromptTemplateLoader
+#     app.state.prompt_loader = PromptTemplateLoader()
+#     # （可选）预热 3 个 Agent 相关模板，避免首包卡顿
+#     try:
+#         app.state.prompt_loader.load(
+#             "query_intent/prompts/intent-classifier.st")
+#         app.state.prompt_loader.load(
+#             "query_intent/prompts/agent-question-rewrite.st")
+#         app.state.prompt_loader.load(
+#             "query_intent/prompts/orchestration-mode-decider.st")
+#     except Exception as preload_err:
+#         logger.warning("Agent Pipeline Prompt 预热失败（忽略）: {}", preload_err)
+#
+# （其他代码完全不动）
+```
+
+================================================================================
+⑭（可选）app/core/intent/recognizer.py  —— 非 Agent 接口意图识别（【待重写-⑭ 可选】）
+  对标文件：自身
+  现状：关键词规则引擎 IntentRecognizer，只用于 /chat 非 Agent 接口
+  说明：【可选改动】如果你希望非 Agent 接口也升级为 LLM 级意图识别，
+        可以把 IntentRecognizer.recognize 内部改成调用
+        AgentQueryIntentPipeline → 提取 AgentIntents 返回。
+        但这不是本次"Agent 编排模式决策"的必需项。
+        推荐优先级：低。
+================================================================================
+
+（省略可选代码骨架，等用户确认需要再补）
+
+================================================================================
+三、Prompt 模板文件改动清单（按顺序）
+================================================================================
+
+P0. prompts/user-question-rewrite.st  ——  RAG 改写模板（【不改动】）
+    说明：RAG 专用，Agent 改写使用独立的 agent-question-rewrite.st。
+
+P0. prompts/intent-classifier.st  ——  RAG 分类模板（【不改动】）
+    说明：Agent 意图分类复用同一模板（intent_list 注入方式一致），不需要改。
+
+--------------------------------------------------------------------------------
+P1. 【新增文件】 prompts/orchestration-mode-decider.st  —— 模式决策（【待补充-⑮】顺序⑮）
+    对应：orchestration/mode_decider.py 的 _llm_decide()
+--------------------------------------------------------------------------------
+
+```
+# ======================================================================
+# prompts/orchestration-mode-decider.st
+# 【待补充-⑮】Agent 模式决策 Prompt
+# mode 字符串必须严格为 "react" 或 "plan_execute"（与 app AgentMode 100% 对齐）
+# ======================================================================
+
+# 角色
+你是 Agent 编排策略专家，负责选择最合适的执行模式。
+
+# 两种执行模式说明
+
+## react 模式（ReAct：Thought + Action + Observation 循环）
+适用场景：
+- 单步或 2 步以内可解决
+- 不需要严格的步骤先后依赖
+- 适合：简单知识库查询、单工具调用、常见问答、闲聊问候、轻量计算
+- 特点：响应快，灵活
+
+## plan_execute 模式（Plan-and-Execute：先拆解子任务，再逐步执行）
+适用场景：
+- 预估 3 步及以上
+- 存在明确步骤依赖（必须先做 A 才能做 B）
+- 需要调用 2 个或以上不同工具/知识源
+- 用户明确要求"分步骤""先...再...然后..."
+- 复杂任务：方案制定、数据汇总对比、多维度分析、报告生成
+- 特点：稳定可靠，但延迟更高
+
+# 输入（根据这些信息判断）
+
+## 改写后的用户问题
+{rewritten_question}
+
+## 子问题（如有）
+{sub_questions}
+
+## 复杂度分析
+- 预估步骤数：{estimated_steps}
+- 预估工具调用数：{estimated_tool_calls}
+- 是否存在步骤依赖：{has_multi_step_dependency}
+- 是否需要外部数据：{has_external_data_dependency}
+- 是否需要创造性输出：{need_creative_output}
+- 用户显式步骤提示：{explicit_plan_hint}（无则写 null）
+- 建议使用的工具：{suggested_tools}
+
+## 意图命中
+- 主意图：{primary_intent}
+- 知识库相关：{kb_hit_count} 个节点命中
+- MCP 工具相关：{mcp_hit_count} 个节点命中
+- 系统交互相关：{sys_hit_count} 个节点命中
+
+## Agent 当前可用工具（仅供参考）
+{available_tools}
+
+# 决策规则（优先级从高到低）
+1. 用户明确给出步骤提示（explicit_plan_hint 非空）→ "plan_execute"
+2. 预估步骤数 >= 3 → "plan_execute"
+3. 预估工具调用数 >= 2 → "plan_execute"
+4. 命中知识库单节点 + 无工具 + 预估1步 → "react"
+5. 命中系统交互意图（问候/关于）→ "react"
+6. 拿不准 → 默认 "react"（保守低延迟）
+
+# 输出格式（严格 JSON，无多余文字）
+{
+  "mode": "react" 或 "plan_execute",
+  "confidence": 0.0 ~ 1.0,
+  "reason": "一句话理由",
+  "initial_plan_hint": "若 mode=plan_execute，给出 3~5 条步骤建议字符串；否则 null",
+  "first_tool_hint": "若 mode=react，给出建议的第一个工具名；否则 null"
+}
+```
+
+--------------------------------------------------------------------------------
+P2. 【新增文件】 prompts/agent-question-rewrite.st  —— Agent 改写模板（【待补充-⑯】顺序⑯）
+    对应：rewrite/multi_question_rewrite_service.py 的 AgentMultiQuestionRewriteService
+--------------------------------------------------------------------------------
+
+```
+# ======================================================================
+# prompts/agent-question-rewrite.st
+# 【待补充-⑯】Agent 编排层改写 + 复杂度分析 Prompt
+# 与 RAG 改写（user-question-rewrite.st）的区别：额外输出复杂度+工具建议
+# ======================================================================
+
+# 角色
+你是 Agent 编排层查询改写与任务分析助手。
+职责：1) 最小必要改写  2) 判断是否拆分子问题
+      3) 分析任务复杂度（步骤数/工具依赖）  4) 给出建议使用的工具列表
+【禁止】你不得回答用户问题，只能输出上述分析结果！
+
+# 输出格式（严格 JSON，无多余文字）
+{
+  "rewrite": "改写后的问题",
+  "should_split": true/false,
+  "sub_questions": ["子问题1", "子问题2"],
+  "complexity_analysis": {
+    "estimated_steps": 整数 1~10,
+    "estimated_tool_calls": 整数 0~10,
+    "has_multi_step_dependency": true/false,
+    "has_external_data_dependency": true/false,
+    "need_creative_output": true/false,
+    "reasoning_notes": "判断理由简述"
+  },
+  "suggested_tools": ["工具名1", "工具名2"],
+  "explicit_plan_hint": "用户明确提到的步骤提示原文，没有则为 null"
+}
+
+# ===== 改写规则（与 RAG 改写基本一致） =====
+## 核心原则
+* 尽量保留用户原文，只做必要改动
+* rewrite 必须是查询/任务描述，不能是答案
+* 保持原问题语言
+
+## 保留内容
+* 专有名词（系统名、产品名、模块名、工具名）
+* 关键限制：时间范围、环境、角色身份
+* 任务意图：步骤要求、对比要求、汇总要求
+
+## 删除内容
+* 礼貌用语："请帮我""麻烦""谢谢"
+
+## 多轮上下文规则
+* 指代消解：出现"它""这个""该系统"时，结合历史还原实体
+* 省略续问："X呢"等，继承上一轮任务意图
+* 【重要】Agent 改写的指代消解**只参考历史用户问题**，不要从历史 Assistant 回答里抽取信息。
+
+# ===== 拆分规则 =====
+## 拆分：多个明确问句 / 显式列举 / 分号换行分隔多个独立任务
+## 不拆分：抽象对比（"A和B有什么区别"）、步骤型任务（"先A再B然后C"整体视为一个计划任务）
+
+# ===== 复杂度分析规则 =====
+## estimated_steps 估计
+| 场景 | 步骤数 |
+|------|--------|
+| 单条知识库查询 | 1 |
+| 单工具调用 + 整理答案 | 1~2 |
+| 两个数据源对比 | 3（查A / 查B / 对比） |
+| 用户明确给了 N 步 | N |
+| 汇总分析类 | 3~5 |
+| 报告/方案生成类 | 3~6 |
+
+## estimated_tool_calls 估计
+* 纯知识库问答 → 0
+* 需要调 1 个 MCP/API → 1
+* 多个独立数据查询 → 累加
+
+## has_multi_step_dependency
+* true：步骤有先后（Step N 必须在 Step N+1 之前完成）
+* false：子问题可并行
+
+## has_external_data_dependency
+* true：需要调 API/DB/MCP/文件/知识库 等外部数据源
+* false：仅凭内置知识即可
+
+## need_creative_output
+* true：写方案/写报告/写文案/头脑风暴
+* false：查询、汇总、对比、计算等结构化输出
+
+# ===== suggested_tools 填写规则 =====
+# 【重要 · 疑问-E 已核验】以下是当前 app/core/tools/builtin/init_tools.py 实际
+# 启用（registry.register 未被注释）的 tool.name 完整清单。
+# suggested_tools 数组中的每一项**必须从此集合取字面量**，或填 []：
+#    local_excel_tool         — 本地 .xlsx 读写
+#    feishu_bitable_tool      — 飞书多维表格
+#    rag_knowledge_search     — Milvus 向量知识库精准检索
+#    knowledge_graph_search   — LightRAG 全局图谱/跨文档关系检索
+#    web_search               — Tavily 互联网公开信息检索
+#    write_todos              — Agent 待办规划（>3 步复杂任务时推荐）
+#    file_read_tool           — 读文件
+#    file_list_tool           — 列目录
+#    file_grep_tool           — 全文 grep
+# 【不要出现在示例中】calculator / list_tables / describe_table / database_query
+#                      （当前未注册）
+#
+# * 匹配不到就填 []，**不要**臆造工具名
+# * 原子基础设施工具（file_*）一般不需要显式写；Pipeline 会自动补齐。
+
+# ===== explicit_plan_hint 填写规则 =====
+* 用户问题出现"先...再...然后...""分步骤""步骤是""1)...2)...3)..."，把步骤提示原文（精简）填入
+* 否则填 null
+
+# 上下文信息（供改写参考）
+
+## 多轮对话历史（如有）
+{conversation_history}
+
+## Agent 当前可用工具列表（供工具建议时参考匹配）
+{available_tool_list}
+
+【示例省略，参照 JSON 输出格式自说明】
+```
+
+================================================================================
+四、标记汇总
+================================================================================
+
+【待补充】（按推荐实现顺序）
+  ①    rag_constant.py                                        追加常量 + 真实已注册工具名清单（①-B）
+  ②    intent_data_base.py                                    新增 AgentChatContext
+  ③-1  intent_dto.py                                          新增 TaskComplexityAnalysis
+  ③-2  intent_dto.py                                          新增 AgentRewriteResult
+  ③-3  intent_dto.py                                          新增 AgentIntents
+  ③-4  intent_dto.py                                          新增 ModeDecision
+  ③-5  intent_dto.py                                          新增 AgentQueryIntentPipelineOutput
+  ④    rewrite/query_rewrite.py                               新增 AgentQueryRewriteService 抽象
+  ⑤    rewrite/multi_question_rewrite_service.py              新增 AgentMultiQuestionRewriteService
+  ⑦-2  intent/intent_classify.py                              新增 AgentIntentAggregator
+  ⑧    intent/intent_resolver.py                              新增 resolve_for_agent 便捷方法
+  ⑨    orchestration/mode_decider.py                          【新增文件】ModeDecider
+  ⑩    orchestration/__init__.py                              【新增文件】
+  ⑪    orchestration/agent_query_intent_pipeline.py           【新增文件】Pipeline 总入口
+  ⑬    app/api/depends/dependencies.py                        新增 ①适配层 + ②get_pipeline（疑问-C已解决）
+  ⑬-B  app/main.py lifespan                                   挂载 prompt_loader 单例 + 预热模板
+  ⑮    prompts/orchestration-mode-decider.st                  【新增文件】
+  ⑯    prompts/agent-question-rewrite.st                      【新增文件】已绑定真实工具名（疑问-E已解决）
+
+【待重写】（标注对标位置）
+  ⑦-1  intent/intent_classify.py:classify_targets（疑问-B待拍板）
+       对标：自身行 121-138。统一请求构造为 IntentChatRequest，并显式传
+            IntentChoiceTier.FAST 参数。
+       小改动，不影响原逻辑。若线上 chat() 实际支持 dict 则可整项跳过。
+
+  ⑫    app/api/routes/chat.py:handle_agent_chat (L85)
+       对标：自身行 112-117。原调用 orchestrator.run(user_input, session_id)
+            不传 mode/intent → 改为显式传 Pipeline 产出的 mode + intent +
+            effective_user_input（改写后问题）。已在骨架中按疑问-D推荐 D-1，
+            用 asyncio.to_thread 包装同步 pipeline.run()。
+       【这是 app/ 侧唯一必要的真实改动点】
+
+【待移除】（无）
+  - 本骨架无删除内容。原骨架提到的 ORCHESTRATION kind 扩展、WORKFLOW 模式、
+    legacy 兼容字段都已移除，不做任何删除操作。
+
+【已确认无需改动的边界（本轮明确写死"不入骨架"的真实模块，避免误改）】
+  - app/core/agent/react_agent.py    — ReAct 引擎内部零侵入
+  - app/core/agent/planner.py        — Planner plan/replan 内部零侵入
+  - app/core/agent/reflection.py     — Reflection 独立后处理零侵入
+  - app/core/tools/registry.py       — list_tool_names / allowed_tools 过滤已齐备
+  - app/core/tools/builtin/init_tools.py  — 工具注册名已核实并写进 rag_constant①-B
+  - app/core/memory/*                — 仅通过公开 get_context 接口读取，无改动
+  - app/models/enums.py              — AgentMode 复用即可，不新增枚举
+  - prompts/user-question-rewrite.st / prompts/intent-classifier.st  — 不改动
+
+================================================================================
+五、Q&A 待确认（请拍板，我据此调整骨架或开始写实现）
+  【截至当前校准版】疑问-C、疑问-D（推荐方案）、疑问-E 已通过读取真实 app
+  代码解决，不需要用户再补充信息。仅剩下 A / B / F / G 4 条需确认。
+================================================================================
+
+疑问-A（已在骨架中给出推荐答案）：IntentKind 是否要新增 ORCHESTRATION=3？
+  推荐 A-1：不新增。模式决策由 ModeDecider 基于复杂度+意图+LLM 判断，
+           不侵入意图树。骨架中已按此方案实现（intent/intent_model.py 无改动）。
+  可选 A-2：新增，允许在意图树中显式配置"方案制定类"等编排导向节点。
+
+疑问-B（【待拍板，二选一】影响是否执行【待重写-⑦-1】）：
+        DefaultIntentClassifier.classify_targets 当前内部调用
+        llm_service.chat(messages=list[dict])，而同包下
+        MultiQuestionRewriteService 调用的是
+        llm_service.chat(IntentChatRequest, IntentChoiceTier)。两者调用签名不
+        一致，线上 llm_service 是否实际兼容 list[dict]？
+  选择 B-1（chat 实际支持 dict，有适配层）：
+            → 跳过【待重写-⑦-1】classify_targets
+  选择 B-2（chat 只收 IntentChatRequest，当前代码存在未暴露的 bug）：
+            → 执行【待重写-⑦-1】：把 classify_targets 内部请求统一构造成
+              IntentChatRequest，并显式传 tier=IntentChoiceTier.FAST。
+  【建议】先按 B-1 走，线上首测若报 "expect IntentChatRequest got list"
+         再回切 B-2，改动面很小（只改 1 个方法内部 6 行）。
+
+疑问-F（【新增】关于 initial_plan_hint 如何传进 Planner）：
+        ModeDecider 产出 initial_plan_hint（=3~5 条步骤建议字符串），
+        但 PlannerAgent.plan() 目前签名 (query, memory_context, skills_block)
+        没有 plan_hint 形参。两种处理：
+  推荐 F-1：首版**不把 plan_hint 塞进 plan() 参数**——仅把它写到
+            IntentContext.slots["initial_plan_hint"]，由 Prompt 侧
+            （PlannerAgent PLAN_SYSTEM_PROMPT 之前）通过 slots 变量拼进
+            user_message 末尾作为"<规划建议/>"提示。不侵入 Planner。
+            → 本骨架已按 F-1 在 ModeDecision → IntentContext.slots 对接。
+  可选 F-2：给 PlannerAgent.plan() 增加 initial_plan_hint: Optional[str]=None
+            形参 → 需改动 app/core/agent/planner.py（本轮不动，后续迭代）。
+
+疑问-G（【新增】关于 Request.strategy 字段的优先级）：
+        AgentChatRequest 已有 strategy: Optional[str] = "auto"，当前仅传
+        给 config={"default_strategy": ...}。未来是否允许前端显式传
+        strategy="plan_execute" / "react" 来**强覆盖** Pipeline 决策？
+  推荐 G-1：是。在【待重写-⑫】chat.py 调 pipeline.build_orchestrator_input
+            之后加一段：
+              if request.strategy in ("react", "plan_execute"):
+                  mode = request.strategy
+                  intent_ctx.preferred_mode = mode
+            → 前端可灰度指定某条流量强制走某模式。
+  可选 G-2：否，完全由 Pipeline 决策，不信任前端 strategy。
+            → 不加这段，骨架保持现状。
+
+【已解决 · 留档备查】
+  疑问-C（dependencies.py 注入风格）：已读取真实文件，新增
+           _AppModelRouterIntentLLMAdapter + get_intent_llm_service +
+           get_pipeline 三部分骨架，完全对齐 request.app.state 单例
+           + Depends 嵌套的风格。见【待补充-⑬】。
+  疑问-D（Pipeline 同步/异步）：推荐 D-1 同步，asyncio.to_thread 包
+           装，骨架【待重写-⑫-4-c】已按此方案写好。
+  疑问-E（真实 tool_name 清单）：已读取 init_tools.py + 所有 builtin/*.py
+           的 self.name 字面量，9 个已启用工具写入【待补充-①-B】和
+           Prompt ⑯ 的"suggested_tools 填写规则"，避免 LLM 幻觉工具名。
+
+【补充】
+  - 若以上 4 条疑问 A/B/F/G 直接按"推荐项"拍板，无需再回复，告诉我
+    "按推荐从①开始实现"即可，我会按顺序 ①→⑯ 生成具体代码。
+  - 若要修改其中某 1~2 条的决策，直接列选择项（例如："B 选 B-2，
+    G 选 G-2，其余按推荐"）。
+  - 某条骨架条目看不清楚、想展开/示例，随时点名对应编号即可。

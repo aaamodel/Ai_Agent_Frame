@@ -1,0 +1,40 @@
+# ===== 环境变量 & 密钥 =====
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 生成的架构图 / 构建产物 =====
+*.svg
+*.gv
+
+# ===== 数据与上传目录（运行时产生，不入库） =====
+uploads/
+raw_data/
+
+# ===== 内部设计工作笔记（非对外文档） =====
+_*.md
+build_orchestrator_input.md
+query_intent_dto2.md
+rewrite_for_agent.md
+get_skills_summary_for_prompt
+
+# ===== 重复的 compose 副本 =====
+docker-compose副本.yml
+
+# ===== IDE / 操作系统 =====
+.idea/
+.vscode/
+.DS_Store
+
+# ===== WorkBuddy 项目记忆（本地私有） =====
+.workbuddy

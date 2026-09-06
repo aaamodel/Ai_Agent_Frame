@@ -1,0 +1,99 @@
+ query_intent 子包死代码清单
+判定规则：符号在运行时代码（排除自身定义文件、注释、doc、__init__.py re-export、设计文档 .md/.txt）中零次真实引用。
+
+一、整块「管理后台模块」从未被 FastAPI 路由挂载 —— 两个文件共 14 个符号全部是死代码
+main.py 的 include_router() 只有 health/chat/document/kownledgebase，整个 query_intent_controller/ 目录从未被接入。
+
+1A 文件：query_intent_controller/intent_node_tree_controller.py
+#	类型	名称	行号	备注
+1	dataclass	IntentNodeBatchRequest	L18	请求 DTO，未被任何路由接收
+2	dataclass	IntentNodeCreateRequest	L23	请求 DTO
+3	dataclass	IntentNodeUpdateRequest	L43	请求 DTO
+4	dataclass	IntentNodeTreeVO	L63	树结构响应 VO
+5	普通类	IntentTreeService	L85	服务层——7 个方法全是空实现（返回 []/""/pass），即便是占位，也无人实例化调用
+6	普通类	IntentTreeController	L108	控制器层，未被任何 APIRouter 注册
+IntentTreeService 方法（L86-105，共 7 个，全死）：get_full_tree / create_node / update_node / delete_node / batch_enable_nodes / batch_disable_nodes / batch_delete_nodes
+
+IntentTreeController 方法（L113-132，共 7 个，全死）：tree / create_node / update_node / delete_node / batch_enable / batch_disable / batch_delete
+
+1B 文件：query_intent_controller/query_term_mapping.py
+#	类型	名称	行号	备注
+7	dataclass	QueryTermMappingPageRequest	L24	分页请求 DTO（继承 IntentPage）
+8	dataclass	QueryTermMappingCreateRequest	L29	创建请求 DTO
+9	dataclass	QueryTermMappingUpdateRequest	L39	更新请求 DTO
+10	dataclass	QueryTermMappingVO	L49	响应 VO
+11	普通类 (ABC)	QueryTermMappingAdminService	L62	管理后台服务接口，5 个抽象方法无任何子类被实例化
+12	普通类	BizChangeLogContext	L86	"占位类，实际由外部依赖提供"，仅方法签名，从未被任何 DI 构造或传入
+13	普通类	QueryTermMappingAdminServiceImpl	L95	完整的 CRUD 实现，但调用链被切断（控制器不死不活）
+14	普通类	QueryTermMappingController	L206	控制器，无路由注册
+死方法补充：
+
+QueryTermMappingAdminService 5 个抽象方法：create / update / delete / query_by_id / page_query（L64-L82）
+BizChangeLogContext.put() L91
+QueryTermMappingAdminServiceImpl 方法：create / update / delete / query_by_id / page_query / _load_by_id / _to_vo（L107-L202）
+QueryTermMappingController 方法：page_query / query_by_id / create / update / delete（L211-L226）
+二、孤立实体 & Mapper（DO/Mapper 定义了但没有任何上层 DAO/Service 走这条链路）
+文件：intent_entity.py + intent_mapper.py
+
+注意：QueryTermMappingDO 和 QueryTermMappingMapper 不是死代码——它们在 query_rewrite.py 的 QueryTermMappingService.normalize() 中被 Agent Pipeline 真实读取数据库使用；而 IntentNodeDO / ConversationMessageDO / SourceRef / GroundingChunk 只有被 IntentNodeMapper/ConversationMapper 当泛型参数，整条链路零调用。
+
+#	类型	名称	所在文件	行号	备注
+15	dataclass	IntentNodeDO	intent_entity.py	L7	意图节点实体：仅在 IntentNodeMapper 作泛型参数，而 IntentNodeMapper 本身也死
+16	dataclass	SourceRef	intent_entity.py	L35	消息来源引用：仅在 ConversationMessageDO.sources 作为字段类型自引用，无外部实例化
+17	dataclass	GroundingChunk	intent_entity.py	L45	检索分片 DO：同上，仅 ConversationMessageDO.retrieved_chunks 自引用
+18	dataclass	ConversationMessageDO	intent_entity.py	L50	消息 DO：仅 ConversationMessageMapper 泛型参数，Mapper 死
+19	普通类 (ABC)	ConversationMessageMapper	intent_mapper.py	L55	空 Mapper 接口，无子类/无 DI
+20	普通类 (ABC)	IntentNodeMapper	intent_mapper.py	L59	空 Mapper 接口，无子类/无 DI
+三、Agent 配置侧「迁移占位 6 件套」——从未被业务代码实际接入
+文件：intent_prompt/agent_intent_prompt.py
+
+头注释写着「聚合了 core/prompt 目录下 3 个原有模块缺失引用的 7 个类」，但实际只有第 7 个 PromptTemplateUtils 真的被 prompt_template_loader.py 使用；其余 6 个符号 + 1 个 helper 函数都只在文件内部形成「定义 + 文档 + __all__ 列表」的闭环，没有任何一个外部 .py 导入它们。
+
+#	类型	名称	行号	备注
+21	Enum	OrchestrationMode	L32	⚠️ 名字冲突风险：core/agent/orchestrator.py:L28 已有同名类型别名 OrchestrationMode = Literal["react","plan_execute"]，项目用的是那个；这个 Enum 版是僵尸（含 WORKFLOW/AGENT 两个档位 + of() 静态方法，全无人调用）
+22	dataclass	AgentProfileDO	L57	智能体配置实体：5 个 Java 风格 getter 同时死（见下方方法级）
+23	dataclass	AgentPromptDO	L91	智能体提示词实体：3 个 getter 同上
+24	普通类 (ABC)	AgentProfileMapper	L116	空接口，无任何子类/DI
+25	普通类 (ABC)	AgentPromptMapper	L126	空接口，无任何子类/DI
+26	dataclass	AgentPromptCacheManager	L135	Redis/本地双层缓存管理器：3 个方法 + 内部字段全未被调用
+27	顶层函数	_time_unit_hours_sentinel()	L212	被 AgentPromptCacheManager.save_to_cache() 内部调用 → 因为 save_to_cache 本身死，该 helper 跟随死
+方法级（所属类已死，不重复计入父类）：
+
+OrchestrationMode.of() L38、__str__() L49
+AgentProfileDO 5 个 getter：get_id / get_name / get_builtin / get_active / get_create_time（L71-L85）
+AgentPromptDO 3 个 getter：get_agent_id / get_slot_key / get_content（L103-L110）
+AgentPromptCacheManager 方法：get_from_cache / save_to_cache / clear_cache（L153-L209）
+四、核心模型的孤立符号
+文件：intent_data_base.py
+
+#	类型	名称	行号	备注
+28	Enum	MessageStatus	L26	只有一个枚举值 NORMAL = "NORMAL"，整个项目零引用（扫描器已报死代码）
+29	普通类	ChatRequestBuilder	L73	Builder 模式的 9 个方法 + IntentChatRequest.builder() 静态入口，但全项目从未出现一次 .builder() 调用链——实际代码中全是直接构造 IntentChatRequest(messages=..., ...) 传参
+30	顶层静态方法	IntentChatRequest.builder()	L69	Builder 入口，同上，零调用
+ChatRequestBuilder 的 9 个死方法（L84-L129）：messages / temperature / top_p / max_tokens / thinking / response_format / tools / tool_choice / build
+
+五、孤立配置常量
+文件：rag_constant.py
+
+#	类型	名称	行号	备注
+31	顶层常量	MULTI_CHANNEL_KEY	L8	"multi_channel" 字符串常量，全项目除定义外 0 引用
+六、占位类（不算严格死代码，但无实际效果，一并提醒）
+#	文件	名称	行号	说明
+★	intent_utils.py L25	rag_trace_node 装饰器	L25	已在 2 个服务模块装饰了 4 个方法，但内部只有 return func(...) 透传，零追踪输出。这就是你上一条消息指出的——接口已挂上，实现仍待补。不建议删除，建议加 TODO 注释
+📊 汇总表
+分类	数量
+死 dataclass（含 4 个请求 DTO + 2 个管理 VO + 4 个孤立 DO + 2 个 Agent DO + 1 个 AgentCacheManager）	13 个
+死 Enum	2 个（MessageStatus、OrchestrationMode）
+死普通类 / ABC 接口	11 个（2 Service + 2 Controller + 2 Mapper + BizChangeLogContext + ChatRequestBuilder + 2 Agent Mapper + IntentTreeService）
+死顶层函数	1 个（_time_unit_hours_sentinel）
+死静态方法入口	1 个（IntentChatRequest.builder）
+死顶层常量	1 个（MULTI_CHANNEL_KEY）
+方法级死代码（以上死类内部的方法 + Builder 方法）	约 60+ 个方法，随父类整体删除即可
+⚠️ 假阴性提醒：如果项目未来打算接入「意图节点管理后台 API」「术语映射管理后台 API」「Agent 配置（profile/prompt）后台 API」或接入多通道 RAG，则 1A/1B/三/五的符号届时会被启用，删除前请务必确认这四条后台链路已经被其他方案替代或彻底不做。
+
+消耗
+89.79
+代码变更
+50%
+好的，执行吧
+先帮我确认一下这些死代码是否真的没有外部引用
