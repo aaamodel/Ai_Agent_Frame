@@ -49,7 +49,7 @@ class IntentChatMessage:
 class IntentChatRequest:
     """query_intent 侧统一的 LLM 聊天请求 DTO。
 
-    本轮结构化输出改造新增字段（底部）：
+
       - response_format：OpenAI 协议 response_format 字典（json_schema / json_object），
         详见 llm_schemas.pydantic_to_openai_response_format。
       - tools：function calling 工具列表；见 llm_schemas.build_function_tool_def。

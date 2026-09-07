@@ -28,6 +28,9 @@ query_intent_dto2.md
 rewrite_for_agent.md
 get_skills_summary_for_prompt
 
+# ===== 生成的调试/分析临时产物（非源码） =====
+scan_and_refresh_skills
+
 # ===== 重复的 compose 副本 =====
 docker-compose副本.yml
 
