@@ -52,11 +52,15 @@ _VALID_TIME_RANGE = {"OneDay", "OneWeek", "OneMonth", "OneYear"}
 
 
 class DoubaoWebSearchTool(BaseTool):
-    """豆包搜索 API 直连工具（第一梯队主）。
+    """联网搜索唯一对外工具（豆包 API 直连；内部自带 Tavily 降级通道）。
 
-    区分两种情况：
-    1. 工具故障：http 异常、鉴权错误、服务报错 → 自动降级 Tavily
-    2. API 返回 0 条文档：接口正常，只是没有网页资料 → 不降级，直接返回空结果提示
+    降级策略（**全部在代码层完成，不经过大模型判断**）：
+    1. 调用异常（网络 / 鉴权 / 服务报错，重试 2 次后仍失败）→ 降级 ``_fallback``（Tavily）
+    2. 接口正常但 0 条文档 / 无摘要 → 同样降级 ``_fallback``
+    两条通道都没有有效结果时，才返回"未检索到 / 工具故障"提示，让模型改用自身知识作答。
+
+    之所以把两档合并：豆包返回空结果时，另一家搜索引擎往往能命中（索引源不同），
+    而降级只是一次内部 HTTP 调用、不额外消耗 LLM 轮次，比让模型去判断"要不要换工具"便宜且确定。
     """
 
     # ===== 输出体积控制参数（可按 Agent 上下文窗口调优）=====
@@ -66,17 +70,9 @@ class DoubaoWebSearchTool(BaseTool):
     MAX_OUTPUT_TOTAL = 6000     # 搜索工具返回给 LLM 的整体最大字符，控制 token
     KEEP_TOP_DOCS = 5           # 只保留 Rank 靠前 N 篇文档，不全部返回
 
-    SYSTEM_PROMPT: str = (
-        "## web_search 外部信息联网搜索工具，优先使用此工具\n"
-        "1. 本工具（豆包搜索）是联网搜索的**第一梯队首选通道**：需要外部互联网的实时、"
-        "公开信息（新闻、行情、最新动态、公开资料）时，一律优先调用本工具。\n"
-        "2. 仅在以下情况才考虑切换到第二梯队备选 `tavily_web_search`：本工具被系统标记为"
-        "熔断/不可用，或返回结果明确提示搜索失败、长期无有效数据。\n"
-        "3. 本工具绝不能用于查询公司内部文件、机密合同或私有资产（内部数据请用 "
-        "rag_knowledge_search / knowledge_graph_search / local_excel_tool 等内部检索工具）。\n"
-        "4. `count` 控制结果条数（1-10），`time_range` 可限定网页发布时间"
-        "（OneDay / OneWeek / OneMonth / OneYear），时效性强的问题建议传 time_range。"
-    )
+    SYSTEM_PROMPT: str = "联网搜索外部公开信息（新闻/行情/最新动态/公开资料）"
+
+
 
     def __init__(
         self,
@@ -87,9 +83,8 @@ class DoubaoWebSearchTool(BaseTool):
         super().__init__()
         self.name = "web_search"
         self.description = (
-            "联网检索工具的首选，用于查询外部互联网的公开、"
-            "实时新闻、最新动态与公开资料；仅在自身服务故障时由系统降级到备选tavily_web_search "
-            "。绝对不能用于查询任何公司内部文件、机密合同或私有资产。"
+            "联网搜索外部公开信息（新闻/行情/最新动态/公开资料）。"
+            "不用于公司内部文件、私有数据。"
         )
         self.parameters = [
             ToolParameter(name="query", type="string", description="搜索关键词或完整问句", required=True),
@@ -129,7 +124,7 @@ class DoubaoWebSearchTool(BaseTool):
                 if context:
                     logger.info("豆包搜索成功，query='{}'，返回内容长度={}", query, len(context))
                     return f"以下是关于「{query}」的最新联网搜索结果：\n{context}"
-                # HTTP 正常、业务返回空数据：不再重试相同请求，直接标记空结果
+                # HTTP 正常、业务返回空数据：不再重试相同请求，转内部降级通道
                 got_empty_result = True
                 logger.warning("豆包搜索接口调用成功，但 Documents 为空，query='{}'", query)
                 break
@@ -140,25 +135,48 @@ class DoubaoWebSearchTool(BaseTool):
             if attempt < doubao_max_retries:
                 await asyncio.sleep(1.0)
 
-        # 分支1：接口正常，只是无网页，不走降级
+        # 统一走代码层降级：空结果与调用异常都交给内部通道，模型不参与"要不要换工具"的决策
+        fallback_text = await self._try_fallback(query, got_empty_result)
+        if fallback_text:
+            return fallback_text
+
+        # 两条通道都无有效结果：按失败成因返回对应提示，让模型改用自身知识作答
         if got_empty_result:
             return _SEARCH_EMPTY_RESULT
-
-        # 分支2：发生网络/鉴权异常，才走 fallback 降级
-        if self._fallback is not None:
-            logger.warning("豆包搜索【服务异常】（{}），降级到备选搜索工具 [{}]", repr(last_exception), self._fallback.name)
-            try:
-                fallback_result = await self._fallback.execute(query=query)
-                text = str(fallback_result)
-                if "【系统提示】" not in text:
-                    logger.info("备选搜索成功，query='{}'，返回内容长度={}", query, len(text))
-                    return text
-                logger.warning("备选搜索也未返回有效结果，query='{}'", query)
-            except Exception as exc:
-                logger.warning("备选搜索执行失败，原因: {}", exc)
-
-        logger.error("豆包搜索与备选通道均发生故障（最后异常: {}）。", repr(last_exception))
+        logger.error("豆包搜索与降级通道均发生故障（最后异常: {}）。", repr(last_exception))
         return _SEARCH_TOOL_FAILURE_SUFFIX.format(query=query)
+
+    async def _try_fallback(self, query: str, doubao_empty: bool) -> Optional[str]:
+        """调用内部降级通道（Tavily）；拿不到有效结果时返回 None。
+
+        ⚠️ 这是**纯代码层降级**：该通道（``search.WebSearchTool``）不注册进 ToolRegistry、
+        也不出现在任何意图白名单里，模型既看不到也调不到它，"何时降级"由本方法决定。
+
+        Args:
+            query: 用户检索问句（原样透传，降级不再改写 query）。
+            doubao_empty: True 表示豆包"接口正常但无结果"，False 表示调用异常。
+
+        Returns:
+            可用的搜索结果文本；未注入通道 / 抛异常 / 返回"【系统提示】"占位时返回 None。
+        """
+        if self._fallback is None:
+            return None
+        reason: str = "接口返回空结果" if doubao_empty else "调用发生异常"
+        logger.warning(
+            "豆包搜索【{}】，降级到内部通道 [{}]，query='{}'", reason, self._fallback.name, query
+        )
+        try:
+            fallback_result = await self._fallback.execute(query=query)
+        except Exception as exc:  # noqa: BLE001 - 降级通道失败只影响最终文案，不向上抛
+            logger.warning("降级通道执行失败，原因: {}", exc)
+            return None
+        text: str = str(fallback_result)
+        # 降级通道以"【系统提示】"开头表示"我也没拿到有效结果"
+        if "【系统提示】" in text:
+            logger.warning("降级通道也未返回有效结果，query='{}'", query)
+            return None
+        logger.info("降级通道搜索成功，query='{}'，返回内容长度={}", query, len(text))
+        return text
 
     async def _search_via_doubao(self, query: str, count: int, time_range: Optional[str]) -> str:
         """调用豆包搜索 HTTP 接口并格式化结果；0 条结果返回空串；HTTP 异常直接 raise。

@@ -1,0 +1,198 @@
+# =====================================================================
+# eval CI：每次 push / PR 跑评测并把质量门当成红线
+#
+# 两个 job 是刻意分开的：
+#   1. offline-eval-tests —— 只跑纯函数单测 + 黄金集校验。
+#      不需要 Milvus / Redis / 模型 API，**任何环境都能绿**，
+#      负责守住"指标算法没被改坏""黄金集没标注到不存在的意图/工具"。
+#   2. full-eval —— 跑真实三阶段链路（意图/RAG/工具）出 eval_report.md，
+#      并把 thresholds.yaml 当红线。
+#      需要密钥，所以用 job 级 output 做条件：**没配 secrets 就跳过**，
+#      而不是失败——否则 fork 过来的 PR 会因为缺密钥而红。
+# =====================================================================
+name: eval
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "app/**"
+      - "evals/**"
+      - "monitoring/**"
+      - "requirements.txt"
+      - ".github/workflows/eval.yml"
+  pull_request:
+    paths:
+      - "app/**"
+      - "evals/**"
+  workflow_dispatch:
+    inputs:
+      run_full_eval:
+        description: "是否跑全量评测（需要密钥与中间件）"
+        type: boolean
+        default: false
+
+concurrency:
+  group: eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------
+  # JOB 1：离线必跑（无依赖）
+  # -------------------------------------------------------------------
+  offline-eval-tests:
+    name: 离线单测 + 黄金集校验
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # 只装纯函数单测需要的最小依赖，避免为了跑指标算法去装 llama-index
+      - name: 安装最小依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pyyaml
+
+      - name: 指标算法 + 质量门 + 黄金集校验
+        run: |
+          pytest evals/test_metrics.py evals/test_eval_gate.py -v \
+            --no-header -p no:cacheprovider
+
+      - name: 黄金集体检（ID 唯一性 / 取值是否落在真实枚举内）
+        run: |
+          python - <<'PY'
+          from evals.loaders import load_intent_cases, load_rag_cases, load_tool_cases
+          from evals.doc_ids import make_doc_id
+          i, r, t = load_intent_cases(), load_rag_cases(), load_tool_cases()
+          print(f"黄金集：意图 {len(i)} / RAG {len(r)} / 工具 {len(t)} 条")
+          assert len(i) >= 15 and len(r) >= 20 and len(t) >= 15, "黄金集条数不足"
+          mismatch = [
+              c["id"] for c in r
+              if c.get("expected_doc_id") and c["expected_doc_id"] != make_doc_id(c["expected_doc_name"])
+          ]
+          assert not mismatch, f"expected_doc_id 与文件名派生规则不一致：{mismatch}"
+          print("expected_doc_id 与文件名派生规则一致 ✅")
+          PY
+
+  # -------------------------------------------------------------------
+  # JOB 2：全量评测（需要密钥；没配就跳过）
+  # -------------------------------------------------------------------
+  full-eval:
+    name: 全量评测（真实链路）
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: offline-eval-tests
+    # 用 output 间接判断 secrets 是否存在（GitHub 不允许在 job.if 里直接用 secrets）
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      milvus:
+        image: milvusdb/milvus:v2.4.0
+        env:
+          ETCD_USE_EMBED: "true"
+          ETCD_DATA_DIR: /var/lib/milvus/etcd
+          COMMON_STORAGETYPE: local
+        ports: ["19530:19530", "9091:9091"]
+        options: >-
+          --health-cmd "curl -f http://localhost:9091/healthz"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+    steps:
+      - name: 检查密钥是否就绪
+        id: check
+        env:
+          LLM_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$LLM_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 OPENAI_API_KEY，跳过全量评测（这是预期行为，不是失败）"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.enabled == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.enabled == 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: 等待 Milvus 就绪
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:9091/healthz > /dev/null; then
+              echo "Milvus 已就绪"; exit 0
+            fi
+            echo "等待 Milvus… ($i/40)"; sleep 5
+          done
+          echo "::error::Milvus 未在预期时间内就绪"; exit 1
+
+      # 评测语料入库：必须走 reingest_corpus，因为它用确定性 doc_id，
+      # 黄金集的 expected_doc_id 才对得上（线上 upload 用 uuid4，对不上）
+      - name: 灌评测语料（确定性 doc_id）
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          MILVUS_HOST: 127.0.0.1
+          MILVUS_PORT: "19530"
+          REDIS_URL: redis://127.0.0.1:6379/0
+          MILVUS_KB_COLLECTION_NAME: eval_kb_512
+        run: |
+          python -m evals.tools.reingest_corpus \
+            --collection eval_kb_512 --chunk-size 512 --reset --confirm-reset
+
+      - name: 跑三组评测并产出 eval_report.md
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          MILVUS_HOST: 127.0.0.1
+          MILVUS_PORT: "19530"
+          REDIS_URL: redis://127.0.0.1:6379/0
+          MILVUS_KB_COLLECTION_NAME: eval_kb_512
+          # 关键：CI 上绝不允许评测链路去重建集合
+          MILVUS_KB_OVERWRITE: "false"
+        run: |
+          python -m evals.report --run-all
+
+      - name: 质量门（跌破 thresholds.yaml 即失败）
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          pytest evals/test_eval_gate.py::test_eval_gate_pytest_gate -v \
+            --no-header -p no:cacheprovider
+
+      - name: 上传评测报告
+        if: always() && steps.check.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            evals/eval_report.md
+            evals/_results/
+          if-no-files-found: warn
+          retention-days: 30

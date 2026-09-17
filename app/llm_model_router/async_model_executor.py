@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """异步版模型路由执行器：按候选顺序调用，失败自动降级下一个。
 
-与同步版 ``ModelRoutingExecutor`` 思路一致，但整个调用链是 async：
+整个调用链是 async：
   - ``client_resolver`` 仍允许为同步 callable（查表返回客户端对象即可）；
-  - ``caller`` 必须是 async callable，签名为
-    ``async caller(client, target: ModelTarget, **execution_kwargs) -> TResult``；
+  - 单次调用固定走 OpenAI 兼容协议的 ``async_openai_chat_caller``。历史上曾以
+    ``caller`` 参数注入以支持"多协议/多 capability"，但实际只有一个 caller 实现、
+    一种 capability（CHAT），该泛型属于投机设计，已内联为本模块直接调用；
   - 结果通过``permit.mark_success/mark_failure`` 反馈给 AsyncModelHealthStore。
 """
 
@@ -12,16 +13,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable, List, Optional, TypeVar
+from typing import Any, Callable, List, Optional
 
 from app.llm_model_router.async_model_health import AsyncModelHealthStore, CallPermit
+from app.llm_model_router.async_openai_caller import (
+    AsyncOpenAICallResult,
+    async_openai_chat_caller,
+)
 from app.llm_model_router.model_router_config import AIModelProperties
 from app.llm_model_router.model_router_enums import ModelCapability, ModelTarget
 
 logger = logging.getLogger(__name__)
-
-TClient = TypeVar("TClient")
-TResult = TypeVar("TResult")
 
 
 class AsyncModelRoutingExecutor:
@@ -35,28 +37,32 @@ class AsyncModelRoutingExecutor:
         self._health_store = health_store
         self._properties = properties
 
-    async def execute_with_fallback(
+    async def execute_with_candidate_fallback(
         self,
         capability: ModelCapability,
         targets: List[ModelTarget],
-        client_resolver: Callable[[ModelTarget], Optional[TClient]],
-        caller: Callable[..., Awaitable[TResult]],
+        client_resolver: Callable[[ModelTarget], Optional[Any]],
         **execution_kwargs,
-    ) -> TResult:
+    ) -> AsyncOpenAICallResult:
         """
         按 targets 顺序发起异步调用，第一个成功者即返回结果。
+
+        ⚠️ 命名说明：本方法是本执行器**唯一**的执行入口（不存在"不带 fallback 的
+        execute"）。这里的 fallback 指的是**候选级故障转移**（failover）——在
+        targets 之间逐个转移，而非"主路径失败后启用的备用路径"。后者请见
+        ReAct 的 FC→文本协议、Orchestrator 的 plan→react，那些才是真正的 fallback。
 
         Args:
             capability: 能力类型（仅用于日志/错误信息）
             targets: Selector 输出的候选目标列表（已按 tier/priority/健康 排序过滤）
             client_resolver: ``ModelTarget → Optional[客户端对象]``；返回 None 视为
                 客户端缺失，跳过该候选并 warning。
-            caller: ``async def caller(client, target, **execution_kwargs) -> TResult``
-            **execution_kwargs: 透传给 caller 的实际调用参数（messages/temperature/
-                max_tokens/thinking/response_format/tools/tool_choice 等）。
+            **execution_kwargs: 透传给 ``async_openai_chat_caller`` 的调用参数
+                （messages/temperature/max_tokens/thinking/response_format/
+                tools/tool_choice 等）。
 
         Returns:
-            首个成功的 caller 返回值。
+            首个成功候选的 AsyncOpenAICallResult。
 
         Raises:
             RuntimeError: 所有候选全部失败（附带最后一个异常的 cause 链）。
@@ -96,11 +102,11 @@ class AsyncModelRoutingExecutor:
                 timeout_s: Optional[float] = self._resolve_timeout(target)
                 if timeout_s is not None:
                     result = await asyncio.wait_for(
-                        caller(client, target, **execution_kwargs),
+                        async_openai_chat_caller(client, target, **execution_kwargs),
                         timeout=timeout_s,
                     )
                 else:
-                    result = await caller(client, target, **execution_kwargs)
+                    result = await async_openai_chat_caller(client, target, **execution_kwargs)
             except asyncio.TimeoutError as exc:
                 last_exception = exc
                 try:

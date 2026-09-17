@@ -11,7 +11,7 @@
   1) 用 IntentTreeVectorRetriever（调整二）对用户问题做 Embedding Top-K
      召回，只把最相关的候选意图节点序列化进 Prompt（召回失败时降级为
      全量叶子清单，保住「单次调用」收益）；
-  2) 单次 LLM 调用同时产出：改写字段（6 顶层字段，与 AgentRewriteSchema
+  2) 单次 LLM 调用同时产出：改写字段（8 顶层字段，与 AgentRewriteSchema
      一致）+ 逐问题意图打分（intent_classifications，按 question_index
      索引主/子问题）；
   3) 改写字段解析完全复用父类 _parse_agent_rewrite（clamp + 工具白名单
@@ -298,11 +298,13 @@ class AgentCombinedRewriteIntentService(AgentMultiQuestionRewriteService):
             if effective_tools:
                 sb.append(f"  tools={','.join(effective_tools)}\n")
 
+            # 示例只保留**最多 1 条**：候选清单是 TopK=8 个节点、每个节点 3~5 条示例，
+            # 全部渲染进 Prompt 后是这份清单里最大的一块（实测 8 个候选 ≈ 1.7KB），
+            # 而分类规则本身是按 path/description 的主题词判定的（见模板里的判定规则），
+            # 示例只是一个消歧锚点，留 1 条足够，剩下的纯占 token。
             examples = getattr(node, "examples", None) or []
             if examples:
-                sb.append("  examples=")
-                sb.append(" / ".join(str(e) for e in examples))
-                sb.append("\n")
+                sb.append(f"  example={examples[0]}\n")
             sb.append("\n")
         return "".join(sb)
 

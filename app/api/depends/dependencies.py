@@ -19,6 +19,7 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
+from app.config import get_settings
 from app.core.memory.manager import MemoryManager
 from app.core.memory.short_term import ShortTermMemory
 from app.core.memory.long_term import LongTermMemory
@@ -298,7 +299,10 @@ async def get_tool_registry(
     dynamic_registry = bootstrap_tools(
         db_session_factory=None,  # 根据你实际情况传入
         fs_backend=fs_backend,  # 注入虚拟文件沙箱
-        rag_service=rag_service  # 🌟 注入在寿命周期内已联通 Milvus 的 RAG 单例
+        rag_service=rag_service,  # 🌟 注入在寿命周期内已联通 Milvus 的 RAG 单例
+        # 表格自然语言查询工具的代码生成通道：复用 lifespan 构建的全局 ModelRouter 单例
+        # （多厂商 tier/熔断/追踪），不另起 LLM 客户端。
+        model_router=getattr(request.app.state, "model_router", None),
     )
 
     return dynamic_registry
@@ -411,3 +415,67 @@ async def get_pipeline(
         intent_aggregator=aggregator,
         mode_decider=mode_decider,
     )
+
+
+# ==========================================
+# 🌟【2.2 状态图】Agent GraphRunner 单例 + 节点配置
+# ==========================================
+def get_agent_config(request: Request) -> Dict[str, Any]:
+    """节点读取的配置字典（deps.cfg 协议即 ``dict.get(key, default)``）。
+
+    旧链路传的是 ``{"default_strategy": ...}`` 裸 dict；此处把 Settings 中
+    2.2 新增开关与既有步数/预算相关键一并下发，缺省行为与旧硬编码默认值一致。
+    """
+    settings = get_settings()
+    return {
+        "enable_skill_tool_gating": settings.enable_skill_tool_gating,
+        "enable_empty_result_replan": settings.enable_empty_result_replan,
+        "react_max_steps": settings.react_max_steps,
+        "max_replan_attempts": settings.max_replan_attempts,
+        "agent_evidence_gate_enabled": settings.agent_evidence_gate_enabled,
+        "agent_approval_enabled": settings.agent_approval_enabled,
+        "agent_danger_tools": settings.agent_danger_tools,
+        "agent_reflect_enabled": settings.agent_reflect_enabled,
+        "agent_reflect_min_score": settings.agent_reflect_min_score,
+        "agent_node_retry_max": settings.agent_node_retry_max,
+    }
+
+
+async def get_agent_graph_runner(request: Request) -> Any:
+    """FastAPI 依赖：获取进程级 GraphRunner 单例（懒初始化，带并发锁）。
+
+    - checkpointer 优先 Redis（复用 settings.redis_url，独立连接避免与业务
+      Redis 的 decode_responses=True 冲突），失败自动降级 InMemorySaver；
+    - 图只编译一次；审批/断点续跑依赖该单例持有的同一个 saver。
+    """
+    existing_runner: Optional[Any] = getattr(request.app.state, "agent_graph_runner", None)
+    if existing_runner is not None:
+        return existing_runner
+
+    init_lock: Optional[asyncio.Lock] = getattr(request.app.state, "agent_graph_runner_lock", None)
+    if init_lock is None:
+        init_lock = asyncio.Lock()
+        request.app.state.agent_graph_runner_lock = init_lock
+
+    async with init_lock:
+        # 双检：持锁期间可能已被其他请求初始化
+        existing_runner = getattr(request.app.state, "agent_graph_runner", None)
+        if existing_runner is not None:
+            return existing_runner
+
+        from app.core.agent.graph.builder import compile_agent_graph
+        from app.core.agent.graph.checkpoint import build_checkpointer
+        from app.core.agent.graph.runner import GraphRunner
+
+        settings = get_settings()
+        saver, actual_backend = await build_checkpointer(
+            backend=settings.agent_checkpoint_backend,
+            redis_url=settings.redis_url,
+            ttl_seconds=settings.agent_checkpoint_ttl_seconds,
+            checkpoint_prefix=settings.agent_checkpoint_prefix,
+        )
+        runner = GraphRunner(compile_agent_graph(saver), saver)
+        request.app.state.agent_graph_runner = runner
+        request.app.state.agent_checkpoint_backend = actual_backend
+        logger.info("Agent GraphRunner 初始化完成（checkpointer=%s）。", actual_backend)
+        return runner

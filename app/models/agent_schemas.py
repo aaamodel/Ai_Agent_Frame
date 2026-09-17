@@ -44,6 +44,46 @@ class DocumentUploadResponse(BaseModel):
     filename: str
     status: str
     chunk_count: int = 0
+    collection_name: str = ""
+    description: str | None = None
+    retrieval_hint: str | None = None
+    message: str = "ok"
+
+
+class CollectionFileInfo(BaseModel):
+    """逻辑集合内的单个文件信息。"""
+
+    filename: str
+    chunk_count: int = Field(default=0, description="Milvus 中该文件的向量切片数")
+    document_id: str | None = None
+    created_at: str | None = None
+
+
+class KbCollectionInfo(BaseModel):
+    """向量库逻辑集合信息（Milvus 实际向量 + Postgres 描述合并）。"""
+
+    name: str
+    description: str | None = Field(default=None, description="集合功能描述")
+    retrieval_hint: str | None = Field(default=None, description="检索时机描述（意图匹配用）")
+    document_count: int = 0
+    vector_chunk_count: int = 0
+    files: list[CollectionFileInfo] = Field(default_factory=list)
+
+
+class KbCollectionListResponse(BaseModel):
+    """向量集合列表响应（两层）：RAG 写入的物理 Milvus 集合 + 其内部的逻辑集合清单。"""
+
+    physical_collection: str = Field(description="RAG 服务当前读写的物理 Milvus 集合")
+    collections: list[KbCollectionInfo] = Field(default_factory=list)
+
+
+class CollectionFileDeleteResponse(BaseModel):
+    """按集合 + 文件名删除向量的响应。"""
+
+    collection: str
+    filename: str
+    deleted_chunks: int = 0
+    deleted_documents: int = 0
     message: str = "ok"
 
 

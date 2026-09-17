@@ -81,6 +81,20 @@ class DefaultIntentClassifier(IntentClassifier, IntentNodeRegistry):
         if roots is None or len(roots) == 0:
             return _IntentTreeData(all_nodes=[], leaf_nodes=[], id_to_node={})
 
+        # 用户上传的动态知识库集合（带功能描述/检索时机）合并为 knowledge 域下
+        # 的 KB 叶子节点——合并发生在缓存读取之后，因此不会污染缓存，且集合
+        # 增删后无需清树缓存即可生效（向量索引侧另由上传/删除接口负责 reset）。
+        # 必须深拷贝：缓存（或 DB mapper）持有的是同一批根节点对象引用，原地
+        # append 会让动态节点残留在缓存里，注册表清空后也摘不下来。
+        try:
+            import copy
+
+            from app.query_intent.kb_collection_registry import KbCollectionRegistry
+
+            roots = KbCollectionRegistry.merge_into_tree(copy.deepcopy(roots))
+        except Exception as merge_error:  # noqa: BLE001 - 动态集合是增强而非硬依赖
+            logger.warning("动态 KB 集合合并失败（忽略，不影响静态意图树）：%s", merge_error)
+
         all_nodes = self._flatten(roots)
         leaf_nodes = [n for n in all_nodes if n.is_leaf()]
         id_to_node = {n.id: n for n in all_nodes if n.id is not None}
@@ -91,6 +105,13 @@ class DefaultIntentClassifier(IntentClassifier, IntentNodeRegistry):
     def load_intent_tree_data(self) -> _IntentTreeData:
         """公开意图树数据访问入口（供向量检索器等外部组件复用缓存逻辑）。"""
         return self._load_intent_tree_data()
+
+    def invalidate_tree_cache(self) -> None:
+        """清除意图树缓存（动态 KB 集合增删后，向量索引重建前调用）。"""
+        try:
+            self._intent_tree_cache_manager.clear_intent_tree_cache()
+        except Exception as cache_error:  # noqa: BLE001 - 清缓存失败不阻断刷新
+            logger.warning("意图树缓存清除失败（忽略）：%s", cache_error)
 
     def get_node_by_id(self, node_id: str) -> IntentNode | None:
         if node_id is None or not node_id.strip():

@@ -85,6 +85,49 @@ class TaskComplexityAnalysis:
     reasoning_notes: str = ""
 
 
+# =============================================================================
+# 本轮目标（agent_goal）归一化 —— 主链路 / 降级链路 / 全部注入点共用的唯一口径
+# =============================================================================
+AGENT_GOAL_MAX_CHARS: int = 60
+"""本轮目标长度上限（一句话量级）。与提示词侧约束同源，见 design.md D6。"""
+
+_NULL_LIKE_GOAL_VALUES = frozenset({"", "null", "none"})
+
+
+def normalize_agent_goal(raw: Any, fallback_question: str) -> str:
+    """把改写阶段产出的目标归一为「非空 + 限长」的一句话。
+
+    步骤（顺序不可换）：空值判定 → 回退 → 硬截断。
+
+    ⚠️ 为什么必须**集中在这一处**、而不是各注入点各自兜底：
+        三个注入点（ReAct 系统段 / 规划提示词 / 台账首行）若各自实现兜底，
+        极易漂移成"一处回退到改写后的问题、另一处注入空串"，于是同一轮里
+        模型看到的目标并不一致。design.md D5 要求单一真源。
+
+    ⚠️ 截断是**硬截断**，不是"智能压缩"：压缩是提示词侧要求模型自己完成的
+        写作要求（design.md D6）；代码层只保证"任何情况下都不会注入超长文本"。
+        回退值本身也要截断（spec：回退为改写后问题，「必要时截断」），
+        否则一条 400 字的 rewrite 会直接变成 400 字的目标。
+
+    Args:
+        raw: LLM 产出的目标（可能为 None / 空串 / "null" 字面量 / 超长）。
+        fallback_question: 回退值——**改写后的问题**（调用方保证它是"当前问题"，
+            而不是原始问题，否则多轮指代场景下语义会错）。
+
+    Returns:
+        目标文本；仅当 raw 与 fallback_question 都为空时返回空串（调用方
+        此时按"无目标"处理，MUST NOT 因此中断链路）。
+    """
+    text: str = str(raw or "").strip()
+    if text.lower() in _NULL_LIKE_GOAL_VALUES:
+        text = ""
+    if not text:
+        text = str(fallback_question or "").strip()
+    if len(text) > AGENT_GOAL_MAX_CHARS:
+        text = text[:AGENT_GOAL_MAX_CHARS]
+    return text
+
+
 @dataclass
 class AgentRewriteResult:
     """Agent 改写阶段的完整输出。
@@ -105,9 +148,14 @@ class AgentRewriteResult:
         问题文本 → NodeScore 列表。非 None 时 Pipeline Stage2 走
         aggregate_for_agent_precomputed 零 LLM 聚合；None 时回退原
         resolve_for_agent 的独立 LLM 意图识别链路。
+        agent_goal: 本轮要交付的最终产物/结论形态（一句话，≤60 字）。
+            解析层经 :func:`normalize_agent_goal` 归一（strip → 截断 →
+            空值回退为 rewritten_question），故**由解析层产出时恒非空**；
+            手工构造（如规则兜底）也走同一函数，读取侧再有兜底不阻断链路。
     """
 
     rewritten_question: str = ""
+    agent_goal: str = ""
     should_split: bool = False
     sub_questions: List[str] = field(default_factory=list)
     complexity_analysis: TaskComplexityAnalysis = field(

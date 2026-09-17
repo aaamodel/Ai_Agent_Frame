@@ -18,32 +18,24 @@ from tavily import AsyncTavilyClient  # 需要先安装：pip install tavily-pyt
 
 
 class WebSearchTool(BaseTool):
-    """Tavily 联网搜索工具（第二梯队备选；带 3 次失败退避重试）。
+    """Tavily 联网搜索通道（**豆包搜索的内部降级专用，不注册进 ToolRegistry**）。
 
-    通过提示词（description + SYSTEM_PROMPT）显著限制使用时机：
+    ⚠️ 本工具不参与意图路由，也不下发给大模型——它的唯一调用方是
+    ``DoubaoWebSearchTool``：豆包搜索**空结果或调用异常**时由代码直接降级调用
+    （见 ``doubao_search.DoubaoWebSearchTool._try_fallback``）。
 
+    因为模型根本看不到它，这里**不再编写任何"使用时机"提示词**（原 SYSTEM_PROMPT 已删除）：
+    "什么时候该降级"不再是模型的判断题，而是 ``DoubaoWebSearchTool`` 里的 if 分支。
+    保留 3 次退避重试，作为降级通道自身的健壮性。
     """
-
-    # 第二梯队使用守则（tool_to_function_call_definition 会自动拼入 function description，
-    # 让大模型在 FC/ReAct/Plan 场景下都能看到本梯队约束）
-    SYSTEM_PROMPT: str = (
-        "## tavily_web_search 使用限制（第二梯队备选）\n"
-        "1. 本工具是联网搜索的**第二梯队备选**，第一梯队是 `web_search`（豆包搜索）。\n"
-        "2. 仅当满足以下任一条件时才允许调用本工具：\n"
-        "   - `web_search` 已被系统标记为熔断/不可用；\n"
-        "   - `web_search` 的返回明确提示搜索失败或长期无有效结果。\n"
-        "3. 严禁把本工具作为联网搜索的首选；只要 `web_search` 还可用，一律优先调用 `web_search`。\n"
-        "4. 严禁对同一个问题同时并行调用两个搜索工具；切换到本工具前必须先看过 `web_search` 的失败结果。"
-    )
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         super().__init__()
-        self.name = "tavily_web_search"
-        self.description = (
-            "Tavily 联网搜索的备选，用于查询外部互联网的公开、实时新闻与公开资料。"
-            "仅当第一梯队 web_search（豆包搜索）不可用、被熔断或返回失败提示时才允许使用；"
-            "绝不能用于查询任何公司内部文件、机密合同或私有资产。"
-        )
+        # name 仅用于日志留痕；由于未注册，LLM 无法通过它发起调用。
+        # 刻意不叫 "tavily_web_search"（那个"第二梯队工具名"已从全链路消失），
+        # 避免日志里出现一个在意图白名单/工具清单中都不存在的工具名造成误读。
+        self.name = "tavily_search_internal"
+        self.description = "Tavily 联网搜索（豆包搜索的内部降级通道，模型不可见）。"
         self.parameters = [
             ToolParameter(
                 name="query",

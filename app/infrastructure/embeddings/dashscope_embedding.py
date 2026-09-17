@@ -52,9 +52,17 @@ class DashScopeEmbedding(BaseEmbedding):
         ordered = sorted(resp.data, key=lambda item: item.index)
         return [item.embedding for item in ordered]
 
-    def _get_query_embedding(self, queries: List[str]) -> List[List[float]]:
-        """同步批量查询 embedding。"""
-        return self._get_text_embeddings(queries)
+    def _get_query_embedding(self, query: str) -> List[float]:
+        """同步单条查询 embedding。
+
+        ⚠️ 这里必须是**单条**语义（``str -> List[float]``），签名不能写成批量
+        ``(List[str]) -> List[List[float]]``：LlamaIndex 的 ``BaseEmbedding`` 按单条
+        调用（``get_query_embedding`` / ``get_agg_embedding_from_queries`` 都是逐条），
+        写成批量会返回二维数组，向量检索通道在构造 ``EmbeddingEndEvent`` 时直接抛
+        pydantic ``ValidationError``；该异常又被 ``HybridRetriever`` 的兜底 try 吞掉，
+        最终表现为「向量通道 0 召回」，日志上完全看不出异常。
+        """
+        return self._get_text_embedding(query)
 
     async def _aget_text_embedding(self, text: str) -> List[float]:
         """异步单条 embedding。"""
@@ -74,7 +82,3 @@ class DashScopeEmbedding(BaseEmbedding):
         resp = await self._async_client.embeddings.create(model=self.model_name, input=texts)
         ordered = sorted(resp.data, key=lambda item: item.index)
         return [item.embedding for item in ordered]
-
-    async def _aget_query_embeddings(self, queries: List[str]) -> List[List[float]]:
-        """异步批量查询 embedding。"""
-        return await self._aget_text_embeddings(queries)

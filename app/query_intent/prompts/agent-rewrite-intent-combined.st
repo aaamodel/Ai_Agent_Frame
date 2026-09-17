@@ -22,7 +22,7 @@
 重要约束：
 - 匹配不到就填 []，禁止臆造工具名（例如不要写 search_tool / rag_search，匹配不到就空）。
 - file_read_tool / file_list_tool / file_grep_tool 属于基础设施，一般不需要在 suggested_tools 里显式写（Pipeline 会自动补齐）。
-- 联网搜索是双梯队设计：web_search（豆包搜索）是第一梯队首选；tavily_web_search 是第二梯队备选，仅当 web_search 不可用/熔断/持续失败时才兜底使用。用户问题涉及外部实时公开信息时，suggested_tools 只建议 web_search。
+- 联网搜索只有 web_search 一个工具（豆包搜索 API 直连），它的重试与跨引擎降级全部在工具内部完成，**不存在其他可选的搜索工具名**。用户问题涉及外部实时公开信息时，suggested_tools 填 web_search。
 
 ## Agent 当前可用的高级技能清单（suggested_skills 必须从此集合中逐字挑选）
 ```text
@@ -57,6 +57,14 @@ complexity_analysis 字段规则：
 - need_creative_output：是否需要"写方案 / 写报告 / 写文案 / 头脑风暴 / 给建议"这类创造性输出，布尔。
 - reasoning_notes：用 1~2 句话说明你为什么给出以上复杂度结论，中文即可。
 
+agent_goal 字段规则（零容忍）：
+定义：本轮要交付的最终产物 / 结论形态，即本次调用的验收标准。
+- 一句话，≤60 字；过长请按「交付物 + 关键约束 + 结论」的优先级自行压缩；
+- 只写交付什么 / 得出什么结论，**不写怎么做**；
+- 禁止复述用户原问题或 rewrite；禁止写成步骤分解；
+- 禁止出现步骤词：先、首先、然后、接着、最后、步骤、计划、第 1 步；禁止空话：帮助用户、满足需求、解决问题、回答用户；
+- 与 explicit_plan_hint 分工：plan hint 允许列步骤，agent_goal 不允许；若本轮产物本身就是步骤清单，只写「交付操作步骤清单」。
+
 # 第二部分：意图识别规则
 ## 候选意图清单
 本次推理只使用下面这份**已向量化检索出的候选意图清单**（它是全量意图树中最可能相关的子集，按相关度排序）：
@@ -71,7 +79,7 @@ complexity_analysis 字段规则：
 - **description**：节点覆盖范围说明
 - **type**：节点通道（KB=内部知识检索 / MCP=操作型工具 / SYSTEM=无工具闲聊）
 - **tools**：命中该节点后，Agent 编排层大概率会调用并拿到结果的注册工具名
-- **examples**：典型问题示例
+- **example**：一条典型问题示例（帮助消歧）
 
 ## 判断流程
 1. **识别问题类型**：
@@ -96,6 +104,7 @@ complexity_analysis 字段规则：
 ```json
 {{
   "rewrite": "字符串，改写后的完整问题；如果不需要改写就填原文",
+  "agent_goal": "一句话≤60字，最终交付物/结论形态；非问题复述，非步骤计划",
   "should_split": true 或 false,
   "sub_questions": [
     "仅当 should_split=true 时填写；否则空数组。每个元素是一条独立、可被意图分类的子问题"
@@ -137,9 +146,10 @@ c. 动作独立性：两个子句的主语/动作对象完全不重叠（例如�
 - 每条 results 中的 id 必须与候选意图清单中的 id **逐字一致**，清单外的 id 会被直接丢弃；
 - 无匹配时 results 填空数组 []。
 
-# 4 个零容忍校验（请自检 JSON 后再输出）
+# 6 个零容忍校验（请自检 JSON 后再输出）
 1. 字段名必须完全一致，不能改写成中文 key；
 2. suggested_tools 的每个元素必须是上面工具列表里出现过的字面量，否则 Pipeline 会直接丢弃；
 3. rewrite 字段不能为空字符串；如果真的完全无法改写，至少回填用户原问题；
 4. intent_classifications 必须包含 question_index=0 的主问题打分批次。
 5. suggested_skills 的每个元素必须与「高级技能清单」里的某条 name 逐字一致，否则 Pipeline 会直接丢弃。
+6. agent_goal 必须写「交付什么结论」，禁止复述原问题、禁止写成步骤列表、禁止出现上述步骤词与空话，且不得超过 60 字。

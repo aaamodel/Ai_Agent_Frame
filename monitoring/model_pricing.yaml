@@ -1,0 +1,106 @@
+# =====================================================================
+# 模型价格表（用于把 token 用量换算成金额）
+#
+# ⚠️⚠️ 重要：本文件里的价格默认是 null，**不是 0**。
+#
+# 为什么留空：模型价格随时调整，编一个数字进仓库比留空更危险——
+# 留空会让"算不出成本"，编数字会让你在面试里被问"这个单价哪来的"时答不上。
+#
+# 填法（每条价格都必须写清来源与生效日期，否则这个数字不可辩护）：
+#   1. 打开对应厂商的官方定价页（见 source_url）；
+#   2. 把「每 1000 token」的单价填进 input_per_1k / output_per_1k；
+#   3. 把官方页面上看到的价格生效日期填进 price_effective_date；
+#   4. 把顶层 prices_filled 改成 true。
+#
+# 单位约定：**人民币元 / 1000 token**。如果你的账单是「元/百万 token」，
+# 除以 1000 即可（例：2 元/百万 token → input_per_1k: 0.002）。
+#
+# 币种：CNY。若账单是美元，请把 currency 改成 USD 并在报告里注明，
+# 不要混着算。
+# =====================================================================
+
+currency: CNY
+unit: "per_1k_tokens"
+prices_filled: true
+last_verified: 2026-09-14
+note: >-
+  价格未填时 cost_calculator.py 不会静默返回 0，而是标记为
+  pricing_source=unverified 并在输出里报警告，避免把"没填价格"
+  误读成"零成本"。
+
+# ---------------------------------------------------------------------
+# 各模型价格
+#
+# key 必须与 Langfuse 里记录到的 model 名**完全一致**（区分大小写）。
+# 若不确定 Langfuse 用的什么名字，先跑：
+#   python monitoring/langfuse_daily_report.py --list-models
+# 再把结果补到这里。
+# ---------------------------------------------------------------------
+models:
+
+  # ---- DashScope 阿里云百炼（本项目默认 provider）----
+  qwen3.7-flash:
+    tier: FAST
+    provider: dashscope
+    input_per_1k: 0.0002
+    output_per_1k: 0.0024
+    price_effective_date: 2026-09-14
+    source_url: "https://help.aliyun.com/zh/model-studio/models"
+    note: "Agent 工具交互 / 意图识别（purpose=react / intent_analysis）"
+
+  qwen3.8-flash:
+    tier: STANDARD
+    provider: dashscope
+    input_per_1k: 0.008
+    output_per_1k: 0.0027
+    price_effective_date: 2026-09-14
+    source_url: "https://help.aliyun.com/zh/model-studio/models"
+    note: "规划 / 标准对话（purpose=planner / chat）"
+
+  # DEEP tier：反思质量门用的思考模型。若与 STANDARD 同款，删掉这段即可，
+  # cost_calculator 会自动按 fallback 规则回退（见 default 段）。
+  qwen3.8-max-0902:
+    tier: DEEP
+    provider: dashscope
+    input_per_1k: 0.012
+    output_per_1k: 0.036
+    price_effective_date: 2026-09-14
+    source_url: "https://help.aliyun.com/zh/model-studio/models"
+    note: "反思质量门（purpose=reflection，开启 thinking）"
+
+  # ---- 向量模型（按 token 计价的 embedding 服务）----
+  text-embedding-v3:
+    tier: EMBEDDING
+    provider: dashscope
+    input_per_1k: 0.001
+    output_per_1k: 0
+    price_effective_date: 2026-09-14
+    source_url: "https://help.aliyun.com/zh/model-studio/models"
+    note: "RAG 向量化 + 意图树向量召回；embedding 只有 input 计费"
+
+# ---------------------------------------------------------------------
+# 兜底规则
+# ---------------------------------------------------------------------
+fallback:
+  # Langfuse 里出现了价格表没覆盖的模型时的处理方式。
+  #
+  # 目前**只支持 warn_and_skip**：把该模型列进 unknown、不计入总额。
+  # 为什么不提供"按 tier 默认价"：未知模型连它属于哪个 tier 都不知道，
+  # 猜一个价会让总额看起来完整但实际错误——比缺数字更危险。
+  # 要让它参与计价，就直接在下面 models: 里补一条。
+  on_unknown_model: warn_and_skip
+
+  # 保留字段（当前实现未使用），仅用于记录各档的参考价，便于人工补录。
+  tier_defaults:
+    FAST:
+      input_per_1k: 0.0006
+      output_per_1k: 0.0024
+    STANDARD:
+      input_per_1k: 0.001
+      output_per_1k: 0.004
+    DEEP:
+      input_per_1k: 0.012
+      output_per_1k: 0.036
+    EMBEDDING:
+      input_per_1k: 0.001
+      output_per_1k: 0

@@ -162,6 +162,18 @@ class ShortTermMemory:
             messages.append(self._deserialize(str(raw_a)))
         return messages
 
+    async def clear(self, session_id: str) -> None:
+        """清空指定会话的短期记忆。
+
+        用途：会话重置、以及**评测隔离**——评测用一次性 session_id 跑完后清掉，
+        否则下一轮评测会读到自己上一轮写的历史，测出来的 token/延迟会逐次膨胀。
+        """
+        try:
+            await self._redis.delete(self._key(session_id))
+        except Exception as e:
+            logger.exception("清空短期记忆失败: {}", e)
+            raise RuntimeError(f"清空短期记忆失败: {e}") from e
+
     async def add_message(
             self,
             session_id: str,

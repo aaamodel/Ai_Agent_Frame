@@ -1,4 +1,4 @@
-﻿"""query_intent.orchestration 子包：Agent 编排模式决策 + Pipeline 总入口。
+"""query_intent.orchestration 子包：Agent 编排模式决策 + Pipeline 总入口。
 
 对外导出主要公共类型，方便外部（app 侧 dependencies / chat 路由）直接
 单 import 使用：

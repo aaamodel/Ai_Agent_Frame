@@ -54,34 +54,36 @@ MODE_DECISION_LLM_MIN_CONFIDENCE: float = 0.55
 #   1) Pipeline.fill_allowed_tools() 做白名单交叉过滤时的对照参考；
 #   2) P2 prompt 示例 suggested_tools 字面量必须从此集合取，避免 LLM 幻觉。
 # 数据来源（已代码核验）：
-#   local_excel_tool      ← LocalExcelTool.name
+#   local_excel_read_tool  ← LocalExcelReadTool.name（只读，不审批）
+#   local_excel_query_tool ← LocalExcelQueryTool.name（自然语言 pandas 取数，只读，不审批）
+#   local_excel_write_tool ← LocalExcelWriteTool.name（单格/语义/批量写入，危险名单，人工审批）
+#   sales_report_export_tool ← SalesReportExportTool.name（报表导出，危险名单，人工审批）
 #   feishu_bitable_tool   ← FeishuBitableTool.name
-#   web_search            ← DoubaoWebSearchTool.name（豆包搜索 API 直连，联网搜索第一梯队）
-#   tavily_web_search     ← WebSearchTool.name（Tavily，联网搜索第二梯队备选，
-#                            仅当 web_search 不可用时使用，使用时机由提示词约束）
+#   web_search            ← DoubaoWebSearchTool.name（豆包搜索 API 直连；联网搜索**唯一**对外工具）
 #   rag_knowledge_search  ← RagSearchTool.name
 #   knowledge_graph_search← KnowledgeGraphSearchTool.name
-#   write_todos           ← AgentTodoPlannerTool.name
 #   file_read_tool        ← FileReadTool.name
 #   file_list_tool        ← FileListTool.name
 #   file_grep_tool        ← FileGrepTool.name
 REGISTERED_ENABLED_TOOL_NAMES: list[str] = [
-    "local_excel_tool",
+    "local_excel_read_tool",
+    "local_excel_query_tool",
+    "local_excel_write_tool",
+    "sales_report_export_tool",
     "feishu_bitable_tool",
     "web_search",
     "rag_knowledge_search",
     "knowledge_graph_search",
-    "write_todos",
     "file_read_tool",
     "file_list_tool",
     "file_grep_tool",
 ]
 
-# ---- 联网搜索双梯队工具名（问题改写 / 模式决策 / Agent 执行提示词中引用）----
-# 第一梯队：豆包搜索（doubao_search.py），外部实时公开信息首选通道
-WEB_SEARCH_PRIMARY_TOOL_NAME: str = "web_search"
-# 第二梯队：Tavily 备选（search.py），仅当第一梯队不可用/熔断/失败时使用
-WEB_SEARCH_FALLBACK_TOOL_NAME: str = "tavily_web_search"
+# ---- 联网搜索：只有一个对外工具名 ----
+# 豆包搜索（doubao_search.py）是唯一注册、唯一下发给模型的联网检索工具；
+# Tavily（search.py 的 WebSearchTool）已降级为其**内部实现细节**——不注册、不进白名单、
+# 不下发 schema，模型侧完全不存在这个工具名，因此这里不再有"梯队/备选"常量。
+WEB_SEARCH_TOOL_NAME: str = "web_search"
 
 # ---- 原子基础设施工具兜底集合（与 orchestrator.py:L125 完全一致）----
 # 即使 allowed_tools 被 Pipeline 大幅缩窄，也必须保证这 3 个工具存在

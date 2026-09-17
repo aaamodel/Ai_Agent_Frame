@@ -34,8 +34,7 @@ from pydantic import BaseModel
 from app.llm_model_router.async_model_executor import AsyncModelRoutingExecutor
 from app.llm_model_router.async_model_health import AsyncModelHealthStore
 from app.llm_model_router.async_model_selector import AsyncModelSelector
-from app.llm_model_router.async_openai_caller import async_build_openai_client, AsyncOpenAICallResult, \
-    async_openai_chat_caller
+from app.llm_model_router.async_openai_caller import async_build_openai_client, AsyncOpenAICallResult
 from app.llm_model_router.model_router_config import AIModelProperties, resolve_model_id
 from app.llm_model_router.model_router_enums import Tier, ModelTarget, ModelCapability
 
@@ -212,59 +211,21 @@ class ModelRouter:
         model_preference: Optional[str] = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        """纯文本对话路由：失败按 Selector 排序顺序自动降级。
+        """对话路由统一执行体：解析 tier → 选候选 → 逐候选降级调用。
+
+        【已合并】原 ``chat`` 仅做 3 行转发到 ``_execute_route``，二者合一后少一层
+        透传；``chat_with_tools`` 亦复用本方法（仅额外注入 tools/tool_choice 后转调）。
+        失败时按 Selector 排序顺序自动降级到下一个候选。
 
         Args:
             messages: OpenAI 协议消息列表
             model_preference: 旧协议兼容参数（精确命中 model_id）
             **kwargs: temperature / max_tokens / thinking / response_format
-                / purpose_hint / tier_override。
+                / purpose_hint / tier_override / tools / tool_choice。
+
+        Returns:
+            LLMResponse（纯文本取 .content；Function Calling 取 .tool_calls）。
         """
-        result: AsyncOpenAICallResult = await self._execute_route(
-            messages, model_preference=model_preference, **kwargs
-        )
-        return self._to_response(result)
-
-    async def chat_with_tools(
-        self,
-        messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]],
-        tool_choice: Any = "auto",
-        model_preference: Optional[str] = None,
-        **kwargs: Any,
-    ) -> LLMResponse:
-        """Function Calling 对话路由：透传 tools/tool_choice 并返回含 tool_calls 的响应。
-
-        专供 Agent（ReAct / Planner 子任务）在需要大模型自主/强制调用工具时使用。
-        tools/tool_choice 不参与 tier 选择，仅作为请求载荷透传给底层
-        AsyncOpenAI SDK；除 content 外，结果中还携带 tool_calls（含严格校验后的
-        JSON 参数字符串）与 reasoning_content（思考模型思维链）。
-
-        Args:
-            messages: OpenAI 协议消息列表
-            tools: OpenAI tools[]（[{type: function, function: {name, description, parameters}}]）
-            tool_choice: "auto" 或 {"type": "function", "function": {"name": ...}} 强制指定
-            model_preference: 旧协议兼容参数（精确命中 model_id）
-            **kwargs: temperature / max_tokens / thinking / response_format
-                / purpose_hint / tier_override。
-        """
-        if not tools:
-            raise ValueError("chat_with_tools 要求至少传入一个 tools 定义")
-        kwargs["tools"] = tools
-        if tool_choice is not None:
-            kwargs["tool_choice"] = tool_choice
-        result: AsyncOpenAICallResult = await self._execute_route(
-            messages, model_preference=model_preference, **kwargs
-        )
-        return self._to_response(result)
-
-    async def _execute_route(
-        self,
-        messages: List[Dict[str, Any]],
-        model_preference: Optional[str] = None,
-        **kwargs: Any,
-    ) -> AsyncOpenAICallResult:
-        """统一路由执行体：解析 tier → 选候选 → 逐候选降级调用（chat 与 chat_with_tools 共用）。"""
         thinking_raw = kwargs.get("thinking")
         thinking_flag = bool(thinking_raw) if thinking_raw is not None else False
 
@@ -302,16 +263,48 @@ class ModelRouter:
 
         # ----- 2) 异步逐候选执行 + 降级（Executor 内：熔断许可 + 状态回写）-----
         result: AsyncOpenAICallResult = (
-            await self._executor.execute_with_fallback(
+            await self._executor.execute_with_candidate_fallback(
                 capability=ModelCapability.CHAT,
                 targets=targets,
                 client_resolver=self._resolve_client,
-                caller=async_openai_chat_caller,
                 messages=messages,
                 **kwargs,
             )
         )
-        return result
+        return self._to_response(result)
+
+    async def chat_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: Any = "auto",
+        model_preference: Optional[str] = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Function Calling 对话路由：透传 tools/tool_choice 并返回含 tool_calls 的响应。
+
+        专供 Agent（ReAct / Planner 子任务）在需要大模型自主/强制调用工具时使用。
+        tools/tool_choice 不参与 tier 选择，仅作为请求载荷透传给底层
+        AsyncOpenAI SDK；除 content 外，结果中还携带 tool_calls（含严格校验后的
+        JSON 参数字符串）与 reasoning_content（思考模型思维链）。
+
+        Args:
+            messages: OpenAI 协议消息列表
+            tools: OpenAI tools[]（[{type: function, function: {name, description, parameters}}]）
+            tool_choice: "auto" 或 {"type": "function", "function": {"name": ...}} 强制指定
+            model_preference: 旧协议兼容参数（精确命中 model_id）
+            **kwargs: temperature / max_tokens / thinking / response_format
+                / purpose_hint / tier_override。
+        """
+        if not tools:
+            raise ValueError("chat_with_tools 要求至少传入一个 tools 定义")
+        kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        # 复用 chat()：tools/tool_choice 已在 kwargs 里，会原样透传给底层 caller
+        return await self.chat(
+            messages=messages, model_preference=model_preference, **kwargs
+        )
 
     def _to_response(self, result: AsyncOpenAICallResult) -> LLMResponse:
         """把内部 AsyncOpenAICallResult 转为对外 LLMResponse（含 tool_calls / reasoning_content）。"""

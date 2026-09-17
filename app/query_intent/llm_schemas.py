@@ -344,55 +344,65 @@ def _json_schema_type_map(type_name: str, prop: Dict[str, Any]) -> Any:
 
 
 # ==============================================================================
-# S1：Agent 改写 Schema（agent-question-rewrite.st · 6 顶层字段）
+# S1：Agent 改写 Schema（agent-question-rewrite.st · 8 顶层字段）
 # ==============================================================================
+# ℹ️ 本区块所有 Field description 都会**逐字进 response_format 的 JSON Schema**，
+#    每次「改写+意图」调用都要带上（实测整份 schema ≈ 3.8KB / 1.1k token）。
+#    因此描述一律写"约束本身"，不复述业务背景、不带"建议/尽量"之类口水话。
 class TaskComplexitySchema(BaseModel):
     """Agent 改写 Stage1 输出的复杂度分析子对象（严格上下界 1~10 / 0~10）。"""
 
-    estimated_steps: int = Field(ge=1, le=10, description="预估完成任务所需步骤数，1~10。")
-    estimated_tool_calls: int = Field(ge=0, le=10, description="预估需要调用工具的总次数，0~10。")
-    has_multi_step_dependency: bool = Field(description="是否存在「第 N 步依赖第 N-1 步结果」的明确依赖。")
-    has_external_data_dependency: bool = Field(description="是否需要查询外部数据源（RAG/工具/飞书/网页）。")
-    need_creative_output: bool = Field(description="是否要求撰写/润色/创作类输出（不只是事实查询）。")
+    estimated_steps: int = Field(ge=1, le=10, description="预估步骤数（1~10）")
+    estimated_tool_calls: int = Field(ge=0, le=10, description="预估工具调用次数（0~10）")
+    has_multi_step_dependency: bool = Field(description="是否存在前后步骤依赖（第 N 步依赖第 N-1 步结果）")
+    has_external_data_dependency: bool = Field(description="是否需查外部数据源（知识库/图谱/表格/网络）")
+    need_creative_output: bool = Field(description="是否需创作类输出（写方案/报告/文案，非纯事实查询）")
     reasoning_notes: str = Field(
         default="",
         max_length=300,
-        description="复杂度判断的简短推理说明，建议控制在 300 字内。",
+        description="简短推理说明（≤300 字）",
     )
 
 
 class AgentRewriteSchema(BaseModel):
     """Agent Pipeline Stage1 改写结果：含问题重构+拆分+复杂度+工具建议+步骤提示。
 
-    对应 prompts/agent-question-rewrite.st 的 JSON 输出，顶层固定 6 个 key。
+    对应 prompts/agent-question-rewrite.st 的 JSON 输出，顶层固定 8 个 key。
     """
 
-    rewrite: str = Field(min_length=1, max_length=400, description="改写后的规范化用户问题（用于后续 Agent 处理）。")
-    should_split: bool = Field(description="是否建议拆分为多个子问题独立处理。")
+    rewrite: str = Field(min_length=1, max_length=400, description="规范化后的用户问题（≤400 字）")
+    # ⚠️ 只在本基类定义一次：主链路的 AgentRewriteIntentCombinedSchema 继承它即自动获得；
+    #    在子类重复定义会覆盖字段顺序、且 response_format 里会出现两份。
+    # 长度约束**刻意不放进 schema**：strict 模式下超长输出会被判为非法，进而把整次
+    # 改写调用打回降级链路（多一次 LLM）。按设计 D6，长度由提示词侧要求模型压缩、
+    # 解析层硬截断兜底（见 _parse_agent_rewrite），保证"不得阻断链路"。
+    agent_goal: str = Field(
+        description="本轮要交付的最终产物/结论形态（一句话≤60字；非问题复述、非步骤计划）",
+    )
+    should_split: bool = Field(description="是否拆分为多个子问题")
     sub_questions: List[str] = Field(
         default_factory=list,
-        description="拆分后的子问题列表；若不拆分则只包含 rewrite 本身 1 条。",
+        description="子问题列表（不拆分时仅含 rewrite 本身 1 条）",
         min_length=0,
         max_length=10,
     )
-    complexity_analysis: TaskComplexitySchema = Field(description="结构化任务复杂度分析。")
+    complexity_analysis: TaskComplexitySchema = Field(description="任务复杂度分析")
     suggested_tools: List[str] = Field(
         default_factory=list,
-        description="建议调用的工具名数组（必须来自 Prompt 中明确列出的可用工具白名单）。",
+        description="建议工具名（必须在 Prompt 的工具白名单内）",
         min_length=0,
         max_length=10,
     )
     suggested_skills: List[str] = Field(
         default_factory=list,
-        description="建议调用的高级技能名数组（必须逐字来自 Prompt 中列出的技能清单的 name 字段，"
-                    "禁止自造；若问题与任何技能无关则为空数组）。",
+        description="建议技能名（逐字取自 Prompt 技能清单的 name，无关则空数组）",
         min_length=0,
         max_length=20,
     )
     explicit_plan_hint: Optional[str] = Field(
         default=None,
         max_length=200,
-        description="若用户问题中存在「先…再…最后…」等显式步骤描述，回填原文摘要；否则为 null。",
+        description="显式步骤描述（「先…再…」）的原文摘要，无则 null",
     )
 
 
@@ -449,8 +459,9 @@ class QuestionIntentScoresSchema(BaseModel):
 class AgentRewriteIntentCombinedSchema(AgentRewriteSchema):
     """「改写 + 意图识别」单次 LLM 调用的组合输出容器（调整一核心）。
 
-    继承 AgentRewriteSchema 的 6 个顶层字段（rewrite/should_split/sub_questions/
-    complexity_analysis/suggested_tools/explicit_plan_hint），额外追加
+    继承 AgentRewriteSchema 的 8 个顶层字段（rewrite/agent_goal/should_split/
+    sub_questions/complexity_analysis/suggested_tools/suggested_skills/
+    explicit_plan_hint），额外追加
     intent_classifications 逐问题意图打分列表——一次网络往返同时产出
     Stage1（改写）与 Stage2（意图）两段结果，Pipeline 据此削减 1 次 LLM 调用。
     """
@@ -591,6 +602,11 @@ class SubTaskSchema(BaseModel):
         max_length=400,
         description="若 action_type=tool：给出工具参数的 JSON 文本或自然语言提示；否则为 null。",
     )
+    covers_sub_questions: Optional[List[int]] = Field(
+        default=None,
+        description="本子任务覆盖了哪些子问题（序号从 1 开始，与提示词里的子问题编号一致）。"
+                    "用于校验每个子问题都有对应子任务；无法确定时留空。",
+    )
 
 
 class PlanGenerateSchema(BaseModel):
@@ -604,12 +620,156 @@ class PlanGenerateSchema(BaseModel):
     )
 
 
+def _inject_tool_name_enum(
+    node: Any,
+    tool_names: List[str],
+    parent_key: Optional[str],
+) -> None:
+    """原地递归：给 schema 里名为 ``tool_name`` 的属性注入 enum（只动 string 分支）。
+
+    ``Optional[str]`` 在 JSON schema 里是 ``anyOf: [{type: string}, {type: null}]``，
+    enum 必须挂在 string 那一支上，否则 "null" 也会变成非法值。
+    """
+    if isinstance(node, dict):
+        if parent_key == "tool_name":
+            for branch in node.get("anyOf") or []:
+                if isinstance(branch, dict) and branch.get("type") == "string":
+                    branch["enum"] = list(tool_names)
+        for key, value in node.items():
+            _inject_tool_name_enum(value, tool_names, key)
+    elif isinstance(node, list):
+        for item in node:
+            _inject_tool_name_enum(item, tool_names, parent_key)
+
+
+def build_dynamic_plan_schema(
+    allowed_tool_names: List[str],
+    class_name: str = "DynamicPlanSchema",
+) -> Type[BaseModel]:
+    """按「当前可用工具白名单」动态构造 Planner 输出 schema（``tool_name`` 带 enum 约束）。
+
+    背景（一次真实故障）：静态 ``PlanGenerateSchema`` 里 ``tool_name`` 只是 ``str``，
+    而 planner 提示词里又没有给出真实工具清单，模型于是自己编了一个
+    ``sales_intelligence_query``（由技能名 sales-intelligence-assistant 派生），
+    执行阶段被白名单拒绝 → 触发一次完整 replan（单笔 7149 tokens，占全链路 1/5）。
+
+    ⚠️ 为什么必须**动态**构造：可用工具是运行时才确定的
+    （``active_tool_names`` = 意图白名单 ∩ 注册中心 ∩ 技能号令结果），
+    不可能在静态 Pydantic 类里写死 enum 字面量。
+
+    手法沿用 ``build_dynamic_tool_names_enum_schema``：不在 Python 类型层用
+    ``Literal`` 动态 unpack，而是把 enum 注入 JSON schema 的 string 分支，
+    这样 ``pydantic_to_openai_response_format`` 生成的 strict schema 才真正带 enum。
+
+    Args:
+        allowed_tool_names: 当前允许调用的工具名列表；为空时返回静态
+            ``PlanGenerateSchema``（不施加 enum 约束，保持旧行为，避免空 enum 锁死输出）。
+
+    Returns:
+        可直接交给 ``pydantic_to_openai_response_format`` 的 Pydantic 类。
+    """
+    tool_names: List[str] = sorted({
+        str(name).strip() for name in (allowed_tool_names or [])
+        if isinstance(name, str) and str(name).strip()
+    })
+    if not tool_names:
+        return PlanGenerateSchema
+
+    class DynamicSubTaskSchema(BaseModel):
+        """Planner 子任务声明（tool_name 受当前白名单 enum 约束）。"""
+
+        id: str = Field(min_length=1, max_length=64, description="子任务唯一 ID，例如 task_1。")
+        title: str = Field(min_length=1, max_length=120, description="子任务标题（简短可读）。")
+        description: str = Field(min_length=1, max_length=500, description="子任务完整描述与要求。")
+        action_type: Literal["tool", "reasoning"] = Field(
+            description="子任务类型：tool=需调用工具；reasoning=纯推理/总结/写作即可完成。",
+        )
+        tool_name: Optional[str] = Field(
+            default=None,
+            max_length=64,
+            description="若 action_type=tool：工具名，必须取自本 schema 给定的枚举值；否则为 null。",
+        )
+        tool_args_hint: Optional[str] = Field(
+            default=None,
+            max_length=400,
+            description="若 action_type=tool：工具参数的严格 JSON 文本；否则为 null。",
+        )
+        covers_sub_questions: Optional[List[int]] = Field(
+            default=None,
+            description="本子任务覆盖了哪些子问题（序号从 1 开始，与提示词里的子问题编号一致）。"
+                        "用于校验每个子问题都有对应子任务；无法确定时留空。",
+        )
+
+    class DynamicPlanSchema(BaseModel):
+        """Planner 计划顶层容器（tool_name 枚举已按当前白名单收紧）。"""
+
+        subtasks: List[DynamicSubTaskSchema] = Field(
+            default_factory=list,
+            description="规划出的子任务列表，按执行顺序排列。",
+            max_length=20,
+        )
+
+        @classmethod
+        def model_json_schema(cls, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+            """在生成后的 schema 上递归注入 tool_name enum。
+
+            ⚠️ 必须在**顶层类**上覆写：pydantic 生成父级 schema 时是通过 core schema
+            内联子模型的，**不会**调用子模型的 ``model_json_schema`` 类方法
+            （在子模型上覆写会静默失效 —— 表现为"代码看着加了 enum，实际 schema 里没有"）。
+            """
+            schema: Dict[str, Any] = super().model_json_schema(*args, **kwargs)
+            _inject_tool_name_enum(schema, tool_names, None)
+            return schema
+
+    DynamicPlanSchema.__name__ = class_name
+    return DynamicPlanSchema
+
+
+class SubTaskOutcomeSchema(BaseModel):
+    """plan 子任务执行产出的结构化结果：**结论 + 控制指令一次调用产出**。
+
+    与 ``SummaryVerdictSchema`` 同构——一次 LLM 调用同时拿到"业务产物"与"调度判定"，
+    **不额外发起调用**（这是它优于"注册一个 end 工具"的关键：后者要再跑一轮）。
+
+    ⚠️ 控制指令是**增值能力，不是主链路依赖**：解析失败时调用方 MUST 降级为
+    "继续执行下一子任务"，且 MUST NOT 丢弃已经花钱取回的结论。
+
+    两条字段的语义边界（与台账的两列一一对应）：
+        solved      → 本子任务是否解决了它要解决的问题（语义判断，只能模型自评）
+        next_action / skip_task_ids → 下一步怎么走（调度决策）
+    """
+
+    conclusion: str = Field(
+        min_length=1, description="本子任务的结论或分析结果（纯文本）。"
+    )
+    solved: Literal["yes", "partial", "no"] = Field(
+        description="本子任务是否解决了它要解决的问题："
+                    "yes=已拿到所需答案；partial=只拿到部分；no=没拿到。"
+                    "工具调用成功不等于 yes——返回了内容但答非所问应判 no/partial。"
+    )
+    next_action: Literal["continue", "finish"] = Field(
+        default="continue",
+        description="continue=继续执行后续子任务；"
+                    "finish=已有结论足以回答用户原始问题，提前收尾剩余子任务。",
+    )
+    skip_task_ids: Optional[List[str]] = Field(
+        default=None,
+        description="要跳过的子任务 id 列表（其答案已由其它子任务取得，或已无执行必要）。"
+                    "无需跳过时为 null。只允许跳过，不允许新增或修改子任务。",
+    )
+    reason: str = Field(
+        default="", description="选择 finish 或 skip_task_ids 的简短理由（用于留痕审计）。"
+    )
+
+
 __all__ = [
     # 公共工具
     "pydantic_to_openai_response_format",
     "build_function_tool_def",
     "build_tool_choice_required",
     "build_dynamic_tool_names_enum_schema",
+    "build_dynamic_plan_schema",
+    "SubTaskOutcomeSchema",
     "build_mcp_parameters_schema",
     # S1 Agent 改写
     "TaskComplexitySchema",

@@ -75,6 +75,22 @@ class IntentTreeVectorRetriever:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def reset(self) -> None:
+        """作废内存向量索引（动态 KB 集合增删后调用）。
+
+        下次 ``retrieve`` 会重新从 tree_provider 拉取全量叶子（含新集合节点）
+        并重新 embedding 预热；同时解除一次性 degraded 标记，给索引重建机会。
+        """
+        with self._lock:
+            self._vector_index = []
+            self._system_nodes = []
+            self._index_ready = False
+            self._index_degraded = False
+        invalidate = getattr(self._tree_provider, "invalidate_tree_cache", None)
+        if callable(invalidate):
+            invalidate()
+        logger.info("意图树向量索引已 reset，等待下次请求重新预热。")
+
     def retrieve(self, question: str) -> Optional[list[IntentNode]]:
         """对用户问题召回 Top-K 候选意图节点。
 

@@ -96,7 +96,6 @@ MODE_DECISION_DEFAULT: str = "react"      # 所有规则/LLM都无法判断时�
 #   - 检索类：  rag_knowledge_search  （Milvus 向量知识库精准检索）
 #              knowledge_graph_search （LightRAG 全局图谱/跨文档关系检索）
 #              web_search             （Tavily 互联网公开信息检索）
-#   - 编排辅助：write_todos          （Agent 任务待办规划工具，见 todo_list.py:L40）
 #   - 原子基础设施（Pipeline 不建议移除；orchestrator 也会自动补回）：
 #              file_read_tool / file_list_tool / file_grep_tool
 #

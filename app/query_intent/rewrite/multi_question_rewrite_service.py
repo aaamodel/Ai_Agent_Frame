@@ -27,6 +27,7 @@ from app.query_intent.rewrite.query_rewrite import (
 from app.query_intent.intent_dto import (
     AgentRewriteResult,
     TaskComplexityAnalysis,
+    normalize_agent_goal,
 )
 # 本轮结构化输出：Pydantic schema + OpenAI 协议转换工具 + 数组形状兜底
 from app.query_intent.llm_schemas import (
@@ -224,6 +225,11 @@ class AgentMultiQuestionRewriteService(
 
         fallback_result: AgentRewriteResult = AgentRewriteResult(
             rewritten_question=normalized_question or original_question,
+            # 规则兜底同样带上目标：否则 Pipeline 写 slots 时该键缺失，
+            # 下游读取侧只能退到 user_input，与主链路的取值口径不一致。
+            agent_goal=normalize_agent_goal(
+                "", normalized_question or original_question
+            ),
             should_split=False,
             sub_questions=[normalized_question or original_question],
             complexity_analysis=TaskComplexityAnalysis(
@@ -580,6 +586,13 @@ class AgentMultiQuestionRewriteService(
         else:
             explicit_plan_hint_value = str(plan_hint_raw).strip() or None
 
+        # agent_goal：本轮目标锚点。归一化**只在这里做一次**（strip → 截断 →
+        # 空值回退为改写后问题），下游三个注入点只读不各自兜底——否则会出现
+        # "一处回退到改写后问题、另一处注入空串"的漂移（design.md D5）。
+        agent_goal_value: str = normalize_agent_goal(
+            parsed_struct.agent_goal, final_rewritten_question
+        )
+
         # 技能名白名单过滤（与注入清单 name 逐字比对，防 LLM 幻觉自造技能名）
         skill_whitelist: set[str] = {
             str(skill_name).strip()
@@ -598,6 +611,7 @@ class AgentMultiQuestionRewriteService(
 
         return AgentRewriteResult(
             rewritten_question=final_rewritten_question,
+            agent_goal=agent_goal_value,
             should_split=should_split_value,
             sub_questions=sub_questions_value,
             complexity_analysis=complexity_result,

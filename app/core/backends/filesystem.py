@@ -385,7 +385,8 @@ class FilesystemBackend:
             logger.warning("ripgrep timed out; using Python grep fallback")
             return None
         except (FileNotFoundError, PermissionError, NotADirectoryError) as e:
-            logger.warning("ripgrep subprocess run failed (%s); clearing path cache", type(e).__name__)
+            # loguru 只认 {}：写成 %s 会打印字面量 "%s" 并丢掉异常类型
+            logger.warning("ripgrep subprocess run failed ({}); clearing path cache", type(e).__name__)
             _resolve_ripgrep_path.cache_clear()
             return None
 

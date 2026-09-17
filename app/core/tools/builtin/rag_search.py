@@ -22,10 +22,20 @@ class RagSearchTool(BaseTool):
         super().__init__()
         self.name = "rag_knowledge_search"
         self.description = (
-            "【局部精准检索工具】用于从私有知识库中查找【具体事实、特定数据、独立条款或明确定义】。"
-            "当用户的提问是寻找某个具体问题的标准答案（如：关税数字、特定材质标准、某项具体政策的原文条款）时，"
-            "必须优先使用此工具。注意：它不擅长做全局总结或跨实体的关系推导。"
+            "从私有知识库检索原文片段，用于获取具体事实、数字、条款、"
+            "操作步骤等可直接引用的文档证据。"
         )
+        """
+        self.description = (
+            "【证据检索工具】从私有知识库文档中检索与问题最相关的原文片段，"
+            "用于获取【具体事实、数字、定义、条款、标准、操作步骤、文档原文】等可直接作为回答依据的证据。"
+            "优先用于回答‘是什么’、‘多少’、‘具体规定是什么’、‘原文怎么说’、"
+            "‘某个具体问题的答案是什么’等问题。"
+            "该工具返回的是文档文本证据，不负责建立或推导多个实体之间的复杂关系。"
+            "如果问题主要需要跨文档发现实体、比较实体、追踪关系链或理解多个实体之间的关联，"
+            "应优先使用 knowledge_graph_search。"
+        )
+        """
         self._rag_service = rag_service
 
         # 显式声明工具参数规范
@@ -33,7 +43,7 @@ class RagSearchTool(BaseTool):
             ToolParameter(
                 name="query",
                 type="string",
-                description="需要进行语义搜索的精准关键词或细化问题文本。",
+                description="检索问题或关键词",
                 required=True
             ),
             ToolParameter(
@@ -45,15 +55,10 @@ class RagSearchTool(BaseTool):
             ToolParameter(
                 name="collection_names",
                 type="array",
-                description=(
-                    "【意图路由硬约束】限定检索范围的私有知识库集合名称列表（字符串数组），"
-                    "例如 [\"hr_docs\"]。当系统提示明确指定了目标集合时，必须传入该参数，"
-                    "严禁查询列表之外的集合；未指定时可省略，由系统在默认全库检索。"
-                ),
-                required=False
-            )
+                description="限定的知识库集合名列表，如 [\'hr_docs\']；未指定时可省略，由系统在默认全库检索。",
+                required=False)
         ]
-
+        
     async def execute(self, **kwargs: Any) -> str:
         """异步执行知识库检索并将结构化结果序列化为可供模型阅读的文本块。
 

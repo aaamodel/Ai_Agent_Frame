@@ -38,31 +38,55 @@ def _tokenize(text: str) -> List[str]:
 
 
 class BM25IndexBuilder:
-    """维护一份 id → 文本 的映射，并按需构建 BM25Okapi 检索器。"""
+    """维护一份 id → TextNode 的映射，并按需构建 BM25Okapi 检索器。
+
+    ⚠️ 存的是**整个 TextNode**（而不是只有文本），这一点很关键：BM25 的召回结果
+    会和向量召回一起进 RRF 融合后直接返回。如果这里丢掉了 metadata，命中节点上的
+    ``document_id`` / ``filename`` / ``collection`` 全是空值，后果有两个，且都表现为
+    "什么都没召回"，日志上完全看不出来：
+
+    1. 评测侧文档级判分两条通道同时落空 → ``Recall@5`` 恒为 0；
+    2. ``retrieve_contexts`` 的集合白名单过滤按 ``metadata['collection']`` 匹配，
+       空标签会被整段剔除 → 关键词通道的命中全部被过滤掉。
+    """
 
     def __init__(self) -> None:
-        self._id_to_text: Dict[str, str] = {}
+        self._id_to_node: Dict[str, TextNode] = {}
         self._lock = threading.Lock()
         self._retriever: Optional[BM25Retriever] = None
         self._revision = 0
 
-    def update(self, items: List[Dict[str, str]]) -> None:
-        """增量登记节点文本（items: [{"id": ..., "text": ...}]）。"""
+    def update(self, nodes: List[TextNode]) -> None:
+        """增量登记节点（保留 metadata，供召回后判分/过滤使用）。"""
         with self._lock:
-            for item in items:
-                text = item.get("text")
-                if text:
-                    self._id_to_text[item.get("id") or ""] = text
+            for node in nodes:
+                if node.text:
+                    self._id_to_node[str(node.node_id)] = node
+            self._revision += 1
+
+    def remove_ids(self, ids: List[str]) -> None:
+        """按 id 删除已登记节点（向量库删除文档后同步调用）。"""
+        with self._lock:
+            for nid in ids:
+                self._id_to_node.pop(str(nid), None)
+            self._revision += 1
+
+    def replace_all(self, nodes: List[TextNode]) -> None:
+        """用给定全量节点**替换**内存语料（删除向量后的全量重建路径）。
+
+        与启动时的 ``update`` 合并语义不同：这里必须先清空，否则被删文档
+        会残留在 BM25 倒排里，关键词通道仍能召回已删除内容。
+        """
+        with self._lock:
+            self._id_to_node = {
+                str(node.node_id): node for node in nodes if node.text
+            }
             self._revision += 1
 
     def rebuild_retriever(self, similarity_top_k: int = 10) -> "BM25Retriever":
-        """据当前全量文本重建 BM25 检索器（corpus 变化后调用）。"""
+        """据当前全量节点重建 BM25 检索器（corpus 变化后调用）。"""
         with self._lock:
-            nodes = [
-                TextNode(id_=nid, text=text)
-                for nid, text in self._id_to_text.items()
-                if text
-            ]
+            nodes = list(self._id_to_node.values())
             bm25 = BM25Okapi([_tokenize(n.text) for n in nodes]) if nodes else None
             self._retriever = BM25Retriever(
                 nodes=nodes, bm25=bm25, similarity_top_k=similarity_top_k
@@ -77,7 +101,7 @@ class BM25IndexBuilder:
 
     @property
     def size(self) -> int:
-        return len(self._id_to_text)
+        return len(self._id_to_node)
 
 
 class BM25Retriever(BaseRetriever):

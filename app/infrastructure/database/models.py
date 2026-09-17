@@ -129,6 +129,40 @@ class DocumentChunk(Base):
     document: Mapped["Document"] = relationship(back_populates="chunks")
 
 
+class VectorCollection(Base):
+    """向量库「逻辑集合」注册表。
+
+    所有文档切片物理上写入同一个 Milvus collection，用节点 metadata 里的
+    ``collection`` 字段区分逻辑集合（见 RAGService.retrieve_contexts 的白名单
+    过滤）。本表登记每个逻辑集合的**功能描述 / 检索时机描述**，供意图识别阶段
+    把用户问题匹配到正确的集合（命中后经 slots.top_kb_node.collection_names
+    透传给 Agent 编排层的 RAG 工具）。
+
+    一条集合名只对应一行；上传同名集合的新文档时 upsert（更新描述）。
+    """
+
+    __tablename__ = "vector_collections"
+
+    name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # 检索引擎：rag = Milvus 文档向量库（documents/upload）；
+    # graph = LightRAG 知识图谱 workspace（documents/kownledgebase/upload）。
+    # 同名集合在两种引擎下语义不同，全局仍要求 name 唯一。
+    engine: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="rag", default="rag"
+    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retrieval_hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+
 class TraceLog(Base):
     """追踪日志表：持久化关键 Span（可与内存 Tracer 配合）。"""
 

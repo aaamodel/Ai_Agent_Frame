@@ -9,19 +9,28 @@ from dotenv import load_dotenv
 from typing import Any, Dict, List
 
 from app.llm_model_router.model_router import ModelRouter
-from app.llm_model_router.model_router_config import AIModelProperties
+from app.llm_model_router.model_router_config import (
+    AIModelProperties,
+    normalize_api_style,
+    infer_api_style,
+    expand_secret,
+)
 
 # 导入期计时起点：放在所有重型依赖导入之前，用于量化 import 阶段耗时
 _IMPORT_T0 = time.perf_counter()
 
 from fastapi import FastAPI
 from loguru import logger
+from sqlalchemy import text
 import redis.asyncio as aioredis
 
-from app.api.routes import chat, document, health, kownledgebase
+from app.api.routes import agent_runs, chat, document, health, kownledgebase
 from app.config import get_settings
 from app.core.rag.rag_service import RAGService
-from app.infrastructure.database.session import configure_session, init_engine
+from app.infrastructure.database.session import (
+    configure_session,
+    init_engine,
+)
 from app.infrastructure.database.models import Base
 from app.core.memory.short_term import QwenChatLLMImpl
 from app.core.memory.long_term import MilvusCollectionWrapper, QwenEmbeddingImpl
@@ -64,39 +73,75 @@ def _build_global_router() -> ModelRouter:
             mid: str = str(raw.get("model_id") or "").strip()
             if not mid:
                 raise ValueError(f"LLM_MODELS 条目缺少 model_id: {raw!r}")
-            key = str(raw.get("api_key") or settings.openai_api_key).strip() or settings.openai_api_key
-            base = str(raw.get("base_url") or settings.openai_api_base).strip() or settings.openai_api_base
-            provider_key = str(raw.get("provider") or "openai").lower()
+            # 独立网关 / 独立密钥：每条模型可指向不同厂商（百炼/DeepSeek/智谱/...）
+            # api_key 支持 "${ENV_VAR}" 引用，避免明文多 key 写进 .env
+            explicit_key = expand_secret(str(raw.get("api_key") or "").strip())
+            explicit_base = str(raw.get("base_url") or "").strip()
+            base = explicit_base or settings.openai_api_base
+            if explicit_key:
+                key = explicit_key
+            elif not explicit_base or explicit_base == settings.openai_api_base:
+                # 未配独立网关（同厂商）：沿用全局 OPENAI_API_KEY（旧版行为）
+                key = settings.openai_api_key
+            else:
+                # 跨厂商网关但未配独立 key：不能错用全局百炼 key（否则真调用必 401），
+                # 留空 → client 构建跳过 → 执行期自动降级到下一候选
+                key = ""
+                logger.warning(
+                    "模型 {} 指向独立网关 {} 但未配置 api_key（{} 为空），"
+                    "该候选将被跳过；请在环境变量配置对应厂商密钥",
+                    mid, base, str(raw.get("api_key") or "").strip(),
+                )
+            # 厂商方言：显式 provider/api_style > 按 base_url 域名推断（兼容旧 .env）
+            api_style = normalize_api_style(raw.get("api_style") or raw.get("provider") or infer_api_style(base))
+            provider_key = api_style  # provider 分组名直接用规范方言名
             supports_thinking = bool(raw.get("supports_thinking", True))
-            # Provider 只写一次（多个模型共享）；单模型独立网关通过 candidate.url 覆盖
-            providers.setdefault(provider_key, {
-                "url": base or None,
-                "api_key": key,
-                "endpoints": {},
-            })
-            candidates.append({
+
+            def _opt_bool(name: str):
+                # 未配置返回 None（走家族默认）；配置了严格转 bool
+                return None if raw.get(name) is None else bool(raw.get(name))
+
+            candidate_dict: Dict[str, Any] = {
                 "id": mid,
                 "provider": provider_key,
-                "model": mid,
+                "model": str(raw.get("model") or mid),  # 允许 model 与注册 id 不同
                 "url": base or None,
+                "api_key": key or None,
+                "api_style": api_style,
                 "priority": int(raw.get("priority", 0)),
-                "enabled": True,
+                "enabled": bool(raw.get("enabled", True)),
                 "supports_thinking": supports_thinking,
+                "supports_json_schema": _opt_bool("supports_json_schema"),
+                "supports_json_object": _opt_bool("supports_json_object"),
+                "thinking_can_disable": bool(raw.get("thinking_can_disable", True)),
+            }
+            # Provider 只写一次（同家族多模型共享默认值）；候选级 url/api_key 优先级更高
+            providers.setdefault(provider_key, {
+                "url": base or None,
+                "api_key": key or None,
+                "endpoints": {},
             })
+            candidates.append(candidate_dict)
             all_ids.append(mid)
     else:
-        # 单模型兜底
+        # 单模型兜底：按全局 OPENAI_API_BASE 推断方言
         mid = settings.openai_llm_model
         base = settings.openai_api_base or None
-        providers = {"openai": {"url": base, "api_key": settings.openai_api_key, "endpoints": {}}}
+        style = infer_api_style(base or "")
+        providers = {style: {"url": base, "api_key": settings.openai_api_key, "endpoints": {}}}
         candidates = [{
             "id": mid,
-            "provider": "openai",
+            "provider": style,
             "model": mid,
             "url": base,
+            "api_key": settings.openai_api_key,
+            "api_style": style,
             "priority": 0,
             "enabled": True,
             "supports_thinking": True,
+            "supports_json_schema": None,
+            "supports_json_object": None,
+            "thinking_can_disable": True,
         }]
         all_ids = [mid]
 
@@ -151,6 +196,13 @@ def _build_global_router() -> ModelRouter:
         tiers["standard"]["timeout_ms"],
         tiers["deep"]["timeout_ms"],
     )
+    # 逐模型打印厂商方言/网关/结构化能力，便于排查多厂商接线
+    for c in candidates:
+        logger.info(
+            "  └─ 模型 {}: style={}, base_url={}, thinking={}, json_schema={}",
+            c["id"], c["api_style"], c["url"],
+            c["supports_thinking"], c["supports_json_schema"],
+        )
 
     return ModelRouter(properties)
 
@@ -205,7 +257,12 @@ async def lifespan(app: FastAPI):
         embed_model=rag_embed_model,
         milvus_uri=f"http://{settings.milvus_host}:{settings.milvus_port}",
         collection_name=settings.milvus_kb_collection_name,
-        overwrite=settings.milvus_kb_overwrite,  # 一次性迁移重建后请改为 False
+        # ⚠️ 恒为 False，且**不提供配置开关**：overwrite=True 会让 llama_index 在
+        # **每次进程启动**时 drop 整个物理集合并重建空表（已入库向量全部丢失，
+        # 表现为管理面 vector_chunk_count=0、RAG 评测 Recall 恒为 0）。
+        # 真正需要推倒重建时走唯一受保护的入口：
+        #     python -m evals.tools.reingest_corpus --reset --confirm-reset
+        overwrite=False,
         dim=1024,
         top_k_default=10,
     )
@@ -273,11 +330,22 @@ async def lifespan(app: FastAPI):
     # ==========================================
     t_db = time.perf_counter()
     engine = init_engine(settings.database_url)
-    configure_session(engine)
+    # 必须接住 configure_session 返回的 maker：顶部 from-import 拿到的是
+    # session 模块初始化前的 None，lifespan 里重新绑定不会更新本地名字。
+    session_factory = configure_session(engine)
     app.state.engine = engine
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # 轻量补列（项目无 Alembic）：vector_collections.engine 用于区分
+        # Milvus RAG 集合（rag）与 LightRAG 图谱集合（graph）
+        await conn.execute(
+            text(
+                "ALTER TABLE vector_collections "
+                "ADD COLUMN IF NOT EXISTS engine VARCHAR(16) "
+                "NOT NULL DEFAULT 'rag'"
+            )
+        )
     logger.info(f"⏱️  PostgreSQL 数据库建表初始化完成，耗时: {time.perf_counter() - t_db:.3f}s")
 
     # ==========================================
@@ -321,6 +389,22 @@ async def lifespan(app: FastAPI):
     # 预热失败不阻塞启动（get_pipeline 有懒加载兜底）。
     # ==========================================
     app.state.intent_vector_retriever = None
+
+    # 启动先加载用户动态 KB 集合注册表（功能描述/检索时机 → 意图集合路由），
+    # 必须在意图向量索引预热之前完成，动态集合节点才会被 embedding 进索引。
+    try:
+        from app.api.routes.kownledgebase import enumerate_active_graph_workspaces
+        from app.infrastructure.database.collection_repo import refresh_kb_registry
+
+        # 图谱集合走纯文件系统枚举（不 import lightrag，避免拉起 torch）
+        graph_active = enumerate_active_graph_workspaces()
+        async with session_factory() as db_session:
+            active_collections = await refresh_kb_registry(
+                db_session, graph_active_names=graph_active
+            )
+        logger.info("动态 KB 集合注册表启动加载完成：{}", active_collections)
+    except Exception as registry_error:  # noqa: BLE001 - 不阻塞启动
+        logger.warning("动态 KB 集合注册表启动加载失败（上传接口仍可在运行期刷新）：{}", registry_error)
 
     def _preheat_intent_vector_index() -> None:
         try:
@@ -376,6 +460,7 @@ def create_app() -> FastAPI:
     )
     application.include_router(health.router, prefix=settings.api_prefix)
     application.include_router(chat.router, prefix=settings.api_prefix)
+    application.include_router(agent_runs.router, prefix=settings.api_prefix)
     application.include_router(document.router, prefix=settings.api_prefix)
     application.include_router(kownledgebase.router, prefix=settings.api_prefix)
     return application

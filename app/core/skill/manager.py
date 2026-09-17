@@ -4,7 +4,7 @@ import re
 import yaml
 from pathlib import PurePosixPath
 
-from trace_to_markdown import trace_to_markdown
+from app.core.trace_to_markdown import trace_to_markdown
 from app.core.backends.filesystem import FilesystemBackend
 
 from loguru import logger

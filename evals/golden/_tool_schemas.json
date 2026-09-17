@@ -1,0 +1,336 @@
+{
+  "generated_by": "evals/tools/export_tool_schemas.py",
+  "source": "runtime-registry",
+  "tool_count": 10,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "feishu_bitable_tool",
+        "description": "【使用时机 · 飞书多维表格读写】当用户明确提到「飞书」「多维表」「多维表格」「Bitable」「Base」，读写飞书多维表格（Bitable）。凭证与表格标识需由用户提供，缺失时先向用户确认。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "app_id": {
+              "type": "string",
+              "description": "飞书应用 App ID"
+            },
+            "app_secret": {
+              "type": "string",
+              "description": "飞书应用 App Secret"
+            },
+            "app_token": {
+              "type": "string",
+              "description": "多维表格 app_token（浏览器 URL 中截取）"
+            },
+            "table_id": {
+              "type": "string",
+              "description": "数据表 table_id，通常以 tbl 开头"
+            },
+            "action": {
+              "type": "string",
+              "description": "'list' 查询 / 'add' 新增"
+            },
+            "fields_json": {
+              "type": "string",
+              "description": "新增时的字段 JSON，如 '{\"姓名\":\"张三\"}'；add 必填"
+            }
+          },
+          "required": [
+            "app_id",
+            "app_secret",
+            "app_token",
+            "table_id",
+            "action"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "local_excel_read_tool",
+        "description": "读取本地表格（xlsx/xls/csv/tsv/xlsm），返回结构摘要而不是整表内容：不给 sheet_name 时列出**所有 sheet 的名称/行列数/列名/前若干行**；给 sheet_name 时看该表明细，可按列过滤（filter_column+filter_value）或直接做分组聚合（group_by+agg_column+agg_func，聚合在工具内完成，不要自己心算累加）；给 cell（如 'D7'）读单个单元格。写入请用 local_excel_write_tool。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string",
+              "description": "本地表格文件的绝对路径或相对项目根的路径"
+            },
+            "sheet_name": {
+              "type": "string",
+              "description": "工作表名；留空则返回该文件**所有 sheet 的结构摘要**"
+            },
+            "cell": {
+              "type": "string",
+              "description": "单元格坐标（如 'D7'）；仅需单格取值时使用"
+            },
+            "filter_column": {
+              "type": "string",
+              "description": "按列过滤行：列名（与 filter_value 搭配使用）"
+            },
+            "filter_value": {
+              "type": "string",
+              "description": "过滤值：该列包含此文本的行才返回（不区分大小写）"
+            },
+            "group_by": {
+              "type": "string",
+              "description": "分组聚合的分组列名（如 '产品线'）；配合 agg_column 使用"
+            },
+            "agg_column": {
+              "type": "string",
+              "description": "聚合的目标列名（如 '金额(万元)'）"
+            },
+            "agg_func": {
+              "type": "string",
+              "description": "聚合函数：sum（默认）/ mean / count / max / min / median"
+            },
+            "head_rows": {
+              "type": "integer",
+              "description": "明细/摘要展示的行数，默认 5，最大 50"
+            }
+          },
+          "required": [
+            "file_path"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "local_excel_write_tool",
+        "description": "写入本地表格，两种模式二选一：(1) 单格更新 cell+value（改台账某一条的某个字段）；(2) 批量写入 rows（JSON 数组：对象数组，或「首行为列名」的二维数组），一次落多行，write_mode=append 追加 / replace 覆盖该 sheet。写操作需人工审批；写入前先用 local_excel_read_tool 确认列名与目标行。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string",
+              "description": "目标表格文件路径（相对路径相对项目根解析）"
+            },
+            "sheet_name": {
+              "type": "string",
+              "description": "工作表名称，默认 'Sheet1'；不存在会自动创建"
+            },
+            "cell": {
+              "type": "string",
+              "description": "单格模式：目标单元格坐标（如 'D7'）"
+            },
+            "value": {
+              "type": "string",
+              "description": "单格模式：写入该单元格的值"
+            },
+            "rows": {
+              "type": "string",
+              "description": "批量模式：JSON 数组。对象数组 [{\"列名\": 值, ...}]，或二维数组 [[\"列名1\",\"列名2\"], [值, 值]]（二维时第一行必须是列名）。一次可写多行，避免一格一格写入。"
+            },
+            "write_mode": {
+              "type": "string",
+              "description": "批量模式写入方式：append（默认，追加到 sheet 末尾）/ replace（清掉该 sheet 原有内容后重写）"
+            }
+          },
+          "required": [
+            "file_path"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sales_report_export_tool",
+        "description": "将销售分析结论导出为 .xlsx 报表，落盘到 outputs/sales_reports/。仅在用户明确要求导出/下载/归档报表时调用；写操作，需人工审批。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "report_title": {
+              "type": "string",
+              "description": "报表标题"
+            },
+            "content": {
+              "type": "string",
+              "description": "报表正文纯文本，建议按 结论/指标/原因/建议 分段"
+            },
+            "file_name": {
+              "type": "string",
+              "description": "自定义文件名（不含扩展名，禁止带路径）；留空自动生成"
+            }
+          },
+          "required": [
+            "report_title",
+            "content"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "联网搜索外部公开信息（新闻/行情/最新动态/公开资料）。不用于公司内部文件、私有数据。\n\n## web_search 联网搜索（唯一可用的联网检索工具）\n适用：新闻资讯、行情汇率、政策法规、公开公司信息等**外部**实时/公开信息。\n不适用：公司内部文件、私有知识库、台账数据（那类问题用 rag_knowledge_search）。\n工具内部已内置重试与降级通道，返回失败提示时请直接改用自身知识作答，**不要重复调用本工具**。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "搜索关键词或完整问句"
+            },
+            "count": {
+              "type": "integer",
+              "description": "返回结果条数，范围 1-10，默认 5"
+            },
+            "time_range": {
+              "type": "string",
+              "description": "可选时间过滤：OneDay / OneWeek / OneMonth / OneYear"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "rag_knowledge_search",
+        "description": "从私有知识库检索原文片段，用于获取具体事实、数字、条款、操作步骤等可直接引用的文档证据。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "检索问题或关键词"
+            },
+            "top_k": {
+              "type": "integer",
+              "description": "期望召回的高相关性文本切片最大数量，默认值为 5。"
+            },
+            "collection_names": {
+              "type": "array",
+              "description": "限定的知识库集合名列表，如 ['hr_docs']；未指定时可省略，由系统在默认全库检索。"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "knowledge_graph_search",
+        "description": "从私有知识图谱检索实体、实体关系和跨文档上下文，用于回答\"A 和 B 有什么关系\"\"A 依赖哪些东西\"等关联性问题。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "检索问题，建议传完整业务长句"
+            },
+            "collection": {
+              "type": "string",
+              "description": "知识图谱集合名；不传则用默认集合"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "file_read_tool",
+        "description": "读取文本类文件（代码/配置/文档/日志等）。不用于 Excel 等二进制文件（请用 local_excel_read_tool）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string",
+              "description": "需要读取的目标文件的相对路径或绝对路径"
+            },
+            "offset": {
+              "type": "integer",
+              "description": "读取的起始行数索引（0 表示从第一行开始），默认为 0"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "单次最大读取的行数，默认为 2000 行"
+            }
+          },
+          "required": [
+            "file_path"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "file_list_tool",
+        "description": "列出目录内容，支持递归多层（depth，默认 3 层）与文件名过滤（pattern，如 '*.xlsx'）。不确定文件在哪、或读文件前确认路径时用；按**内容**搜索请用 file_grep_tool。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "【重要】目标目录的路径。请务必将此参数命名为 'path'，严禁使用 'directory' 或 'dir' 作为参数名。"
+            },
+            "depth": {
+              "type": "integer",
+              "description": "递归层数，默认 3（1=只看当前目录），最大 8。不知道文件在哪时用默认值，一次就能看到多层结果。"
+            },
+            "pattern": {
+              "type": "string",
+              "description": "可选：文件名通配过滤（如 '*.xlsx'、'客户*'），只过滤文件、不影响目录展开。"
+            },
+            "max_entries": {
+              "type": "integer",
+              "description": "最多返回的条目数，默认 200；超出会截断并提示。"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "file_grep_tool",
+        "description": "跨文件文本检索，定位关键字/函数/变量出现在哪些文件的哪些行。仅支持文本文件，不支持 Excel；读取内容请用 file_read_tool。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "要进行全文精确匹配的文本字面量（不需要对特殊符号进行正则转义）"
+            },
+            "path": {
+              "type": "string",
+              "description": "限定检索的目标根目录路径，如果不提供则默认在当前根目录 '.' 下进行全局搜索"
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      },
+      "source": "runtime-registry"
+    }
+  ]
+}

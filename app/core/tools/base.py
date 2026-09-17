@@ -49,7 +49,7 @@ def tool_to_function_call_definition(
 ) -> dict[str, Any]:
     """把 BaseTool 转为 OpenAI tools[] 单条 function 定义（React / Planner 强制取参共用）。
 
-    复用工具的 schema_parameters()（write_todos 等特化工具已复写为嵌套结构），
+    复用工具的 schema_parameters()（参数为嵌套结构的工具会复写该方法），
     并把工具的 SYSTEM_PROMPT 专属守则拼入 description，确保模型拿到足够说明。
 
     Args:

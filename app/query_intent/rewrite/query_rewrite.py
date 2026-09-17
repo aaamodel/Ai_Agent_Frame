@@ -1,4 +1,4 @@
-﻿# merged_query_processing.py
+# merged_query_processing.py
 # ======================================================================
 # 合并了以下5个文件：
 # - rewrite_result.py

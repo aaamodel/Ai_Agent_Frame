@@ -9,22 +9,36 @@ class FeishuBitableTool(BaseTool):
     """读写飞书多维表格的工具"""
 
     name: str = "feishu_bitable_tool"
-    description: str = "用于从飞书多维表格（Bitable）中读取记录或新增数据行。"
+    description: str = (
+        "【使用时机 · 飞书多维表格读写】当用户明确提到「飞书」「多维表」「多维表格」「Bitable」「Base」，"
+        "读写飞书多维表格（Bitable）。"
+        "凭证与表格标识需由用户提供，缺失时先向用户确认。"
+    )
+    """
+    description: str = (
+        "【使用时机 · 飞书多维表格读写】当用户明确提到「飞书」「多维表」「多维表格」「Bitable」「Base」，"
+        "或你判断用户要查/要写的数据大概率存放在飞书多维表格上时，使用本工具。"
+        "【能力】action='list' 读取多条记录；action='add' 新增一行记录（写入属于外部系统写操作，需谨慎）。"
+        "【前提】必须提供 app_id、app_secret、app_token、table_id；add 时还必须提供 fields_json。"
+        "若用户未提供这些凭证/标识，应先向用户确认，禁止臆造 app_token 或 table_id。"
+    )
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.parameters = [
-            ToolParameter(name="app_id", type="string", description="飞书开放平台应用的 App ID", required=True),
-            ToolParameter(name="app_secret", type="string", description="飞书开放平台应用的 App Secret", required=True),
+            ToolParameter(name="app_id", type="string",
+                          description="飞书应用 App ID", required=True),
+            ToolParameter(name="app_secret", type="string",
+                          description="飞书应用 App Secret", required=True),
             ToolParameter(name="app_token", type="string",
-                          description="多维表格的 app_token (从多维表格的浏览器 URL 中截取)", required=True),
-            ToolParameter(name="table_id", type="string", description="具体数据表的 table_id (通常以 tbl 开头)",
-                          required=True),
+                          description="多维表格 app_token（浏览器 URL 中截取）", required=True),
+            ToolParameter(name="table_id", type="string",
+                          description="数据表 table_id，通常以 tbl 开头", required=True),
             ToolParameter(name="action", type="string",
-                          description="操作类型: 'list' (查询多条数据) 或 'add' (新增一行记录)", required=True),
+                          description="'list' 查询 / 'add' 新增", required=True),
             ToolParameter(name="fields_json", type="string",
-                          description="新增记录时的 JSON 字符串键值对 (例如: '{\"姓名\": \"张三\", \"金额\": 200}')",
-                          required=False)
+                          description="新增时的字段 JSON，如 '{\"姓名\":\"张三\"}'；add 必填", required=False),
         ]
 
     async def _fetch_tenant_token(self, app_id: str, app_secret: str) -> str:

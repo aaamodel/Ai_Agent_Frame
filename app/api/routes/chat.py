@@ -33,6 +33,8 @@ from app.core.tools.registry import ToolRegistry
 
 # ── Agent 编排前置 Pipeline（改写 + 意图 + 模式决策）注入 ────────────
 from app.api.depends.dependencies import (
+    get_agent_config,
+    get_agent_graph_runner,
     get_memory_manager,
     get_model_router,
     get_pipeline,
@@ -98,15 +100,20 @@ def _build_router() -> ModelRouter:
         raise HTTPException(status_code=503, detail="未配置 OPENAI_API_KEY，无法调用模型")
     mid = settings.openai_llm_model
     base = settings.openai_api_base or None
+    # 按全局 base_url 推断厂商方言，保持与全局路由器一致的参数翻译
+    from app.llm_model_router.model_router_config import infer_api_style
+    style = infer_api_style(base or "")
     properties = AIModelProperties.from_dict({
-        "providers": {"openai": {"url": base, "api_key": settings.openai_api_key, "endpoints": {}}},
+        "providers": {style: {"url": base, "api_key": settings.openai_api_key, "endpoints": {}}},
         "chat": {
             "default_model": mid,
             "candidates": [{
                 "id": mid,
-                "provider": "openai",
+                "provider": style,
                 "model": mid,
                 "url": base,
+                "api_key": settings.openai_api_key,
+                "api_style": style,
                 "priority": 0,
                 "enabled": True,
                 "supports_thinking": True,
@@ -207,10 +214,23 @@ async def _execute_chat_core(
     await memory_manager.append_turn(session_id=session_id, role="assistant", content=resp.content)
 
     async def _store_long_term_in_background() -> None:
+        # 与 persist_node 同一口径：只沉淀「问题全文 + 规则判定的结论句 + 结构化 sidecar」，
+        # 不落整段回复（记录会被注入每一轮 system 提示词，见 build_ltm_digest 的 docstring）。
+        from app.core.memory.long_term import build_ltm_digest
+
+        digest = build_ltm_digest(
+            user_query,
+            resp.content,
+            mode="chat_core",
+            trace_id=trace_id or None,
+        )
+        metadata = digest.metadata
+        if not trace_id:
+            metadata["source"] = "chat_core"
         await memory_manager._ltm.store(
             session_id=session_id,
-            content=f"用户提问: {user_query} \n系统回复: {resp.content}",
-            metadata={"trace_id": trace_id} if trace_id else {"source": "chat_core"},
+            content=digest.content,
+            metadata=metadata,
         )
 
     ltm_store_task: "asyncio.Task[None]" = asyncio.create_task(_store_long_term_in_background())
@@ -236,6 +256,8 @@ async def handle_agent_chat(
     skill_manager: SkillManager = Depends(get_skill_manager),
     pipeline: AgentQueryIntentPipeline = Depends(get_pipeline),
     db_session: AsyncSession = Depends(get_async_session),
+    agent_config: Dict[str, Any] = Depends(get_agent_config),
+    agent_graph_runner: Any = Depends(get_agent_graph_runner),
 ) -> StreamingResponse:
     """Agent 智能对话入口（最终答案 SSE 流式化）。
 
@@ -263,6 +285,8 @@ async def handle_agent_chat(
             tool_registry=tool_registry,
             skill_manager=skill_manager,
             pipeline=pipeline,
+            agent_config=agent_config,
+            agent_graph_runner=agent_graph_runner,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -303,6 +327,8 @@ async def _agent_stream_generator(
     tool_registry: ToolRegistry,
     skill_manager: SkillManager,
     pipeline: AgentQueryIntentPipeline,
+    agent_config: Dict[str, Any],
+    agent_graph_runner: Any,
 ) -> AsyncIterator[bytes]:
     """Agent 全链路执行 + 最终答案流式吞吐（与旧 handle_agent_chat 逻辑完全等价）。
 
@@ -491,13 +517,15 @@ async def _agent_stream_generator(
     # 3. 初始化 Agent 编排器 + 委派执行（显式传 mode 和 intent）
     # ------------------------------------------------------------------
     agent_orchestrator = AgentOrchestrator(
-        config={"default_strategy": request.strategy},
+        config={**agent_config, "default_strategy": request.strategy},
         model_router=model_router,
         memory_manager=memory_manager,
         tool_registry=tool_registry,
         tracer=_tracer,
         skill_manager=skill_manager,
     )
+    # 2.2：注入进程级 GraphRunner（Redis checkpointer），供审批 interrupt/续跑
+    agent_orchestrator.set_graph_runner(agent_graph_runner)
 
     orchestrator_result = await agent_orchestrator.run(
         user_input=effective_user_input,
@@ -510,6 +538,24 @@ async def _agent_stream_generator(
     # ------------------------------------------------------------------
     # 4. 状态检查与断言保护
     # ------------------------------------------------------------------
+    # 4.0 HITL：危险工具命中 → 图已挂起并持久化，推 awaiting_approval 事件后
+    #     正常结束本次流；前端凭 run_id 调 POST /agent/runs/{run_id}/approval 续跑。
+    if getattr(orchestrator_result, "awaiting_approval", False):
+        logger.info(
+            "Agent 运行暂停等待人工审批：run_id={}, trace_id={}",
+            orchestrator_result.run_id, orchestrator_result.trace_id,
+        )
+        yield _sse_payload({
+            "awaiting_approval": True,
+            "run_id": orchestrator_result.run_id,
+            "session_id": active_session_id,
+            "trace_id": orchestrator_result.trace_id,
+            "approvals": getattr(orchestrator_result, "approval_payloads", []),
+            "done": True,
+            "status": "awaiting_approval",
+        })
+        return
+
     if not orchestrator_result.success:
         graceful_answer: str = (getattr(orchestrator_result, "answer", "") or "").strip()
         if graceful_answer:
@@ -526,6 +572,7 @@ async def _agent_stream_generator(
                 "status": "degraded",
                 "session_id": active_session_id,
                 "trace_id": orchestrator_result.trace_id,
+                "run_id": getattr(orchestrator_result, "run_id", None),
                 "steps_executed": len(getattr(orchestrator_result, "steps", None) or []),
                 "degraded": True,
             })
@@ -544,6 +591,7 @@ async def _agent_stream_generator(
         "status": "success",
         "session_id": active_session_id,
         "trace_id": orchestrator_result.trace_id,
+        "run_id": getattr(orchestrator_result, "run_id", None),
         "steps_executed": len(orchestrator_result.steps),
         "degraded": degraded_value,
     })

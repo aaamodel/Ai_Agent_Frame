@@ -1,11 +1,15 @@
 import os
+import re
 import asyncio
+import threading
+from typing import Any, Dict, List, Optional
 
 from lightrag.utils import EmbeddingFunc
 from pypdf import PdfReader
 from lightrag import LightRAG, QueryParam
 from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from langchain_core.tools import tool
+from loguru import logger
 
 from app.config import get_settings
 
@@ -16,9 +20,37 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 light_rag_settings = get_settings()
-llm_model= light_rag_settings.llm_tier_standard or light_rag_settings.llm_tier_fast
-print(f"light_rag的llm_model是:{llm_model}")
+
+
+def _resolve_lightrag_model(settings) -> str:
+    """从 tier 候选池里取**单个**模型名给 LightRAG（它只接受单模型）。
+
+    ⚠️ 必须读 ``*_parsed``（config.py 已按逗号 / JSON 数组拆好的 list），
+    **不能**读原始 ``llm_tier_*`` 字符串字段：那是**候选池**，
+    如 ``LLM_TIER_STANDARD=qwen3.8-flash,glm-4.7``，整串当模型名发给服务端就会报
+    ``404 model_not_found: The model `qwen3.8-flash,glm-4.7` does not exist``
+    （症状出现在图谱抽取的 extract LLM 阶段）。
+
+    取值顺序与 ModelRouter 的降级顺序一致：STANDARD 为主用，其次 FAST；
+    两者都空时退回单模型基础配置 ``OPENAI_LLM_MODEL``。
+    """
+    candidates: List[str] = list(settings.llm_tier_standard_parsed) or list(
+        settings.llm_tier_fast_parsed
+    )
+    if candidates:
+        return candidates[0]
+    logger.warning(
+        "LLM_TIER_STANDARD / LLM_TIER_FAST 均为空，LightRAG 退回 OPENAI_LLM_MODEL={}",
+        settings.openai_llm_model,
+    )
+    return settings.openai_llm_model
+
+
+llm_model: str = _resolve_lightrag_model(light_rag_settings)
+logger.info("LightRAG 使用模型：{}", llm_model)
 EMBEDDING_MODEL = "text-embedding-v3"
+# 百炼 text-embedding-v3 支持 dimensions 参数，这里显式锁定 1024。
+EMBEDDING_DIM = 1024
 
 # 💡 优化：确保这些目录无论在哪个路径下启动 FastAPI 都能正确对应
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,12 +63,18 @@ os.makedirs(WORKING_DIR, exist_ok=True)
 # 2. 适配百炼 Qwen 的 LightRAG 核心基础函数
 # ==============================================================================
 async def qwen_llm_complete(
-        prompt, lightrag_system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs
+        prompt, system_prompt=None, history_messages=None, keyword_extraction=False, **kwargs
 ) -> str:
+    # ⚠️ 1.5.4 的调用约定：框架以 system_prompt=... 关键字传入（旧版参数名
+    # lightrag_system_prompt 已废弃）。若沿用旧名，system_prompt 会落入
+    # **kwargs，与下面显式传的同名参数冲突，实体抽取阶段直接报
+    # 「got multiple values for keyword argument 'system_prompt'」。
+    if history_messages is None:
+        history_messages = []
     return await openai_complete_if_cache(
         llm_model,
         prompt,
-        system_prompt=lightrag_system_prompt,  #这里应该是传入给大模型进行实体提取的提示词，按理lightrag后台会有默认的模板
+        system_prompt=system_prompt,  # 这里透传框架传入的提示词
         history_messages=history_messages,
         api_key=DASHSCOPE_API_KEY,
         base_url=DASHSCOPE_BASE_URL,
@@ -45,28 +83,294 @@ async def qwen_llm_complete(
     )
 
 async def qwen_embedding(texts: list[str]) -> list[list[float]]:
-    return await openai_embed(
+    # ⚠️ 关键：必须调用 openai_embed.func（未装饰原函数），不能直接调 openai_embed。
+    # LightRAG 1.5.4 用 @wrap_embedding_func_with_attrs(embedding_dim=1536) 把
+    # openai_embed 装饰成了 EmbeddingFunc 实例：直接调用它会按 1536 维校验百炼
+    # 实际返回的 1024 维向量（total_elements % 1536 != 0 直接报错），且
+    # send_dimensions=False 时连 dimensions 参数都不会发给百炼——这正是历史
+    # 「Embedding dimension mismatch ... 10240 / 1536」故障的根因。
+    # .func 是官方文档指定的未装饰入口（见 lightrag/utils.py 装饰器 docstring），
+    # 显式传 embedding_dim 后原函数会向百炼发送 dimensions=1024。
+    return await openai_embed.func(
         texts,
         model=EMBEDDING_MODEL,
         api_key=DASHSCOPE_API_KEY,
         base_url=DASHSCOPE_BASE_URL,
+        embedding_dim=EMBEDDING_DIM,
     )
 
 # 1. 包装百炼的向量函数
 wrapped_embedding = EmbeddingFunc(
-    embedding_dim=1024,
+    embedding_dim=EMBEDDING_DIM,
     func=qwen_embedding,
     max_token_size=2048,
     supports_asymmetric=False
 )
 
 # 2. 初始化 LightRAG 实例（供外部全局调用）
-rag_instance = LightRAG(
-    working_dir=WORKING_DIR,
-    llm_model_func=qwen_llm_complete,
-    llm_model_name=llm_model,
-    embedding_func=wrapped_embedding
+# ==============================================================================
+# LightRAG 的「集合」= workspace：不同 workspace 在 WORKING_DIR 下使用各自独立
+# 子目录（kv_store_*.json / vdb_*.json / graph_*.graphml / doc_status），天然隔离。
+# 新上传的数据一律走具名 workspace（默认 DEFAULT_GRAPH_WORKSPACE）；空 workspace
+# （""，文件直接散落在 WORKING_DIR 根下）只用于只读访问与清理历史遗留数据。
+DEFAULT_GRAPH_WORKSPACE = "default"
+LEGACY_GRAPH_WORKSPACE = ""  # 历史遗留：升级前全局单例使用的空 workspace
+
+_WORKSPACE_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff][\w.\u4e00-\u9fff\-]{0,127}$")
+
+
+def validate_graph_workspace_name(name: str) -> str:
+    """校验图谱集合（workspace）名，规则与 RAG 逻辑集合名保持一致。"""
+    name = (name or "").strip()
+    if name and not _WORKSPACE_NAME_RE.match(name):
+        raise ValueError(
+            "集合名仅允许中英文、数字、下划线、中划线与点，长度 1-128；"
+            f"收到：{name!r}"
+        )
+    return name
+
+
+def _build_lightrag(workspace: str) -> LightRAG:
+    return LightRAG(
+        working_dir=WORKING_DIR,
+        workspace=workspace,
+        llm_model_func=qwen_llm_complete,
+        llm_model_name=llm_model,
+        embedding_func=wrapped_embedding,
+    )
+
+
+# 默认单例：保持 rag_instance 导出名不变（graph_search 等旧代码继续可用），
+# 但其 workspace 从空串改为具名默认集合。
+rag_instance = _build_lightrag(DEFAULT_GRAPH_WORKSPACE)
+
+_instances: Dict[str, LightRAG] = {DEFAULT_GRAPH_WORKSPACE: rag_instance}
+_instances_lock = threading.Lock()
+
+
+def get_lightrag(workspace: Optional[str] = None) -> LightRAG:
+    """按 workspace 名取 LightRAG 实例（进程内缓存，懒创建）。
+
+    None / 空串归一到默认集合；历史遗留空 workspace 只能通过
+    ``get_legacy_lightrag()`` 显式获取，避免新数据误写进遗留目录。
+    """
+    name = validate_graph_workspace_name(workspace or DEFAULT_GRAPH_WORKSPACE)
+    if not name:
+        name = DEFAULT_GRAPH_WORKSPACE
+    instance = _instances.get(name)
+    if instance is not None:
+        return instance
+    with _instances_lock:
+        instance = _instances.get(name)
+        if instance is None:
+            instance = _build_lightrag(name)
+            _instances[name] = instance
+    return instance
+
+
+def get_legacy_lightrag() -> LightRAG:
+    """获取历史遗留空 workspace 实例（只读列举/清空用）。"""
+    instance = _instances.get(LEGACY_GRAPH_WORKSPACE)
+    if instance is None:
+        with _instances_lock:
+            instance = _instances.get(LEGACY_GRAPH_WORKSPACE)
+            if instance is None:
+                instance = _build_lightrag(LEGACY_GRAPH_WORKSPACE)
+                _instances[LEGACY_GRAPH_WORKSPACE] = instance
+    return instance
+
+
+# ==============================================================================
+# 2.5 多 workspace（集合）管理：枚举 / 入库（带文件名）/ 删除 / 清空遗留
+# ==============================================================================
+# LightRAG 各层存储文件名前缀（用于判断遗留空 workspace 是否有数据）
+_LEGACY_FILE_PREFIXES = ("kv_store_", "vdb_")
+
+
+def _legacy_workspace_has_data() -> bool:
+    """遗留空 workspace 的数据直接散落在 WORKING_DIR 根下（无子目录）。"""
+    try:
+        for entry in os.listdir(WORKING_DIR):
+            if not os.path.isfile(os.path.join(WORKING_DIR, entry)):
+                continue
+            if entry.endswith(".graphml") or entry.startswith(_LEGACY_FILE_PREFIXES):
+                return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def enumerate_graph_workspaces() -> List[Dict[str, Any]]:
+    """枚举磁盘上存在的图谱 workspace。
+
+    Returns:
+        ``[{"name": str, "legacy": bool}]``；具名集合对应 WORKING_DIR 下的子目录，
+        遗留空 workspace 仅在根目录确有数据文件时以 ``name=""`` 追加。
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        entries = sorted(os.listdir(WORKING_DIR))
+    except FileNotFoundError:
+        entries = []
+    for entry in entries:
+        full = os.path.join(WORKING_DIR, entry)
+        if not os.path.isdir(full):
+            continue
+        # workspace 子目录内至少要有一个 lightrag 数据文件才算数
+        try:
+            has_data = any(
+                f.endswith((".graphml", ".json"))
+                for f in os.listdir(full)
+                if os.path.isfile(os.path.join(full, f))
+            )
+        except OSError:
+            has_data = False
+        if has_data:
+            out.append({"name": entry, "legacy": False})
+    if _legacy_workspace_has_data():
+        out.append({"name": LEGACY_GRAPH_WORKSPACE, "legacy": True})
+    return out
+
+
+async def list_workspace_documents(
+    workspace: str,
+    *,
+    legacy: bool = False,
+    page_size: int = 200,
+) -> List[Dict[str, Any]]:
+    """列出某 workspace 内已登记的全部文档（含 failed/pending，供管理面展示）。"""
+    rag = get_legacy_lightrag() if legacy else get_lightrag(workspace)
+    await rag.initialize_storages()
+
+    docs: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        rows, total = await rag.doc_status.get_docs_paginated(
+            status_filters=None,
+            page=page,
+            page_size=page_size,
+            sort_field="created_at",
+            sort_direction="desc",
+        )
+        for doc_id, status in rows:
+            docs.append(
+                {
+                    "doc_id": str(doc_id),
+                    "filename": str(getattr(status, "file_path", "") or ""),
+                    "status": str(getattr(status, "status", "") or ""),
+                    "chunks_count": getattr(status, "chunks_count", None),
+                    "content_length": getattr(status, "content_length", None),
+                    "track_id": getattr(status, "track_id", None),
+                    "created_at": getattr(status, "created_at", None),
+                    "updated_at": getattr(status, "updated_at", None),
+                    "error_msg": getattr(status, "error_msg", None),
+                }
+            )
+        if len(docs) >= int(total or 0) or not rows:
+            break
+        page += 1
+    return docs
+
+
+async def insert_document(workspace: str, filename: str, content: str) -> str:
+    """把单份文档文本织入指定 workspace，并登记真实文件名。
+
+    Returns:
+        LightRAG track_id（文档本身的 doc_id 可通过文件列表按文件名反查）。
+    """
+    name = validate_graph_workspace_name(workspace or DEFAULT_GRAPH_WORKSPACE)
+    if not name:
+        name = DEFAULT_GRAPH_WORKSPACE
+    rag = get_lightrag(name)
+    await rag.initialize_storages()
+    track_id = (
+        f"upload_{asyncio.get_event_loop().time():.0f}_"
+        f"{os.urandom(4).hex()}"
+    )
+    return await rag.ainsert(
+        [content],
+        file_paths=[filename],
+        track_id=track_id,
+    )
+
+
+async def find_doc_ids_by_filename(
+    workspace: str, filename: str, *, legacy: bool = False
+) -> List[str]:
+    """在 workspace 内按 file_path 精确匹配 doc_id（同名文件可能有多条）。"""
+    docs = await list_workspace_documents(
+        workspace, legacy=legacy
+    )
+    return [doc["doc_id"] for doc in docs if doc["filename"] == filename]
+
+
+class GraphPipelineBusyError(RuntimeError):
+    """LightRAG 文档 pipeline 正忙（上传/抽取进行中），删除被官方并发控制拒绝。"""
+
+
+async def delete_documents_by_filename(
+    workspace: str, filename: str, *, legacy: bool = False
+) -> Dict[str, Any]:
+    """删除某 workspace 下指定文件对应的全部文档：切片 + 三类向量 + 图谱级联。
+
+    LightRAG ``adelete_by_doc_id`` 官方保证四层清理；多个文档共享的实体/关系会
+    更新 source_id，必要时用 LLM 缓存重建部分实体。
+
+    Raises:
+        GraphPipelineBusyError: pipeline 忙（官方返回 not_allowed）。
+    """
+    rag = get_legacy_lightrag() if legacy else get_lightrag(workspace)
+    await rag.initialize_storages()
+
+    doc_ids = await find_doc_ids_by_filename(
+        workspace, filename, legacy=legacy
+    )
+    results: List[Dict[str, Any]] = []
+    for doc_id in doc_ids:
+        result = await rag.adelete_by_doc_id(doc_id)
+        item = {
+            "doc_id": doc_id,
+            "status": str(getattr(result, "status", "")),
+            "message": str(getattr(result, "message", "")),
+            "status_code": int(getattr(result, "status_code", 0) or 0),
+        }
+        if item["status"] == "not_allowed":
+            raise GraphPipelineBusyError(item["message"])
+        results.append(item)
+    return {"filename": filename, "deleted": len(doc_ids), "results": results}
+
+
+# 清空 workspace 时需要 drop 的全部存储属性（LLM 缓存保留：跨集合复用且无害）
+_DROP_STORAGE_ATTRS = (
+    "doc_status",
+    "full_docs",
+    "full_entities",
+    "full_relations",
+    "entity_chunks",
+    "relation_chunks",
+    "chunk_entity_relation_graph",
+    "chunks_vdb",
+    "entities_vdb",
+    "relationships_vdb",
 )
+
+
+async def clear_workspace(workspace: str, *, legacy: bool = False) -> Dict[str, Any]:
+    """清空整个 workspace（运维操作）：drop 全部知识数据存储。"""
+    rag = get_legacy_lightrag() if legacy else get_lightrag(workspace)
+    await rag.initialize_storages()
+    dropped: List[str] = []
+    for attr in _DROP_STORAGE_ATTRS:
+        storage = getattr(rag, attr, None)
+        if storage is None:
+            continue
+        try:
+            outcome = await storage.drop()
+            dropped.append(f"{attr}:{outcome}")
+        except Exception as exc:  # noqa: BLE001 - 单层失败不阻塞其他层
+            dropped.append(f"{attr}:error:{exc}")
+    return {"workspace": workspace, "legacy": legacy, "dropped": dropped}
+
 
 # ==============================================================================
 # 3. 数据处理流：将本地的 PDF / TXT 转化为纯文本并入库

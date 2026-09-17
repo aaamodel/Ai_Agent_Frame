@@ -42,7 +42,7 @@ def parse_bytes_to_text(content: bytes, filename: str) -> str:
             text = text[1:]
         return text
     except Exception as exc:
-        logger.warning("文档解析失败 filename=%s err=%s", filename, exc)
+        logger.warning("文档解析失败 filename={} err={}", filename, exc)
         return ""
 
 
@@ -62,7 +62,7 @@ def _parse_pdf(content: bytes, filename: str) -> str:
         logger.info("PDF 解析完成：{} 共 {} 页、{} 字。", filename, len(pages), len(text))
         return text
     except Exception as exc:
-        logger.warning("PDF 解析失败 filename=%s err=%s", filename, exc)
+        logger.warning("PDF 解析失败 filename={} err={}", filename, exc)
         return ""
 
 

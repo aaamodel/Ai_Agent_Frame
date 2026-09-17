@@ -9,13 +9,19 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from openai import APIError, AsyncOpenAI, RateLimitError
 
-from app.llm_model_router.model_router_config import AIModelProperties
+from app.llm_model_router.model_router_config import (
+    AIModelProperties,
+    STYLE_DASHSCOPE,
+    STYLE_DEEPSEEK,
+    STYLE_ZHIPU,
+)
 from app.llm_model_router.model_router_enums import ModelProvider, ModelTarget
 
 logger = logging.getLogger(__name__)
@@ -80,8 +86,9 @@ def async_build_openai_client(
       - timeout_ms（来自 tier）可映射为 httpx 级别的 timeout。
     """
     # 1) 优先使用 candidate 级别的 url / api_key，其次 provider 级别
-    api_key: Optional[str] = None
-    if provider is not None:
+    #    （多厂商接入时每个候选可挂不同账户/网关，candidate 级必须能覆盖 provider 级）
+    api_key: Optional[str] = candidate.api_key
+    if not api_key and provider is not None:
         api_key = provider.api_key
     # candidate 级覆盖（如某模型单独挂到另一个账户下）
     if candidate.url:
@@ -206,7 +213,129 @@ async def _chat_completion_with_langfuse(
 
 
 # ---------------------------------------------------------------------------
-# Chat Caller：给 AsyncModelRoutingExecutor.execute_with_fallback(..., caller=)
+# 厂商方言翻译：thinking 开关 / response_format 能力降级
+# ---------------------------------------------------------------------------
+def _apply_thinking_dialect(
+    candidate: AIModelProperties.ModelCandidate,
+    thinking: Optional[bool],
+    extra_body: Dict[str, Any],
+) -> None:
+    """把统一的 ``thinking: bool`` 翻译为目标厂商的实际请求参数（原地写 extra_body）。
+
+    各厂商协议（2026-09 官方文档/实测）：
+      - dashscope（百炼）: ``enable_thinking: true/false``
+      - deepseek          : ``thinking: {"type": "enabled"/"disabled"}``
+      - zhipu（智谱）     : ``thinking: {"type": "enabled"/"disabled"}``
+                            但 GLM-5.3 等强制思考模型禁用 disabled → 跳过注入
+      - openai            : 无该参数，不注入
+    """
+    if thinking is None:
+        return
+    style = candidate.api_style
+    if style == STYLE_DASHSCOPE:
+        extra_body["enable_thinking"] = bool(thinking)
+    elif style in (STYLE_DEEPSEEK, STYLE_ZHIPU):
+        if thinking:
+            extra_body["thinking"] = {"type": "enabled"}
+        else:
+            if not candidate.thinking_can_disable:
+                # 强制思考模型（如 GLM-5.3）：发 disabled 会直接 400，保持服务端默认
+                logger.info(
+                    "模型 %s 不支持关闭思考（thinking_can_disable=False），跳过 disabled 注入",
+                    candidate.id,
+                )
+                return
+            extra_body["thinking"] = {"type": "disabled"}
+    # openai 或其他标准协议：不注入任何思考参数
+
+
+def _strictify_schema_node(node: Any) -> Any:
+    """递归把 JSON Schema 补成 OpenAI/GLM 严格模式要求的形状。
+
+    严格模式硬性约束：
+      1. 每个 type=object 节点必须 ``additionalProperties: false``；
+      2. properties 里的所有字段必须出现在 required 中
+         （GLM 官方明确：未列入 required 的字段不会出现在输出里）。
+    递归覆盖嵌套 properties / array items / anyOf, oneOf, allOf / $defs。
+    """
+    if isinstance(node, dict):
+        typ = node.get("type")
+        if typ == "object" and isinstance(node.get("properties"), dict):
+            node["additionalProperties"] = False
+            required = node.get("required")
+            required = list(required) if isinstance(required, list) else []
+            for key in node["properties"].keys():
+                if key not in required:
+                    required.append(key)
+            node["required"] = required
+            node["properties"] = {k: _strictify_schema_node(v) for k, v in node["properties"].items()}
+        for key in ("items", "additionalItems", "contains"):
+            if key in node:
+                node[key] = _strictify_schema_node(node[key])
+        for key in ("anyOf", "oneOf", "allOf"):
+            if isinstance(node.get(key), list):
+                node[key] = [_strictify_schema_node(item) for item in node[key]]
+        if isinstance(node.get("$defs"), dict):
+            node["$defs"] = {k: _strictify_schema_node(v) for k, v in node["$defs"].items()}
+    elif isinstance(node, list):
+        return [_strictify_schema_node(item) for item in node]
+    return node
+
+
+def _normalize_json_schema(fmt: Dict[str, Any]) -> Dict[str, Any]:
+    """对 json_schema response_format 做严格模式归一化（深拷贝，不污染调用方字典）。"""
+    normalized = copy.deepcopy(fmt)
+    js = normalized.get("json_schema")
+    if isinstance(js, dict):
+        js["strict"] = True
+        if isinstance(js.get("schema"), dict):
+            _strictify_schema_node(js["schema"])
+    return normalized
+
+
+def _resolve_response_format(
+    candidate: AIModelProperties.ModelCandidate,
+    response_format: Any,
+) -> Any:
+    """按候选能力对 response_format 做透传（严格归一化）/降级/剥离。
+
+    - json_schema 且候选支持：强制严格模式（补 additionalProperties:false 与全字段 required），
+      GLM-4.7+/OpenAI/百炼严格模式均按此校验；
+    - 降级链：json_schema → json_object → 剥离（业务侧有 JSON 容错解析兜底）。
+    注意：json_object 模式下百炼/DeepSeek 均要求消息体出现 "json" 字样，
+    项目各结构化环节的 system prompt 已包含 JSON 说明。
+    """
+    if response_format is None:
+        return None
+    fmt = response_format if isinstance(response_format, dict) else None
+    fmt_type = (fmt or {}).get("type")
+
+    if fmt_type == "json_schema":
+        if candidate.json_schema_supported():
+            return _normalize_json_schema(fmt)
+        if candidate.json_object_supported():
+            logger.warning(
+                "模型 %s(%s) 不支持 json_schema，自动降级为 json_object",
+                candidate.id, candidate.api_style,
+            )
+            return {"type": "json_object"}
+        logger.warning(
+            "模型 %s(%s) 不支持任何结构化 response_format，已剥离（依赖 prompt + 容错解析）",
+            candidate.id, candidate.api_style,
+        )
+        return None
+    if fmt_type == "json_object" and not candidate.json_object_supported():
+        logger.warning(
+            "模型 %s(%s) 不支持 json_object，已剥离 response_format",
+            candidate.id, candidate.api_style,
+        )
+        return None
+    return response_format
+
+
+# ---------------------------------------------------------------------------
+# Chat Caller：由 AsyncModelRoutingExecutor.execute_with_candidate_fallback 内部直接调用
+#             （原以 caller= 参数注入，现已内联去泛型）
 # ---------------------------------------------------------------------------
 async def async_openai_chat_caller(
     client: AsyncOpenAI,
@@ -227,9 +356,11 @@ async def async_openai_chat_caller(
     说明：
       - ``messages`` 接受 Sequence[Dict[str, Any]]（或 list[dict]），兼容
         orchestrator 的 Sequence[Dict[str,str]] 以及 chat.py 的 list[dict] 两种入参。
-      - ``thinking`` 字段目前主流 Provider 不直接在 SDK 参数中接收，此处将其放入
-        ``extra_body``，供 DashScope/SiliconFlow 等非官方兼容协议的服务端消费。
-        如果目标 Provider 是标准 OpenAI，则字段被忽略不影响。
+      - ``thinking`` 为路由层统一布尔信号，由 ``_apply_thinking_dialect`` 按候选
+        的 ``api_style`` 翻译成各厂商协议（百炼 enable_thinking /
+        DeepSeek·智谱 thinking.type / OpenAI 不注入）。
+      - ``response_format`` 由 ``_resolve_response_format`` 按候选能力自动降级
+        （json_schema → json_object → 剥离），避免不支持的厂商直接 400。
       - 所有 Provider 异常（APIError/RateLimitError）都向上抛出，由 Executor 统一
         做熔断计数 + 降级。
     """
@@ -244,22 +375,21 @@ async def async_openai_chat_caller(
     }
     if max_tokens is not None:
         params["max_tokens"] = max_tokens
-    if response_format is not None:
-        params["response_format"] = response_format
+    # 结构化输出：按候选厂商能力透传/降级/剥离
+    resolved_rf = _resolve_response_format(target.candidate, response_format)
+    if resolved_rf is not None:
+        params["response_format"] = resolved_rf
     if tools is not None:
         params["tools"] = tools
     if tool_choice is not None:
         params["tool_choice"] = tool_choice
 
-    # thinking 字段 → 放入 extra_body（非标准参数，避免 AsyncOpenAI 校验时拒绝）
+    # thinking 统一信号 → 各厂商方言（写入 extra_body）
     if thinking is not None:
         extra_body = dict(extra_kwargs.pop("extra_body", None) or {})
-        # DashScope 兼容接口要求 thinking 为 JSON 对象
-        if isinstance(thinking, bool):
-            extra_body["enable_thinking"] =  thinking
-        else:
-            extra_body.setdefault("enable_thinking", thinking)
-        params["extra_body"] = extra_body
+        _apply_thinking_dialect(target.candidate, thinking, extra_body)
+        if extra_body:
+            params["extra_body"] = extra_body
     if extra_kwargs:
         # ⚠️ 兜底过滤：任何残留在 extra_kwargs 里的路由内部控制参数都必须丢弃，
         #    防止误传到 SDK（例如 purpose_hint）触发 unexpected keyword argument。

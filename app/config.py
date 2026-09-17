@@ -242,11 +242,6 @@ class Settings(BaseSettings):
         default="knowledge_base_v3",
         description="RAG 知识库集合名（LlamaIndex 重构后沿用旧集合名以便复用重建）",
     )
-    milvus_kb_overwrite: bool = Field(
-        default=True,
-        description="RAG 启动时是否重建知识库集合为 LlamaIndex schema。"
-                    "旧集合迁移只需首次置 True，迁移完成后请改为 False 以保留数据。",
-    )
 
     # =========================================================================
     # Langfuse 可观测性（Agent 编排层观测调试）
@@ -279,6 +274,55 @@ class Settings(BaseSettings):
         default=True,
         description="（方案B）是否启用空业务结果触发重规划：数据源工具返回空数据（非异常）时，"
                     "停止执行剩余剧本并触发 replan，改用备选数据源，而非拿着空数据硬造结果。",
+    )
+
+    # =========================================================================
+    # 2.2 状态图 / HITL 审批
+    # =========================================================================
+    react_max_steps: int = Field(
+        default=10, ge=1,
+        description="ReAct 态（无 plan execute 自环）单轮最大步数。",
+    )
+    max_replan_attempts: int = Field(
+        default=2, ge=0,
+        description="plan 工具全坏/证据不足时最大重规划次数。",
+    )
+    agent_evidence_gate_enabled: bool = Field(
+        default=True,
+        description="summarize 证据充分性自判闸门：计划跑完后由汇总调用一并判定"
+                    "证据是否足够作答，不足则带缺口说明 replan（0 额外 LLM 调用）。",
+    )
+    agent_checkpoint_backend: str = Field(
+        default="redis",
+        description="状态图 checkpointer 后端：redis（默认，失败自动降级内存）或 memory。",
+    )
+    agent_checkpoint_ttl_seconds: int = Field(
+        default=86_400, ge=0,
+        description="检查点 TTL（秒），0=永久；refresh_on_read 续期。",
+    )
+    agent_checkpoint_prefix: str = Field(
+        default="agent_cp",
+        description="Redis checkpoint key 前缀（多服务共库隔离）。",
+    )
+    agent_approval_enabled: bool = Field(
+        default=True,
+        description="危险工具人工审批总开关（HITL interrupt），默认开启。",
+    )
+    agent_danger_tools: str = Field(
+        default="local_excel_write_tool,sales_report_export_tool",
+        description="需人工审批的危险工具名，逗号分隔（默认含 Excel 写入与销售报表导出）。",
+    )
+    agent_reflect_enabled: bool = Field(
+        default=False,
+        description="reflect 质量门总开关，默认关闭（保持现网行为）。",
+    )
+    agent_reflect_min_score: int = Field(
+        default=60, ge=0, le=100,
+        description="reflect 质量通过分数线（0-100）。",
+    )
+    agent_node_retry_max: int = Field(
+        default=1, ge=0,
+        description="reflect 不通过时回 execute 重做的最大次数。",
     )
 
     log_level: str = Field(default="INFO", description="日志级别")

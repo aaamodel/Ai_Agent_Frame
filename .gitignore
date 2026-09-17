@@ -21,6 +21,22 @@ __pycache__/
 uploads/
 raw_data/
 
+# ===== 评测 / 压测运行产物（可重跑再生，不入库） =====
+evals/_results/
+benchmark/_results/
+*.log
+*.err
+*.bak
+
+# ===== 个人材料 / 内部过程文档（不入开源仓库） =====
+# 求职准备材料、架构评估笔记、内部交付说明、trace 转储
+面试准备_*.md
+架构重构*.md
+方案完成情况说明.md
+评测-压测-监控落地手册.md
+数据集审查与压测准备说明.md
+retrieve_contexts.md
+
 # ===== 内部设计工作笔记（非对外文档） =====
 _*.md
 build_orchestrator_input.md
@@ -38,6 +54,11 @@ docker-compose副本.yml
 .idea/
 .vscode/
 .DS_Store
+
+# ===== 本地 Agent / IDE 工具配置（含个人计划与技能缓存） =====
+.trae/
+.codebuddy/
+.claude/
 
 # ===== WorkBuddy 项目记忆（本地私有） =====
 .workbuddy

@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from typing import List
 from enum import Enum
 from dataclasses import dataclass

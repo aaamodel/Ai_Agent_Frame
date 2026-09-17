@@ -9,7 +9,7 @@
 #
 #   三通道语义重定义（IntentKind 枚举 code 不变，兼容 DB 旧数据）：
 #     KB     = 内部知识检索类意图（rag_knowledge_search / knowledge_graph_search）
-#     MCP    = 操作型工具意图（web_search / excel / bitable / file_* / write_todos）
+#     MCP    = 操作型工具意图（web_search / excel / bitable / file_*）
 #     SYSTEM = 无工具闲聊意图（welcome / about_bot）
 #
 #   树结构对标旧 RAG 领域树（DOMAIN → CATEGORY/TOPIC → 叶子），保留业务领域
@@ -164,14 +164,12 @@ class IntentTreeFactory:
         web 外部公开信息检索 [MCP]
         └─ web-live-info             → [web_search]
         data 业务数据操作 [MCP]
-        ├─ data-sales-report         → [local_excel_tool, feishu_bitable_tool]
-        ├─ data-excel-ops            → [local_excel_tool]
+        ├─ data-sales-report         → [local_excel_read_tool, local_excel_query_tool, feishu_bitable_tool, sales_report_export_tool]
+        ├─ data-excel-ops            → [local_excel_read_tool, local_excel_query_tool, local_excel_write_tool, sales_report_export_tool]
         └─ data-bitable-ops          → [feishu_bitable_tool]
         files 本地文件操作 [MCP]
         ├─ files-locate              → [file_list_tool]
         └─ files-content             → [file_grep_tool, file_read_tool]
-        task 任务规划 [MCP]
-        └─ task-todo-plan            → [write_todos]  (prefer_mode=plan_execute)
         sys 系统交互 [SYSTEM]
         ├─ sys-welcome / sys-about-bot（无工具）
     """
@@ -188,11 +186,23 @@ class IntentTreeFactory:
     _HINT_WEB_SEARCH: str = (
         "调用 web_search，query 传检索意图，可用 count(1-10) 与 time_range"
         "(OneDay/OneWeek/OneMonth/OneYear) 限定条数与时效；"
-        "tavily_web_search 是系统自动兜底备选，禁止主动调用。"
+        "该工具是**唯一**的联网检索工具，内部自带重试与降级，无需（也无法）切换到其他搜索工具。"
     )
     _HINT_EXCEL: str = (
-        "调用 local_excel_tool 读写本地 Excel；"
-        "若不知道文件路径，先用 file_list_tool 定位文件，再执行读取/统计/写入。"
+        "精确取数/统计/排名/占比/环比等'要算答案'的问题优先用 local_excel_query_tool："
+        "传 file_path + 一句中文 query（多 sheet 给 sheet_name），它在**全量数据**上跑 pandas，"
+        "目标数据不在前几行绝不代表不存在，不要因预览误判数据缺失。"
+        "只看表结构/列名用 local_excel_read_tool（不传 sheet_name 即返回全部 sheet 的"
+        "列名/行列数/前几行摘要）；看某条记录用 filter_column+filter_value（多 sheet 须配 sheet_name）。"
+        "若不知道文件路径，先用 file_list_tool（默认递归 3 层，可按 pattern 过滤）定位文件。"
+        "写入用 local_excel_write_tool：改某条记录传 filter_column+filter_value+target_column+new_value"
+        "（坐标工具内部算，禁止自己数 A1 坐标）；一次写多行传 rows（JSON 数组）。"
+        "写操作会触发人工审批，写入前必须先读定位并向用户确认旧值→新值。"
+    )
+    _HINT_SALES_REPORT_EXPORT: str = (
+        "用户明确要求导出/生成/下载/归档销售报表或分析报告文件时，"
+        "调用 sales_report_export_tool 把分析结论生成 Excel 落到 outputs/sales_reports/；"
+        "该工具是写操作，会触发人工审批，普通问答不要调用。"
     )
     _HINT_BITABLE: str = (
         "调用 feishu_bitable_tool 操作飞书多维表格；"
@@ -200,18 +210,14 @@ class IntentTreeFactory:
         "缺关键参数时先向用户确认，不要猜测。"
     )
     _HINT_FILE_LIST: str = (
-        "调用 file_list_tool 浏览目录/定位文件；找到目标文件后"
-        "通常接 file_read_tool 或 file_grep_tool 深入内容。"
+        "调用 file_list_tool 浏览目录/定位文件：默认一次递归 3 层（depth 可调，最大 8），"
+        "可用 pattern（如 '*.xlsx'）过滤文件名——**不要一层层反复调用去摸路径**；"
+        "找到目标文件后通常接 file_read_tool / local_excel_read_tool 深入内容。"
     )
     _HINT_FILE_CONTENT: str = (
         "先调用 file_grep_tool 按关键词/正则在文件内容中检索定位，"
         "再调用 file_read_tool 读取命中文件的具体片段。"
     )
-    _HINT_WRITE_TODOS: str = (
-        "调用 write_todos 写入任务清单（每项含明确动作与验收标准）；"
-        "多步骤/有依赖的任务建议走 plan_execute 模式逐步执行并勾选。"
-    )
-
     @staticmethod
     def build_intent_tree() -> list[IntentNode]:
         roots: list[IntentNode] = []
@@ -288,12 +294,31 @@ class IntentTreeFactory:
             tool_usage_hint=IntentTreeFactory._HINT_GRAPH_SEARCH,
         )
 
+        # ⚠️ 这个叶子是补缺口用的：公司自有语料（rag_data/ 13 篇销售语料）主体是
+        # 《公司产品知识库》《产品与报价表》，但在它存在之前，KB 分支只有
+        # 人事/IT/财务/业务系统/图谱五个叶子——任何「产品·定价·折扣·部署交付·服务承诺」
+        # 类问题都只能被塞进最近邻（实测：「客户要私有化部署，一般多久能上线？实施费怎么收？」
+        # 被判成「财务发票」，「准确率承诺写不写进合同」被判成「业务系统文档」）。
+        # 这是**结构性缺节点**，不是模型能力问题。
+        knowledge_product = IntentNode(
+            id="knowledge-product",
+            name="产品与报价",
+            level=IntentLevel.CATEGORY,
+            parent_id=knowledge.id,
+            kind=IntentKind.KB,
+            description="公司自有产品线（智能客服平台/工单系统/企业知识库）的版本与定价、折扣与报价权限、组合销售与打包优惠、部署与交付（SaaS 与私有化上线周期、实施服务费）、服务承诺（准确率与 SLA 是否写进合同）、产品 FAQ 与竞品差异化话术等销售产品类问题；答案在公司产品知识库中大概率检索得到",
+            examples=["标准版和专业版有什么区别？", "折扣权限是怎么规定的？", "实施服务费是怎么收的？"],
+            agent_tool_names=["rag_knowledge_search"],
+            tool_usage_hint=IntentTreeFactory._HINT_RAG_SEARCH,
+        )
+
         knowledge.children = [
             knowledge_hr,
             knowledge_it,
             knowledge_finance,
             knowledge_biz_system,
             knowledge_entity_relation,
+            knowledge_product,
         ]
         roots.append(knowledge)
 
@@ -342,10 +367,10 @@ class IntentTreeFactory:
             level=IntentLevel.CATEGORY,
             parent_id=data.id,
             kind=IntentKind.MCP,
-            description="销售总额、销售量、销售占比、销售趋势、排行榜等业务数据统计问题；这类数据存在表格/多维表格中，用表格工具读取统计大概率能拿到结果",
-            examples=["这个月的销售总额是多少？", "各区域销量占比怎么样？", "上季度销量 Top10 有哪些？"],
-            agent_tool_names=["local_excel_tool", "feishu_bitable_tool"],
-            tool_usage_hint=IntentTreeFactory._HINT_EXCEL,
+            description="销售总额、销售量、销售占比、销售趋势、排行榜等业务数据统计问题；这类数据存在表格/多维表格中，用表格工具读取统计大概率能拿到结果；明确要求导出/生成报表文件时用 sales_report_export_tool",
+            examples=["这个月的销售总额是多少？", "各区域销量占比怎么样？", "上季度销量 Top10 有哪些？", "把本月销售分析导出成报表"],
+            agent_tool_names=["local_excel_read_tool", "feishu_bitable_tool", "sales_report_export_tool"],
+            tool_usage_hint=IntentTreeFactory._HINT_EXCEL + IntentTreeFactory._HINT_SALES_REPORT_EXPORT,
         )
 
         data_excel_ops = IntentNode(
@@ -355,9 +380,9 @@ class IntentTreeFactory:
             parent_id=data.id,
             kind=IntentKind.MCP,
             description="对本地 Excel 文件的读取、筛选、汇总、透视、写入、格式处理等操作类请求",
-            examples=["帮我读一下 sales.xlsx 里的数据", "把这张表按月份汇总", "在表格里新增一行记录"],
-            agent_tool_names=["local_excel_tool"],
-            tool_usage_hint=IntentTreeFactory._HINT_EXCEL,
+            examples=["帮我读一下 sales.xlsx 里的数据", "把这张表按月份汇总", "在表格里新增一行记录", "把分析结果导出成 Excel 报表"],
+            agent_tool_names=["local_excel_read_tool", "local_excel_query_tool", "local_excel_write_tool", "sales_report_export_tool"],
+            tool_usage_hint=IntentTreeFactory._HINT_EXCEL + IntentTreeFactory._HINT_SALES_REPORT_EXPORT,
         )
 
         data_bitable_ops = IntentNode(
@@ -414,31 +439,15 @@ class IntentTreeFactory:
         roots.append(files)
 
         # ================================================================
-        # 5. 任务规划（MCP 通道；多步骤任务天然偏 plan_execute 模式）
+        # 5. 任务规划（MCP 通道）—— 已整体移除（2026-09-16）
+        #
+        # 原 `task` / `task-todo-plan` 叶子的唯一工具是 write_todos，该工具已从架构中
+        # 删除。它的原型是 deepagents 的 TodoListMiddleware，成立前提有三条，本项目
+        # 全不具备：(a) 暴露 todos state channel；(b) 每轮把当前清单回注上下文；
+        # (c) 面向长 horizon 循环。本项目里它只是一次无状态、无人消费的 observation，
+        # 且会被 `compact_tool_observations` 在 3 轮后压成短桩。
+        # 多步骤规划由 plan_execute 的 Planner 子任务账本承担，无需本通道。
         # ================================================================
-        task = IntentNode(
-            id="task",
-            name="任务规划",
-            level=IntentLevel.DOMAIN,
-            kind=IntentKind.MCP,
-            description="多步骤任务的拆解、计划制定与进度跟踪",
-        )
-
-        task_todo_plan = IntentNode(
-            id="task-todo-plan",
-            name="任务规划跟踪",
-            level=IntentLevel.CATEGORY,
-            parent_id=task.id,
-            kind=IntentKind.MCP,
-            description="把复杂需求拆解成带步骤的任务清单、制定执行计划、跟踪各步骤完成情况；多步骤有依赖的任务用 write_todos 记录并逐步执行大概率能拿到结果",
-            examples=["帮我制定一个数据迁移的执行计划", "把这个需求拆成可执行的任务清单", "跟进一下这几个步骤的完成情况"],
-            agent_tool_names=["write_todos"],
-            tool_usage_hint=IntentTreeFactory._HINT_WRITE_TODOS,
-            prefer_mode="plan_execute",
-        )
-
-        task.children = [task_todo_plan]
-        roots.append(task)
 
         # ================================================================
         # 6. 系统交互（SYSTEM 通道：无工具，闲聊/问候）

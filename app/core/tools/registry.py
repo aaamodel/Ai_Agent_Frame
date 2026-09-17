@@ -93,8 +93,20 @@ class ToolRegistry:
 
 
 # =============================================================================
-# 工具调用预算（单次 Agent 请求作用域）：质量感知的动态熔断
+# 检索类工具的硬编码配额（**有意为之，不给配置逃生阀**）
 # =============================================================================
+# rag_knowledge_search / knowledge_graph_search 是"每换一次 query 就多烧一轮 LLM"的工具，
+# 实测最典型的浪费形态是"空召回或不对题后不停换同义 query 瞎重试"（单条用例可连调 10 次）。
+# 因此对它们写死上限：**每个 rewrite 子问题 3 次**；请求级配额 = 3 × 子问题数
+# （未拆分的普通问题按 1 个子问题算 = 3 次）。
+# 该值**优先于** ①工具类属性 max_calls ②配置 tool_max_attempts_<name> ③全局默认，
+# 即配置项对这两个工具不生效——这是刻意的，不是配置读不到。
+RETRIEVAL_TOOL_NAMES: frozenset[str] = frozenset(
+    {"rag_knowledge_search", "knowledge_graph_search"}
+)
+RETRIEVAL_CALLS_PER_QUESTION: int = 3
+
+
 @dataclass
 class ToolCallBudget:
     """单次 Agent 运行内的工具调用预算（质量感知，先检查后计数）。
@@ -104,6 +116,9 @@ class ToolCallBudget:
          用完即熔断（区别于旧的"固定 3 次"）。
       2. 累计无效次数 ``invalid_limit``（缺省 3）：返回空 / 异常 / 系统错误提示等无效结果
          累计达 3 次 → 该工具硬熔断（成功不冲销）。
+         另有 **连续无效** 闸门 ``invalid_consecutive_limit``（缺省 2）：连续 2 次无效即熔断，
+         一旦某次调用返回有效结果，连续计数清零。这一层专门打击"空召回后不停换 query
+         瞎重试"——累计闸门要 3 次，连续闸门 2 次就止损（实测一条用例能少烧约 1~2 轮 ≈1.7万 token）。
       3. 相关性抽查（``relevance_check_call``，缺省 5）：单个工具第 5 次调用结果若与
          调用意图完全不匹配（由 LLM 判定，如"搜书籍返回股票"）→ 该工具硬熔断。
      另有全局总调用硬上限 ``total_budget``（缺省 20）作为兜底总闸。
@@ -120,12 +135,16 @@ class ToolCallBudget:
     """全局总调用硬上限（缺省 20；<=0 表示不限总数）。"""
     invalid_limit: int = 3
     """累计无效结果上限（空/异常/系统错误），达到即熔断该工具。"""
+    invalid_consecutive_limit: int = 2
+    """**连续**无效结果上限：连续 N 次无效即熔断；中间出现一次有效结果则清零。"""
     relevance_check_call: int = 5
     """相关性抽查触发点：单个工具第 N 次调用结果做一次 LLM 相关性判定。"""
     _used_per_tool: Dict[str, int] = field(default_factory=dict)
     """各工具已发生的总调用次数（含无效调用）。"""
     _invalid_per_tool: Dict[str, int] = field(default_factory=dict)
     """各工具累计无效结果次数（成功调用不冲销）。"""
+    _consecutive_invalid_per_tool: Dict[str, int] = field(default_factory=dict)
+    """各工具**连续**无效结果次数（一次有效结果即清零）。"""
     _locked: Dict[str, str] = field(default_factory=dict)
     """已熔断工具及其原因（tool_name -> reason）。"""
     _total_used: int = 0
@@ -145,6 +164,10 @@ class ToolCallBudget:
     def invalid_of(self, tool_name: str) -> int:
         """返回指定工具当前累计无效次数。"""
         return int(self._invalid_per_tool.get(tool_name, 0))
+
+    def consecutive_invalid_of(self, tool_name: str) -> int:
+        """返回指定工具当前**连续**无效次数（有效结果后归零）。"""
+        return int(self._consecutive_invalid_per_tool.get(tool_name, 0))
 
     def is_locked(self, tool_name: str) -> bool:
         """该工具是否已被熔断（不可再调用）。"""
@@ -189,25 +212,45 @@ class ToolCallBudget:
     def record_invalid(self, tool_name: str) -> bool:
         """登记一次无效结果（空/异常/系统错误提示）。
 
+        同时推进两个闸门：
+          - **连续**无效计数（``invalid_consecutive_limit``，缺省 2）——主力止损闸门；
+          - **累计**无效计数（``invalid_limit``，缺省 3）——兜底，防"无效-有效-无效"式绕过。
+
         Returns:
-            本次登记是否恰好触发熔断（累计无效达到 invalid_limit）。
+            本次登记是否恰好触发熔断（任一闸门触达即 True）。
         """
         if self.is_locked(tool_name):
             return False
+
+        consecutive: int = self.consecutive_invalid_of(tool_name) + 1
+        self._consecutive_invalid_per_tool[tool_name] = consecutive
+
         new_invalid: int = self.invalid_of(tool_name) + 1
         self._invalid_per_tool[tool_name] = new_invalid
+
+        if consecutive >= self.invalid_consecutive_limit:
+            self.lock_tool(tool_name, "invalid_consecutive")
+            return True
         if new_invalid >= self.invalid_limit:
             self.lock_tool(tool_name, "invalid")
             return True
         return False
 
+    def record_effective(self, tool_name: str) -> None:
+        """登记一次**有效**结果：连续无效计数清零（累计无效计数不冲销）。"""
+        if self._consecutive_invalid_per_tool.get(tool_name):
+            self._consecutive_invalid_per_tool[tool_name] = 0
+
     def lock_tool(self, tool_name: str, reason: str) -> None:
         """按原因硬熔断某工具（重复熔断保留首次原因）。"""
         if tool_name not in self._locked:
             self._locked[tool_name] = reason
+            # ⚠️ loguru 只认 {} 占位符：写成 %s/%d 时 logger 会静默丢弃全部参数，
+            # 日志里只剩一行字面量 "%s"，熔断原因/计数全部看不到（排查等于瞎猜）。
             logger.warning(
-                "工具 [%s] 触发硬熔断，原因=%s（已用 %d/%d，累计无效 %d/%d）",
+                "工具 [{}] 触发硬熔断，原因={}（已用 {}/{}，连续无效 {}/{}，累计无效 {}/{}）",
                 tool_name, reason, self.used_of(tool_name), self.limit_of(tool_name),
+                self.consecutive_invalid_of(tool_name), self.invalid_consecutive_limit,
                 self.invalid_of(tool_name), self.invalid_limit,
             )
 
@@ -215,6 +258,11 @@ class ToolCallBudget:
         """把熔断原因/触达条件转成对人类与 LLM 都清晰的中文说明。"""
         if self.is_locked(tool_name):
             reason: str = self.lock_reason(tool_name)
+            if reason == "invalid_consecutive":
+                return (
+                    f"工具 [{tool_name}] 连续 {self.invalid_consecutive_limit} 次返回无效结果"
+                    "（空召回/异常/系统错误），已硬熔断"
+                )
             if reason == "invalid":
                 return f"工具 [{tool_name}] 累计返回 {self.invalid_limit} 次无效结果（空数据/异常/系统错误），已硬熔断"
             if reason == "relevance":
@@ -238,32 +286,58 @@ class ToolCallBudget:
             )
         return (
             f"【系统拒绝执行】：{self._reason_text(tool_name)}。\n"
-            "请绝对不要再次尝试调用该工具！请结合已有信息直接回答，或转向其它仍有余量且未被熔断的工具。"
+            "请**不要再次调用该工具，也不要换同义改写继续反复检索**"
+            "（系统已判定该工具在当前任务中取不到有效数据）。"
+            "请结合已有信息直接回答，或转向其它仍有余量且未被熔断的工具。"
             + (f"\n（{extra_hint}）" if extra_hint else "")
         )
 
     def lock_notice(self, tool_name: str) -> str:
-        """工具刚刚被熔断时，追加在返回内容前的状态说明（让模型立刻知道该工具不可再用）。"""
-        return f"【工具状态】{self._reason_text(tool_name)}，后续禁止再调用。\n"
+        """工具刚刚被熔断时，追加在返回内容前的状态说明（让模型立刻知道该工具不可再用）。
+
+        特意在这里写明"不要再换同义改写重试"：模型收到本次 Observation 的下一步
+        往往就是"换个说法再检索一次"，不点名堵住这条路，熔断省下的预算会被
+        下一轮的同义 query 立刻花掉。
+        """
+        return (
+            f"【工具状态】{self._reason_text(tool_name)}，后续禁止再调用，"
+            "也不要换同义改写继续反复检索；请改用其他工具或直接作答。\n"
+        )
 
     # ------------------------------------------------------------------
     # 供 LLM 动态规划的额度提示
     # ------------------------------------------------------------------
     def snapshot_lines(self) -> List[str]:
-        """额度快照行列表（含熔断状态 / 累计无效数）。"""
+        """额度快照行列表（**只列需要模型关注的行**：熔断 + 接近上限）。
+
+        这份快照经 ``live_prompt()`` 作为独立 system 消息**每一轮都要重发一次**。
+        原实现把每个工具都逐行列出（10 个工具 ≈ 400 字符），其中大部分是
+        「已用 0/10」这类零信息量内容——纯占额度与注意力。
+
+        现在只保留：总额度、已熔断、以及"余量 ≤1 次或出现过无效"的工具；
+        其余工具折叠成一行汇总。模型真正需要知道的（哪些不能再调、哪些快用完）
+        一条不少，每轮体积从 O(工具数) 降到 O(需关注工具数)。
+        """
         lines: List[str] = []
         if self.total_budget > 0:
             lines.append(f"- 总体工具调用额度：已用 {self._total_used} / 上限 {self.total_budget}")
         else:
             lines.append(f"- 总体工具调用额度：已用 {self._total_used} / 无硬上限")
+        plentiful: int = 0
         for name in sorted(self.per_tool_limits):
             if self.is_locked(name):
                 lines.append(f"- {name}：已熔断（{self.lock_reason(name)}），禁止再调用")
-            else:
+                continue
+            remaining: int = self.limit_of(name) - self.used_of(name)
+            if remaining <= 1 or self.invalid_of(name):
                 lines.append(
-                    f"- {name}：已用 {self.used_of(name)}/{self.limit_of(name)}，"
-                    f"累计无效 {self.invalid_of(name)}/{self.invalid_limit}"
+                    f"- {name}：已用 {self.used_of(name)}/{self.limit_of(name)}"
+                    f"（余 {max(0, remaining)}），累计无效 {self.invalid_of(name)}/{self.invalid_limit}"
                 )
+            else:
+                plentiful += 1
+        if plentiful:
+            lines.append(f"- 其余 {plentiful} 个工具额度充足，按需正常调用即可")
         return lines
 
     def live_prompt(self) -> str:
@@ -284,7 +358,9 @@ class ToolCallBudget:
         locked_note = "（已熔断）" if self.is_locked(tool_name) else ""
         return (
             f"[额度状态] {tool_name} 已用 {self.used_of(tool_name)}/{self.limit_of(tool_name)}"
-            f"，累计无效 {self.invalid_of(tool_name)}/{self.invalid_limit}{total_note}{locked_note}"
+            f"，累计无效 {self.invalid_of(tool_name)}/{self.invalid_limit}"
+            f"，连续无效 {self.consecutive_invalid_of(tool_name)}/{self.invalid_consecutive_limit}"
+            f"{total_note}{locked_note}"
         )
 
 
@@ -292,10 +368,14 @@ def build_tool_call_budget(
     config: Any,
     tool_registry: Any,
     tool_names: List[str],
+    *,
+    sub_question_count: int = 1,
 ) -> ToolCallBudget:
     """按优先级聚合各工具的调用上限并构建（质量感知的）预算对象。
 
     单工具总调用上限优先级（高 → 低）：
+      0. **检索类工具硬编码**：``RETRIEVAL_TOOL_NAMES`` 内一律
+         ``RETRIEVAL_CALLS_PER_QUESTION * 子问题数``（见该常量注释），**覆写下面三层**；
       1. 工具注册实例类属性 ``max_calls``（开发者显式声明，如 file_read_tool=10）；
       2. 编排配置 ``tool_max_attempts_<tool_name>``（运维按工具名覆写）；
       3. 全局默认 ``tool_max_attempts``（缺省 10，环境变量 TOOL_MAX_ATTEMPTS）。
@@ -310,6 +390,10 @@ def build_tool_call_budget(
         config: 编排配置（具备 .get(key, default) 的对象，如 dict）
         tool_registry: ToolRegistry（需可解析出工具实例以读取 max_calls）
         tool_names: 本次请求允许调用的工具名列表
+        sub_question_count: 本次请求由 rewrite 拆出的子问题数（未拆分传 1）。
+            ⚠️ 取值来源只能是 ``IntentContext.slots["per_sub_questions"]`` 的长度——
+            该键**仅在实际拆分时存在**；不要用 ``pipeline_rewrite_meta.sub_questions_count``
+            （未拆分时它也可能是 1，语义不同）。
 
     Returns:
         ToolCallBudget 实例
@@ -348,6 +432,17 @@ def build_tool_call_budget(
     )
     invalid_limit: int = max(1, _first_int(invalid_raw, fallback=3))
 
+    # 连续无效闸门：比累计闸门更早止损，专治"空召回后换同义 query 瞎重试"。
+    consecutive_raw: Any = (
+        config.get(
+            "tool_invalid_consecutive_attempts",
+            os.getenv("TOOL_INVALID_CONSECUTIVE_ATTEMPTS"),
+        )
+        if hasattr(config, "get")
+        else os.getenv("TOOL_INVALID_CONSECUTIVE_ATTEMPTS")
+    )
+    invalid_consecutive_limit: int = max(1, _first_int(consecutive_raw, fallback=2))
+
     checkpoint_raw: Any = (
         config.get("tool_relevance_check_call", os.getenv("TOOL_RELEVANCE_CHECK_CALL"))
         if hasattr(config, "get")
@@ -380,6 +475,14 @@ def build_tool_call_budget(
         # 3) 兜底全局默认
         if limit_value is None:
             limit_value = default_per_tool
+
+        if name in RETRIEVAL_TOOL_NAMES:
+            # 检索类工具：硬编码覆盖上面三层（每个子问题 3 次），刻意不给配置逃生阀
+            per_tool_limits[name] = RETRIEVAL_CALLS_PER_QUESTION * max(
+                1, int(sub_question_count or 1)
+            )
+            continue
+
         try:
             per_tool_limits[name] = max(1, int(limit_value))
         except (TypeError, ValueError):
@@ -390,5 +493,6 @@ def build_tool_call_budget(
         default_per_tool=default_per_tool,
         total_budget=total_budget,
         invalid_limit=invalid_limit,
+        invalid_consecutive_limit=invalid_consecutive_limit,
         relevance_check_call=relevance_check_call,
     )

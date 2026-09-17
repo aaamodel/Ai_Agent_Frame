@@ -1,4 +1,4 @@
-﻿"""
+"""
 本文件聚合了 core/prompt 目录下 3 个原有模块缺失引用的 7 个类：
   1. OrchestrationMode  —— 编排模式枚举 (原 config)
   2. AgentProfileDO     —— 智能体配置实体 (原 dao.entity)

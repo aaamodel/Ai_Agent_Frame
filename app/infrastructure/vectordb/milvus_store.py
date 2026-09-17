@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.embeddings import BaseEmbedding
@@ -20,6 +20,11 @@ from llama_index.vector_stores.milvus import MilvusVectorStore
 from llama_index.vector_stores.milvus.base import MILVUS_ID_FIELD
 
 from loguru import logger
+
+
+def _milvus_quote(value: str) -> str:
+    """转义 Milvus 表达式字符串字面量（反斜杠与双引号）。"""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
 class MilvusIndexManager:
@@ -131,6 +136,83 @@ class MilvusIndexManager:
     async def aget_all(self) -> List[TextNode]:
         """异步拉取全部节点。"""
         return await asyncio_to_thread(self.get_all)
+
+    # ------------------------------------------------------------------
+    # 集合 / 文件管理（管理面 API）
+    # ------------------------------------------------------------------
+    def _query_all_rows(
+        self, output_fields: List[str], expr: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """按 filter 分页枚举集合实体（动态字段 metadata 可直接 output/过滤）。"""
+        client = self.vector_store.client
+        rows: List[Dict[str, Any]] = []
+        offset: int = 0
+        batch_size: int = 1000
+        query_kwargs: Dict[str, Any] = {}
+        if expr:
+            query_kwargs["filter"] = expr
+        while True:
+            batch = client.query(
+                collection_name=self.collection_name,
+                output_fields=output_fields,
+                limit=batch_size,
+                offset=offset,
+                **query_kwargs,
+            )
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < batch_size:
+                break
+            offset += len(batch)
+        return rows
+
+    def list_logical_files(self) -> Dict[str, Dict[str, int]]:
+        """枚举物理集合内的「逻辑集合 → 文件 → 切片数」。
+
+        逻辑集合是节点 metadata 里的 ``collection`` 标签（所有文档物理上写在
+        同一个 Milvus collection）。filename/collection 都在 Milvus 动态字段里。
+        """
+        grouped: Dict[str, Dict[str, int]] = {}
+        rows = self._query_all_rows(["collection", "filename"])
+        for row in rows:
+            tag = str(row.get("collection") or "").strip()
+            filename = str(row.get("filename") or "").strip()
+            if not tag:
+                tag = "_untagged"
+            files = grouped.setdefault(tag, {})
+            if filename:
+                files[filename] = files.get(filename, 0) + 1
+        return grouped
+
+    def delete_by_filename(self, collection_tag: str, filename: str) -> List[str]:
+        """删除指定逻辑集合下某个文件的全部向量，返回被删节点 id 列表。"""
+        expr = (
+            f'collection == "{_milvus_quote(collection_tag)}"'
+            f' and filename == "{_milvus_quote(filename)}"'
+        )
+        client = self.vector_store.client
+        rows = self._query_all_rows([MILVUS_ID_FIELD], expr)
+        ids = [
+            str(row[MILVUS_ID_FIELD])
+            for row in rows
+            if row.get(MILVUS_ID_FIELD) is not None
+        ]
+        if not ids:
+            return []
+        for start in range(0, len(ids), 1000):
+            client.delete(
+                collection_name=self.collection_name,
+                ids=ids[start : start + 1000],
+            )
+        client.flush(self.collection_name)
+        logger.info(
+            "Milvus 已删除集合标签 [{}] 文件 [{}] 的 {} 个向量节点。",
+            collection_tag,
+            filename,
+            len(ids),
+        )
+        return ids
 
 
 def asyncio_to_thread(func, *args: Any, **kwargs: Any) -> Any:

@@ -15,6 +15,8 @@ from typing import List, Optional
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.schema import NodeWithScore
 
+from loguru import logger
+
 from app.core.rag.bm25_builder import BM25IndexBuilder, _to_query_str
 
 # RRF 常驻常数（smooth constant），典型 K=60
@@ -78,11 +80,24 @@ class HybridRetriever(BaseRetriever):
             vector_hits = self._ensure_vector_retriever().retrieve(qstr)
         except Exception as exc:  # 向量侧故障不阻断 BM25
             vector_hits = []
+            # ⚠️ 必须留痕：这里若静默降级成"纯关键词检索"，召回质量会整体下滑，
+            # 但输出看起来完全正常（能召回、只是向量语义召回没了），
+            # 排查时极容易误判成"语料/阈值问题"。
+            logger.warning(
+                "RAG 向量检索通道失败，本次退化为纯 BM25 关键词检索：{}: {}",
+                type(exc).__name__,
+                exc,
+            )
         bm25_retriever = self._bm25_builder.get_retriever(self._similarity_top_k)
         try:
             bm25_hits = bm25_retriever.retrieve(qstr)
-        except Exception:
+        except Exception as exc:
             bm25_hits = []
+            logger.warning(
+                "RAG BM25 检索通道失败，本次仅使用向量召回：{}: {}",
+                type(exc).__name__,
+                exc,
+            )
         return self._fuse(vector_hits, bm25_hits)
 
     async def _aretrieve(self, query: object) -> List[NodeWithScore]:

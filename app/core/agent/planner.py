@@ -10,13 +10,18 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
-from app.core.agent.react_agent import AgentResult
-from app.core.agent.react_agent import ToolInvoker, LLMCallable, postprocess_tool_result
+from app.core.agent.toolcall import (
+    ToolCall,
+    ToolInvoker,
+    execute_tool_call,
+    observation_has_error_marker,
+)
 from app.core.tools.base import tool_to_function_call_definition
 
 # 本轮结构化输出：MID-1 Planner 初始计划/重计划 schema + 协议转换
 from app.query_intent.llm_schemas import (
     PlanGenerateSchema,
+    build_dynamic_plan_schema,
     pydantic_to_openai_response_format,
 )
 
@@ -30,6 +35,27 @@ logger = logging.getLogger(__name__)
 # 可用数据源重新取数，避免拿着空数据硬造后续步骤或生成占位结果。
 EMPTY_DATASOURCE_REPLAN_PREFIX: str = "EMPTY_DATASOURCE_RESULT"
 
+# 模型声明了白名单外的工具名时的兜底映射。
+# 实测故障：planner 由技能名 sales-intelligence-assistant 自行派生出了
+# sales_intelligence_query，执行阶段被白名单拒绝 → 触发一次完整 replan
+# （单笔 7149 tokens）。这类"编造的查询类工具"真实意图几乎都是知识库检索，
+# 因此直接映射到兜底检索工具，**不触发重规划**；兜底工具本身不在白名单时才降级。
+UNKNOWN_TOOL_FALLBACK: str = "rag_knowledge_search"
+
+# replan 上下文裁剪阈值：单条子任务摘要 / 整体 payload 上限。
+# 旧实现整体截断 16000 字符，而单条 observation 本身就有 8000 字符，
+# 于是整篇 SKILL.md 会被原样喂进 replan（这是 replan 单笔 7149 token 的主因）。
+REPLAN_SUMMARY_MAX_CHARS: int = 400
+REPLAN_PAYLOAD_MAX_CHARS: int = 4000
+
+
+# 一刀切用 <=60 字符的长度闸门会把它们漏掉，导致"空数据"被当成"正常结果"继续提炼。
+_EMPTY_RESULT_SENTINELS: tuple = (
+    "未匹配到任何高相关性的文档片段",   # rag_knowledge_search 空召回
+    "未匹配到任何高相关性",
+    "知识库未匹配到",
+)
+
 
 def _is_empty_data(obs_text: str) -> bool:
     """保守判定一次工具观测结果是否属于“空业务数据”（非异常）。返回 True 时触发 replan。
@@ -37,7 +63,8 @@ def _is_empty_data(obs_text: str) -> bool:
     判定策略（宁缺毋滥，避免误伤正常执行）：
       1. 空白 / 空字符串 → 判空；
       2. 可解析 JSON 且为【空数组】或【空对象】→ 判空；
-      3. 短文本（<=60 字符）且含明确的“无数据”语义关键词 → 判空。
+      3. 命中"空结果哨兵短语"（工具固定话术，不限长度）→ 判空；
+      4. 短文本（<=60 字符）且含明确的“无数据”语义关键词 → 判空。
 
     Args:
         obs_text: 工具返回并已字符串化的观测内容。
@@ -56,6 +83,9 @@ def _is_empty_data(obs_text: str) -> bool:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
+    if any(sentinel in text for sentinel in _EMPTY_RESULT_SENTINELS):
+        return True
+
     lowered: str = text.lower()
     if len(text) <= 60 and any(
             marker in lowered for marker in (
@@ -68,50 +98,52 @@ def _is_empty_data(obs_text: str) -> bool:
 
     return False
 
-# 保持原有 Prompt 结构不变...
-PLAN_SYSTEM_PROMPT = """你是一个高瞻远瞩的规划专家。你需要将用户的复杂目标拆解为具体的、可执行的子任务（subtasks）。
-请务必结合用户提供的多轮对话历史、长期记忆事实，以及当前可用的高级技能树，进行合理的任务拆解。
 
-【严格输出规则 · 必须遵守】
-  1. 你的整个回复只能是一个合法的 JSON 对象，不得输出任何 JSON 以外的前缀、后缀、
-     解释文字、Markdown 围栏（```json / ```）或思考过程。
-  2. JSON 顶层必须包含且仅包含一个字段 "subtasks"，其值为子任务对象数组。
-  3. 每个子任务对象字段严格如下：
-       - id            : string  子任务唯一 ID
-       - title         : string  子任务一句话标题
-       - description   : string  子任务详细说明
-       - action_type   : string  枚举 "tool" 或 "reasoning"
-       - tool_name     : string  （仅 action_type="tool" 必填）工具名称，必须属于给定可用工具
-       - tool_args_hint: string  （可选）建议传入工具的参数结构或具体值
-  4. 不得出现尾随逗号、单引号作为字段引号、未闭合的花/方括号等 JSON 语法错误。
-  5.（备用数据源约束）在规划取数类工具时，请评估该数据源可能不可用/返回空数据（例如鉴权失败、
-     无权限、无记录）的风险；如确有该风险，请在计划中保留一个可行的备用数据源备选，
-     避免把整个计划的成败压在一个数据源上。
-
-输出示例：
-{
-  "subtasks": [
-    {"id": "task_1", "title": "...", "description": "...", "action_type": "tool/reasoning", "tool_name": "...", "tool_args_hint": "..."}
-  ]
-}
+PLAN_SYSTEM_PROMPT = """你是规划专家。结合对话历史、长期记忆与可用技能，把用户目标拆解为可执行子任务。
+只输出计划本身，不要解释、Markdown 围栏或思考过程。
+工具选型与参数用法严格依据下方「可用工具清单」中各工具自己的描述，禁止使用清单外的工具。
+取数类工具有失败或返回空数据的可能（鉴权/权限/无记录）：风险明显时在计划中保留一个备用数据源，不要把成败压在单一来源上。
 """
 
-REPLAN_SYSTEM_PROMPT = """你是一个动态调整与重规划专家。当执行过程中遭遇异常或无法达成预期时，你需要根据当前已有的执行结果以及发生的错误，对剩余的子任务进行修订和重新编排。
+REPLAN_SYSTEM_PROMPT = """你是重规划专家。根据已有执行结果与错误信息，修订剩余子任务。
+已成功完成的子任务从新计划移除，只保留需要重做 / 调整顺序 / 新增的部分。
+只输出计划本身，不要解释、Markdown 围栏或思考过程。
+工具选型与参数用法严格依据下方「可用工具清单」中各工具自己的描述。
+- 工具返回【空数据】（非报错）：换另一个可用数据源重新取数，禁止基于空数据编造后续步骤。
+- 工具明确报错：按错误信息修正参数后重试，禁止原样重放已知会失败的调用。
+"""
 
-【严格输出规则 · 必须遵守】
-  1. 你的整个回复只能是一个合法的 JSON 对象，不得输出任何 JSON 以外的前缀、后缀、
-     解释文字、Markdown 围栏（```json / ```）或思考过程。
-  2. JSON 顶层必须包含且仅包含一个字段 "subtasks"，其值为修订后的子任务对象数组。
-     已判定成功完成的子任务请从新计划中移除，只保留需要重做 / 调整顺序 / 新增的子任务。
-  3. 每个子任务字段同初始计划规则：id / title / description / action_type（tool|reasoning）/
-     tool_name（tool 必填）/ tool_args_hint（可选）。
-  4. 不得出现尾随逗号、单引号作为字段引号、未闭合的花/方括号等 JSON 语法错误。
-  5.（空数据回退）若既有的执行结果显示某数据源工具返回了【空数据】（例如空数组 / 空对象 /
-     空字符串，而非报错），则修订计划中必须改用另一个可用数据源工具（例如从飞书多维表切换到
-     本地 Excel / RAG 知识库）重新获取数据，严禁基于空数据继续编造后续步骤或凭空生成占位结果。
 
-输出格式同样为严格的 JSON 对象。"""
+'''replan备份：提示词你是一个动态调整与重规划专家。当执行过程中遭遇异常或无法达成预期时，你需要根据当前已有的执行结果以及发生的错误，对剩余的子任务进行修订和重新编排。
 
+【输出格式】
+只输出一个 JSON 对象（顶层字段 subtasks），不要输出 JSON 之外的任何文字、Markdown 围栏或思考过程。
+已判定成功完成的子任务请从新计划中移除，只保留需要重做 / 调整顺序 / 新增的子任务。
+每个子任务字段同初始计划：id / title / description / action_type（只允许 "tool" 或 "reasoning"）/
+tool_name（tool 必填）/ tool_args_hint（可选）。
+
+【重规划要求】
+若既有执行结果显示某数据源工具返回了【空数据】（空数组 / 空对象 / 空字符串，而非报错），
+修订计划中必须改用另一个可用数据源工具（例如从飞书多维表切换到本地 Excel / RAG 知识库）重新取数，
+严禁基于空数据继续编造后续步骤或凭空生成占位结果。
+
+⚠️ 但**不要把"部分数据"误判成"没有数据"**（这一条是实测事故补的）：
+若工具返回中出现"仅展示前 N 行 / 已截断 / 预览 / 结构摘要"等**局部视图**提示，
+说明数据源是好的、只是查询条件不够精确，**严禁**判定数据不存在、**严禁**更换数据源。
+此时必须改写取数方式：改用 filter_column+filter_value 按条件精确定位，
+或补上 sheet_name / 调大 head_rows（检索类工具则调大 top_k），
+并在子任务描述里写清"要用哪个字段的哪个值来筛"；
+涉及计算/统计的，优先改用 local_excel_query_tool 直接在全量数据上算。
+只有工具**明确报错**或**明确返回空数据**时，才允许更换工具或数据源。
+
+⚠️ 若失败的是写操作（local_excel_write_tool 等），重试子任务必须改用语义参数
+filter_column + filter_value + target_column + new_value，并先安排一次读取定位拿到
+真实列名与唯一条件值；**禁止**再次让执行方自己算 A1 单元格坐标，也禁止重复提交
+已知会被拒绝的相同调用（如审批已拒绝）。
+
+⚠️ 若之前的失败原因是参数里出现了 "<从 task_N 获取的…>" 这类**占位符**，
+新计划必须直接写出该参数的真实取值（路径/文件名照抄工具返回里的真实值），
+严禁在新计划的 tool_args_hint 中再次输出任何尖括号占位符。'''
 
 @dataclass
 class SubTask:
@@ -121,6 +153,8 @@ class SubTask:
     action_type: str
     tool_name: Optional[str] = None
     tool_args_hint: Optional[str] = None
+    covers_sub_questions: Optional[List[int]] = None
+    """本子任务覆盖的子问题序号（从 1 开始）。用于校验子问题是否被全覆盖。"""
 
 
 @dataclass
@@ -246,7 +280,47 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     return parsed_struct.model_dump()
 
 
-def _parse_subtasks(data: Dict[str, Any]) -> List[SubTask]:
+def _resolve_tool_name(
+    candidate: str,
+    allowed_tool_names: Optional[Sequence[str]],
+) -> Optional[str]:
+    """把模型声明的工具名收敛到当前白名单内。
+
+    ⚠️ 这是"模型编造工具名"的最后一道程序化护栏（schema enum 只是软约束：
+    不同厂商对 ``anyOf`` 内 enum 的执行力度不一致，不能只靠它）。
+
+    Returns:
+        - 命中白名单 → 原样返回；
+        - 未命中且兜底工具（``UNKNOWN_TOOL_FALLBACK``）在白名单 → 返回兜底工具名；
+        - 否则 → ``None``（调用方降级为 reasoning 子任务）。
+
+    返回非 None 意味着**不需要重规划**：这一步修掉的是"工具名写错"，
+    计划本身的结构与目标仍然有效，走 replan 纯属浪费一整轮全量上下文。
+    """
+    if not allowed_tool_names:
+        return candidate
+    if candidate in allowed_tool_names:
+        return candidate
+    if UNKNOWN_TOOL_FALLBACK in allowed_tool_names:
+        return UNKNOWN_TOOL_FALLBACK
+    return None
+
+
+def _parse_subtasks(
+    data: Dict[str, Any],
+    allowed_tool_names: Optional[Sequence[str]] = None,
+    sub_question_count: int = 0,
+    strict_coverage: bool = False,
+) -> List[SubTask]:
+    """``sub_question_count`` / ``strict_coverage`` 服务于业务规则 ⑧（子问题覆盖校验）。
+
+    Args:
+        sub_question_count: 意图层实际拆分出的子问题数（未拆分时为 0 → 不做校验）。
+        strict_coverage: True 表示这是**首次**解析——覆盖缺失时抛错，让调用方
+            再要一次计划；False 表示已到重试上限，改为告警后放行（fail-open）。
+            两档是刻意的：只靠提示词要求"每子问题一个子任务"是软约束，模型仍会
+            合并；而无限重试又会把链路卡死，所以第二次选择告警放行。
+    """
     """对照 8 层框架：Pydantic OK → 通用语义校验 → 业务规则校验 → 最终 SubTask 列表。
 
     分层校验顺序（在已经通过 Pydantic model_validate_json 的基础上做业务语义过滤）：
@@ -259,6 +333,13 @@ def _parse_subtasks(data: Dict[str, Any]) -> List[SubTask]:
         ④ 若 action_type == 'tool'：tool_name 必须是非空字符串；否则强制降级为 reasoning 并记录原因
         ⑤ tool_name 如果声明了，tool_args_hint 允许为空（可以在执行阶段再解析参数）
         ⑥ id 若缺失或重复：自动补 task_0/task_1... + 附加 _dup 后缀
+        ⑦（白名单护栏）tool_name 必须在 allowed_tool_names 内：不在则映射到兜底检索工具
+           rag_knowledge_search；兜底工具也不在白名单时才降级为 reasoning。
+           这一条是模型编造工具名（如 sales_intelligence_query）的兜底，
+           命中即原地纠正，**不触发重规划**。
+        ⑧（子问题覆盖校验）若 sub_question_count > 0：每个子问题序号（1..N）
+           都必须被至少一个子任务的 covers_sub_questions 覆盖。
+           首次解析缺失 → 抛错触发重新规划；重试后仍缺失 → 告警并放行。
 
     全部校验通过 → 返回 SubTask 列表。
     若校验后 subtasks 为空 → 抛出 ValueError，交给调用方 Retry / fallback 兜底。
@@ -315,7 +396,25 @@ def _parse_subtasks(data: Dict[str, Any]) -> List[SubTask]:
                 )
                 raw_action_type = "reasoning"
             else:
-                final_tool_name = declared_tool_name.strip()
+                candidate_tool: str = declared_tool_name.strip()
+                resolved_tool: Optional[str] = _resolve_tool_name(
+                    candidate_tool, allowed_tool_names
+                )
+                if resolved_tool is None:
+                    logger.warning(
+                        "Planner 业务规则[⑦]：subtask[%d] 工具 %r 不在白名单 %s 且无兜底映射，"
+                        "降级为 reasoning 子任务（不触发重规划）",
+                        idx, candidate_tool, list(allowed_tool_names or []),
+                    )
+                    raw_action_type = "reasoning"
+                else:
+                    if resolved_tool != candidate_tool:
+                        logger.warning(
+                            "Planner 业务规则[⑦]：subtask[%d] 工具 %r 不在白名单，"
+                            "已自动映射为 %r（不触发重规划）",
+                            idx, candidate_tool, resolved_tool,
+                        )
+                    final_tool_name = resolved_tool
 
         # ---- 业务规则校验 ⑥：id 去重 + 自动补 ----
         raw_id: str = str(item.get("id", "") or "").strip()
@@ -326,6 +425,18 @@ def _parse_subtasks(data: Dict[str, Any]) -> List[SubTask]:
 
         final_title: str = str(item.get("title", "") or "").strip() or f"子任务{idx + 1}"
         final_description: str = str(item.get("description", "") or "").strip() or final_title
+
+        # ---- 业务规则 ⑧ 的输入：本子任务声明覆盖哪些子问题（序号从 1 开始）----
+        raw_covers: Any = item.get("covers_sub_questions")
+        final_covers: Optional[List[int]] = None
+        if isinstance(raw_covers, (list, tuple)):
+            parsed_covers: List[int] = []
+            for value in raw_covers:
+                try:
+                    parsed_covers.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            final_covers = parsed_covers or None
 
         # ---- PASS/FAIL 语义门：组装结果前再做 8 层框架的显式语义兜底 ----
         # 若 reasoning 类型但 description/title 都空 → 本条按 FAIL 跳过
@@ -344,40 +455,73 @@ def _parse_subtasks(data: Dict[str, Any]) -> List[SubTask]:
             action_type=raw_action_type,
             tool_name=final_tool_name,
             tool_args_hint=final_tool_args_hint,
+            covers_sub_questions=final_covers,
         ))
 
     if not result:
         raise ValueError("Planner 业务规则校验失败：所有 subtask 均被过滤，最终为空列表，触发 Retry")
 
+    # ---- 业务规则 ⑧：子问题覆盖校验 ----
+    if sub_question_count > 0:
+        covered: set = set()
+        for task in result:
+            if task.covers_sub_questions:
+                covered.update(task.covers_sub_questions)
+        missing: List[int] = [
+            index for index in range(1, sub_question_count + 1) if index not in covered
+        ]
+        if missing:
+            detail: str = (
+                f"Planner 业务规则[⑧]：子问题 {missing} 没有任何子任务覆盖"
+                f"（共 {sub_question_count} 个，已覆盖 {sorted(covered) or '无'}）"
+            )
+            if strict_coverage:
+                raise ValueError(f"{detail}，触发重新规划")
+            # 已到重试上限 → fail-open：无限重试会把链路卡死，静默丢弃又会漏答，
+            # 所以选择「告警 + 继续执行」，把缺失暴露在日志与 trace 里，
+            # 由汇总阶段的证据充分性判定兜底。
+            # ⚠️ 本模块用标准库 logging（%s 风格），不是 loguru（{} 风格）：
+            # 写成 "{}"... 会抛 "not all arguments converted during string formatting"，
+            # 与之前 execute_node 踩过的坑同源。
+            logger.warning("%s，已达重试上限，fail-open 继续执行", detail)
+
     return result
 
 
 class PlannerAgent:
-    """P1① 扁平化：优先直接持有 ModelRouter（2 层链路：Agent → ModelRouter.chat → 引擎），
-    兼容旧 `llm` 协议参数作为回退兜底。
+    """P1① 扁平化：直接持有 ModelRouter（2 层链路：Agent → ModelRouter.chat → 引擎）。
 
     旧嵌套（改造前）：Agent → orchestrator._LLMAdapter → _PurposeLLMAdapter → ModelRouter（4 层）
     新链路（改造后）：Agent → ModelRouter.chat（2 层，减少 2 个适配器包装层）
+
+    注：旧 ``llm`` / ``acomplete`` 协议兼容分支已移除——当前接线恒走 ModelRouter，
+    该分支不可达（orchestrator 只以 model_router= 构造本类）。
     """
 
     def __init__(
             self,
-            llm: Optional[LLMCallable] = None,
             tools: Optional[ToolInvoker] = None,
             memory: Optional[Any] = None,  # 废弃底层单体耦合
             max_replan_attempts: int = 2,
             *,
-            model_router: Optional[Any] = None,
+            model_router: Any,
             purpose_hint: str = "planner",
             call_budget: Optional[Any] = None,
             enable_empty_result_replan: bool = True,
+            allowed_tool_names: Optional[List[str]] = None,
     ) -> None:
-        if llm is None and model_router is None:
-            raise ValueError("PlannerAgent 需要提供 llm 或 model_router 至少其一")
-        self._llm = llm
+        if model_router is None:
+            raise ValueError("PlannerAgent 需要提供 model_router（旧 llm/acomplete 协议已移除）")
         self._model_router = model_router
         self._purpose: str = purpose_hint
         self._tools = tools
+        # 运行时工具白名单（意图 ∩ 注册中心 ∩ 技能号令）：既用于提示词注入清单，
+        # 也用于给 response_format 的 tool_name 生成 enum，以及 _parse_subtasks 的兜底映射。
+        self._allowed_tool_names: List[str] = [
+            str(name).strip()
+            for name in (allowed_tool_names or [])
+            if isinstance(name, str) and str(name).strip()
+        ]
         # 工具调用预算：单次 Agent 请求作用域（plan/replan 提示词动态规划 + execute 硬熔断共用）
         self._call_budget: Optional[Any] = call_budget
         # 【方案B】空业务结果 → 触发 replan（非异常型），默认开启
@@ -385,13 +529,11 @@ class PlannerAgent:
         self.max_replan_attempts = max(0, max_replan_attempts)
 
     async def _llm_chat(self, messages, **kwargs) -> str:
-        """统一 LLM 调用入口：优先 ModelRouter，否则回退旧 acomplete 协议。"""
-        if self._model_router is not None:
-            resp = await self._model_router.chat(
-                messages=list(messages), purpose_hint=self._purpose, **kwargs
-            )
-            return (getattr(resp, "content", None) or "").strip()
-        return await self._llm.acomplete(messages, **kwargs)
+        """统一 LLM 调用入口：走 ModelRouter，返回纯文本 content。"""
+        resp = await self._model_router.chat(
+            messages=list(messages), purpose_hint=self._purpose, **kwargs
+        )
+        return (getattr(resp, "content", None) or "").strip()
 
     def _budget_prompt_block(self) -> str:
         """生成注入 plan/replan 提示词的预算说明段（静态基线 + 剩余额度动态规划）。
@@ -418,8 +560,106 @@ class PlannerAgent:
             + "\n规划 tool 子任务时请据此收敛调用次数；纯推理子任务不受额度限制。\n\n"
         )
 
+    def _resolve_allowed_tools(self) -> List[str]:
+        """当前允许调用的工具名（构造参数优先，缺省回落到注册中心全量）。"""
+        if self._allowed_tool_names:
+            return list(self._allowed_tool_names)
+        getter = getattr(self._tools, "list_tool_names", None)
+        if callable(getter):
+            try:
+                return [str(name) for name in getter()]
+            except Exception as exc:  # noqa: BLE001 - 反射失败不应阻断规划
+                logger.warning("Planner 反射工具清单失败，跳过工具白名单注入：%s", exc)
+        return []
+
+    def _tool_catalog_block(self) -> str:
+        """生成「可用工具清单」提示段：工具名 + 能力描述 + 必填/可选参数。
+
+        ⚠️ 这一段是让 planner 不再编造工具名的**主手段**（schema enum 只是辅助约束：
+        各家对 ``anyOf`` 分支内 enum 的执行力度并不一致）。
+
+        旧实现里 planner 在 plan 路径上根本拿不到工具名，只能从预算段看到
+        "其余 N 个工具额度充足"，于是按技能名派生出了 ``sales_intelligence_query``
+        这种不存在的工具 → 执行被白名单拒绝 → 触发一次完整 replan。
+        """
+        allowed: List[str] = self._resolve_allowed_tools()
+        if not allowed:
+            return ""
+        getter = getattr(self._tools, "get_tool", None)
+        lines: List[str] = ["## 可用工具清单（tool_name 必须原样取自下列名称，禁止编造）"]
+        for name in allowed:
+            desc: str = ""
+            param_desc: str = ""
+            if callable(getter):
+                try:
+                    tool: Any = getter(name)
+                except Exception:  # noqa: BLE001 - 个别工具反射失败不影响其余工具
+                    tool = None
+                if tool is not None:
+                    desc = str(getattr(tool, "description", "") or "").strip()
+                    parts: List[str] = []
+                    for param in (getattr(tool, "parameters", None) or []):
+                        mark: str = "*" if getattr(param, "required", False) else ""
+                        parts.append(f"{getattr(param, 'name', '?')}{mark}")
+                    if parts:
+                        param_desc = "，".join(parts)
+            entry: str = f"- {name}" + (f"：{desc}" if desc else "")
+            if param_desc:
+                entry += f"\n    参数: {param_desc}（* 为必填）"
+            lines.append(entry[:400])
+        lines.append(
+            "禁止把技能名或业务词直接当工具名使用（例如 sales_intelligence_query 这类工具不存在）；"
+            "知识/业务类问答一律用 rag_knowledge_search；确无合适工具时把子任务设为 reasoning。"
+        )
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _compact_results_for_replan(results: Any) -> List[Dict[str, Any]]:
+        """把完整执行记录压成〔id / 工具 / 状态 / 摘要〕四元组。
+
+        重规划只需要知道"哪些做完了、结论是什么、哪些失败了"，**不需要**原始观测。
+        旧实现直接把 ``results`` 全量 json.dumps 后截断 16000 字符，而单条
+        observation 在上游就被截到了 8000 字符 —— 于是整篇 SKILL.md 会原样进入
+        replan 提示词，这是 replan 单笔 7149 token 的主要来源。
+
+        摘要优先取子任务 LLM 提炼结论（``llm_output``），没有才退回原始观测。
+        """
+        compact: List[Dict[str, Any]] = []
+        for item in results or []:
+            if not isinstance(item, dict):
+                continue
+            summary: str = str(
+                item.get("llm_output") or item.get("observation") or ""
+            )[:REPLAN_SUMMARY_MAX_CHARS]
+            compact.append({
+                "id": item.get("id"),
+                "tool_name": item.get("tool_name"),
+                "status": item.get("status"),
+                "summary": summary,
+            })
+        return compact
+
+    def _plan_response_formats(self) -> tuple:
+        """返回 (动态带 enum 的 response_format, 静态兜底 response_format)。
+
+        第 1 次尝试用动态 schema（模型无法输出白名单外的工具名）；
+        第 2 次（retry）退回静态 schema —— 万一厂商拒绝动态 schema，
+        链路仍可继续，不会因 schema 问题整体降级成 fallback 计划。
+        """
+        allowed: List[str] = self._resolve_allowed_tools()
+        dynamic: Optional[Dict[str, Any]] = (
+            pydantic_to_openai_response_format(build_dynamic_plan_schema(allowed))
+            if allowed
+            else None
+        )
+        static: Dict[str, Any] = pydantic_to_openai_response_format(PlanGenerateSchema)
+        return dynamic, static
+
     # 整合skills
-    async def plan(self, query: str, memory_context: Dict[str, Any], skills_block: str = '') -> List[SubTask]:
+    async def plan(
+            self, query: str, memory_context: Dict[str, Any], skills_block: str = '',
+            sub_question_count: int = 0,
+    ) -> List[SubTask]:
         """MID-1：初始计划生成（执行 1 次 LLM + Parse 失败后 Retry 1 次）。
 
         对应 8 层框架完整执行链路：
@@ -453,6 +693,8 @@ class PlannerAgent:
                            f"## 长期事实参考：\n{mem_block}\n\n"
                            # 整合skills
                            f"{skills_section}"
+                           # 可用工具清单：plan 路径上唯一能看到真实工具名的地方
+                           f"{self._tool_catalog_block()}"
                            # 工具预算：让计划阶段的 tool 子任务数量主动收敛在额度内
                            f"{self._budget_prompt_block()}"
                            f"## 当前用户新目标：\n{query}\n\n"
@@ -465,19 +707,31 @@ class PlannerAgent:
             SubTask(id="fallback_1", title="直接回答", description=query, action_type="reasoning")
         ]
 
+        allowed_tool_names: List[str] = self._resolve_allowed_tools()
+        dynamic_format, static_format = self._plan_response_formats()
+
         # 按 8 层框架：最多 2 次 LLM 调用（首次 + Retry 1 次）
         for attempt_index in range(2):
             temperature_value: float = 0.3 if attempt_index == 0 else 0.4
+            # 首次用带 tool_name enum 的动态 schema；retry 退回静态 schema
+            #（服务端若不支持动态 schema，仍能拿到计划，不会整体降级）
+            response_format = dynamic_format if attempt_index == 0 else static_format
             try:
                 # MID-1 Planner 初始计划：关闭思考 + 严格 JSON schema（subtasks 数组）
                 raw = await self._llm_chat(
                     messages,
                     temperature=temperature_value,
                     thinking=False,
-                    response_format=pydantic_to_openai_response_format(PlanGenerateSchema),
+                    response_format=response_format or static_format,
                 )
                 parsed_dict = _extract_json_object(raw)
-                subtasks_list = _parse_subtasks(parsed_dict)
+                subtasks_list = _parse_subtasks(
+                    parsed_dict,
+                    allowed_tool_names,
+                    sub_question_count=sub_question_count,
+                    # 只有首次解析才因覆盖缺失而重试；重试后仍缺失则告警放行
+                    strict_coverage=(attempt_index == 0),
+                )
                 return subtasks_list
             except Exception as plan_error:
                 if attempt_index == 0:
@@ -513,247 +767,20 @@ class PlannerAgent:
             合法的参数字典；任一环节失败（无 model_router / 无法 introspection /
             LLM 未产出 tool_calls / 参数非 dict）返回 None，由调用方降级走老逻辑。
         """
-        # FC 依赖 ModelRouter.chat_with_tools；纯 llm 回退模式无法走协议，直接放弃
-        if self._model_router is None:
-            return None
+        # 2.2：规范实现已迁至 graph/nodes/_fc_args.py（execute 节点共用），此处薄委托。
+        from app.core.agent.graph.nodes._fc_args import resolve_tool_args_via_function_call
 
-        try:
-            if hasattr(self._tools, "get_tool"):
-                tool_instance: Any = self._tools.get_tool(task.tool_name)  # type: ignore[attr-defined]
-            else:
-                # 仅暴露 invoke 的执行代理无法反射 schema，走降级
-                tool_instance = None
-        except KeyError:
-            tool_instance = None
-        if tool_instance is None:
-            return None
-
-        function_def: Dict[str, Any] = tool_to_function_call_definition(tool_instance)
-        arg_fill_system_prompt: str = (
-            "你是 Agent 子任务执行前的「工具参数填充器」。"
-            "你必须调用系统提供的那个唯一工具，并按其参数 JSON Schema 生成调用所需的参数字段；"
-            "参数名、类型与必填项必须严格与 Schema 一致，禁止虚构 Schema 中不存在的字段。"
-            "若可选参数不影响任务推进可省略。你的输出只会被当成工具参数解析，禁止输出任何解释文字。"
+        return await resolve_tool_args_via_function_call(
+            self._model_router,
+            self._tools,
+            tool_name=task.tool_name,
+            title=task.title,
+            description=task.description,
+            tool_args_hint=task.tool_args_hint,
+            query=query,
+            prior_context_str=prior_context_str,
+            purpose_hint=self._purpose,
         )
-        user_content: str = (
-            f"原始总问题：{query}\n"
-            f"当前子任务：{task.title}\n"
-            f"子任务详细要求：{task.description}\n"
-            f"规划器备注（仅供参考，可能为空）：{task.tool_args_hint or '（无）'}\n"
-            f"可参考的前序子任务上下文：\n{(prior_context_str or '')[:3000]}"
-        )
-        messages: Sequence[Dict[str, str]] = [
-            {"role": "system", "content": arg_fill_system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-
-        try:
-            resp: Any = await self._model_router.chat_with_tools(
-                messages=list(messages),
-                tools=[function_def],
-                tool_choice={"type": "function", "function": {"name": task.tool_name}},
-                purpose_hint=self._purpose,
-                temperature=0.1,
-                thinking=False,
-            )
-        except Exception as fc_exc:  # noqa: BLE001 - 通道/模型不支持 tools 时降级老逻辑
-            logger.warning(
-                "Planner FC 强制取参调用失败（tool=%s），降级走 tool_args_hint 解析: %s",
-                task.tool_name, fc_exc,
-            )
-            return None
-        if not getattr(resp, "tool_calls", None):
-            logger.warning(
-                "Planner FC 强制取参未返回 tool_calls（tool=%s），降级走 tool_args_hint 解析",
-                task.tool_name,
-            )
-            return None
-
-        raw_args: Any = resp.tool_calls[0].get("function", {}).get("arguments")
-        if not isinstance(raw_args, str):
-            return None
-        try:
-            parsed_args: Any = json.loads(raw_args)
-        except json.JSONDecodeError as decode_error:
-            logger.warning(
-                "Planner FC 强制取参返回非法 JSON（tool=%s）：%s", task.tool_name, decode_error
-            )
-            return None
-        if not isinstance(parsed_args, dict):
-            return None
-        return parsed_args
-
-    async def execute(
-            self,
-            plan: List[SubTask],
-            query: str,
-            session_id: str,
-            tool_names: Optional[Sequence[str]] = None,
-            trace_callback: Optional[Any] = None,
-    ) -> AgentResult:
-        allowed = set(tool_names) if tool_names else None
-        results: List[Dict[str, Any]] = []
-
-        for idx, task in enumerate(plan):
-            rec: Dict[str, Any] = {
-                "subtask_id": task.id,
-                "title": task.title,
-                "action_type": task.action_type
-            }
-            try:
-                # 前移：先构建前序子任务精炼上下文（工具强制取参与提炼阶段共用同一份）
-                simplified_context = [
-                    {
-                        "subtask_id": r["subtask_id"],
-                        "title": r["title"],
-                        "conclusion": r.get("llm_output", r.get("observation", ""))
-                    }
-                    for r in results
-                ]
-                ctx_str = json.dumps(simplified_context, ensure_ascii=False, indent=2)[:8000]
-
-                # 1. 如果需要工具，先获取工具的原始观察值 (Observation)
-                obs_str: Optional[str] = None
-                if task.action_type == "tool":
-                    if not task.tool_name:
-                        raise ValueError(f"子任务 [{task.id}] 声明为 tool 类型，但未指定 tool_name")
-                    if allowed is not None and task.tool_name not in allowed:
-                        raise RuntimeError(f"工具 {task.tool_name} 不在允许列表中")
-
-                    # 预算熔断（先检查后计数）：单工具上限或全局总硬上限任一已达 → 不再发起调用
-                    if self._call_budget is not None and not self._call_budget.can_call(task.tool_name):
-                        deny_text: str = self._call_budget.deny_text(task.tool_name)
-                        obs_str = deny_text
-                        rec["budget_denied"] = True
-                        logger.info(
-                            "Planner 子任务 [%s] 工具 [%s] 触发额度熔断，转为纯推理收尾：%s",
-                            task.id, task.tool_name, deny_text[:160],
-                        )
-                    else:
-                        if self._call_budget is not None:
-                            self._call_budget.consume(task.tool_name)
-
-                        # 一律优先【原生 Function Calling】强制取参：模型按该工具 JSON Schema 生成合法参数
-                        args: Dict[str, Any] = await self._resolve_tool_args_via_function_call(
-                            task, query, ctx_str,
-                        )
-                        if args is None:
-                            # 降级（纯 llm 无 model_router / 工具不可 introspection / LLM 异常）：
-                            # 沿用 tool_args_hint 文本解析，保证不因 FC 失败而中断流程
-                            args = {}
-                            if task.tool_args_hint:
-                                try:
-                                    parsed = json.loads(task.tool_args_hint)
-                                    args = parsed if isinstance(parsed, dict) else {"hint": str(parsed)}
-                                except Exception:
-                                    args = {"hint": task.tool_args_hint}
-                            if "user_query" not in args:
-                                args["user_query"] = query
-
-                        # 注意：planner 用的是标准库 logging（%-风格），不要用 {} 占位
-                        logger.info(
-                            "Planner 子任务 [%s] 调用工具 [%s]，实际参数: %s",
-                            task.id, task.tool_name, args,
-                        )
-
-                        # 调用工具并安全转为字符串
-                        obs = await self._tools.invoke(task.tool_name, args)
-                        if isinstance(obs, str) and ("【系统拒绝执行】" in obs or "error" in obs.lower()):
-                            raise RuntimeError(f"工具执行返回错误: {obs[:200]}")
-                        if isinstance(obs, (dict, list)):
-                            obs_str = json.dumps(obs, ensure_ascii=False, indent=2)
-                        else:
-                            obs_str = str(obs)
-
-                        # 预算后处理：空/异常累计无效、第 N 次相关性抽查（可能触发硬熔断）
-                        obs_str = await postprocess_tool_result(
-                            self._call_budget, task.tool_name,
-                            str(args)[:1500], obs_str, self._model_router,
-                        )
-
-                        rec["observation"] = obs_str[:8000] # 保留原始观测记录备查
-
-                        # 【方案B】空业务结果 → 停止剩余剧本并触发 replan（非异常型）。
-                        # 与通过 except 抛异常触发 replan 的本质区别：这不是“调用出错”需要修复，
-                        # 而是“数据源为空”需要临时换一个可用数据源重新取数，避免拿着空数据
-                        # 硬造后续步骤或生成占位结果（例如用空列表凭空编“线索A~E”）。
-                        if (
-                            self._enable_empty_result_replan
-                            and isinstance(obs_str, str)
-                            and _is_empty_data(obs_str)
-                        ):
-                            rec["status"] = "empty_data"
-                            rec["replan_reason"] = (
-                                f"{EMPTY_DATASOURCE_REPLAN_PREFIX}: {task.tool_name} 返回空业务数据"
-                            )
-                            results.append(rec)
-                            if trace_callback:
-                                await trace_callback({"phase": "execute", "record": rec})
-                            logger.info(
-                                "Planner 子任务 [%s] 工具 [%s] 返回空业务数据，触发备选数据源重规划",
-                                task.id, task.tool_name,
-                            )
-                            return AgentResult(
-                                success=False,
-                                final_answer="",
-                                steps=results,
-                                error=(
-                                    f"{EMPTY_DATASOURCE_REPLAN_PREFIX}: 工具 [{task.tool_name}] "
-                                    "未返回可用业务数据，请改用其他可用数据源工具重新获取，严禁编造占位数据。"
-                                ),
-                            )
-
-                # 2. 通用思考/提炼阶段：不管是工具任务还是纯推理任务，统一由 LLM 生成当前子任务的明确结论
-                # 组装当前子任务 Prompt
-                prompt_content = f"原始总问题：{query}\n当前子任务：{task.title}\n详细要求：{task.description}\n历史子任务结论：\n{ctx_str}\n"
-                if obs_str:
-                    prompt_content += f"\n本步骤工具调用返回的原始数据：\n{obs_str[:6000]}\n请结合工具数据完成本子任务。"
-                else:
-                    prompt_content += "\n请根据历史上下文推理并完成本子任务。"
-
-                subtask_msgs: Sequence[Dict[str, str]] = [
-                    {
-                        "role": "system",
-                        "content": "你是高效的子任务执行专家。请根据上下文（及工具数据），针对当前子任务给出简洁、准确的最终结论或分析结果。"
-                    },
-                    {"role": "user", "content": prompt_content},
-                ]
-
-                # 执行 LLM 提炼
-                text = await self._llm_chat(subtask_msgs,thinking=False, temperature=0.3)
-                rec["llm_output"] = text.strip()
-                rec["status"] = "ok"
-
-            except Exception as e:
-                rec["status"] = "error"
-                rec["error"] = str(e)
-                results.append(rec)
-                if trace_callback:
-                    await trace_callback({"phase": "execute", "record": rec})
-                return AgentResult(success=False, final_answer="", steps=results, error=str(e))
-
-            results.append(rec)
-            if trace_callback:
-                await trace_callback({"phase": "execute", "record": rec})
-
-        # 3. 最终汇总阶段：直接基于每一个子任务提炼后的精炼结论（llm_output）生成面向用户的回答
-        try:
-            final_context = [
-                {"step": r["title"], "result": r.get("llm_output", "")}
-                for r in results
-            ]
-            summary_msgs: Sequence[Dict[str, str]] = [
-                {"role": "system", "content": "你是最终总结助手。请根据各子任务的执行结论，整合并回答用户的原始问题。"},
-                {
-                    "role": "user",
-                    "content": f"原始问题：{query}\n各步骤执行结论：\n{json.dumps(final_context, ensure_ascii=False, indent=2)}"
-                },
-            ]
-            final = await self._llm_chat(summary_msgs,thinking=False, temperature=0.2)
-        except Exception as e:
-            return AgentResult(success=False, final_answer="", steps=results, error=f"汇总阶段失败: {e}")
-
-        return AgentResult(success=True, final_answer=final.strip(), steps=results)
 
     async def replan(
         self,
@@ -769,18 +796,30 @@ class PlannerAgent:
           - 复用 PlanGenerateSchema response_format（严格 JSON schema 保证格式正确）
           - 按 8 层框架：同样走 1 次 LLM → Parse 失败 Retry 1 次 的完整分层校验
         """  # 虽然调用大模型，这里本质是一个小模型在编排任务，并且是吧json注入到系统提示词的笨办法
+        # ⚠️ 只喂"摘要 + 失败原因 + 白名单"：全量 results_so_far 会把整篇
+        # SKILL.md（单条 observation 上游已截到 8000 字符）原样带进 replan。
         payload = {
-            "previous_plan": [task.__dict__ for task in plan],
-            "results_so_far": results,
-            "error": error,
+            "allowed_tools": self._resolve_allowed_tools(),
+            "previous_plan": [
+                {
+                    "id": task.id,
+                    "title": task.title,
+                    "action_type": task.action_type,
+                    "tool_name": task.tool_name,
+                }
+                for task in plan
+            ],
+            "results_so_far": self._compact_results_for_replan(results),
+            "error": (error or "")[:500],
         }
         messages: Sequence[Dict[str, str]] = [
             {"role": "system", "content": REPLAN_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": "上下文：\n"
-                + json.dumps(payload, ensure_ascii=False, indent=2)[:16000]
+                + json.dumps(payload, ensure_ascii=False, indent=2)[:REPLAN_PAYLOAD_MAX_CHARS]
                 + "\n\n"
+                + self._tool_catalog_block()
                 + self._budget_prompt_block()  # 剩余额度提醒：重规划时收敛新增 tool 子任务
                 + "【再次提醒】严格遵守 REPLAN 的 JSON 输出规则：整个回复只能是合法 JSON 对象，"
                 "顶层为 {subtasks:[...]}；已成功完成的子任务不要再出现在新计划中。请输出修订后的 JSON 计划。",
@@ -796,19 +835,24 @@ class PlannerAgent:
             )
         ]
 
+        allowed_tool_names: List[str] = self._resolve_allowed_tools()
+        dynamic_format, static_format = self._plan_response_formats()
+
         # 按 8 层框架：最多 2 次 LLM 调用（首次 + Retry 1 次）—— REPLAN 不关闭 thinking
         for attempt_index in range(2):
             temperature_value: float = 0.3 if attempt_index == 0 else 0.45
+            response_format = dynamic_format if attempt_index == 0 else static_format
             try:
                 # REPLAN：A-C2 属于 Plan 循环恢复点的推理环节（不关闭 thinking 保留推理），
-                # 但复用 PlanGenerateSchema response_format 保证输出格式 100% 正确。
+                # 但复用 Plan schema 的 response_format 保证输出格式 100% 正确。
                 raw = await self._llm_chat(
                     messages,
                     temperature=temperature_value,
-                    response_format=pydantic_to_openai_response_format(PlanGenerateSchema),
+                    thinking=False,
+                    response_format=response_format or static_format,
                 )
                 parsed_dict = _extract_json_object(raw)
-                subtasks_list = _parse_subtasks(parsed_dict)
+                subtasks_list = _parse_subtasks(parsed_dict, allowed_tool_names)
                 return subtasks_list
             except Exception as replan_error:  # noqa: BLE001
                 if attempt_index == 0:
@@ -822,40 +866,3 @@ class PlannerAgent:
                 return fallback_replan
 
         return fallback_replan
-
-    # 整合skills
-    async def run_with_plan(
-            self,
-            query: str,
-            session_id: str,
-            tool_names: Optional[Sequence[str]] = None,
-            trace_callback: Optional[Any] = None,
-            memory_context: Dict[str, Any] = None,  # 💡 穿透接收
-            skills_block: str = '',
-    ) -> AgentResult:
-        # 整合skills
-        current_plan = await self.plan(
-            query,
-            memory_context or {"short_term": [], "long_term": []},
-            skills_block=skills_block
-        )
-        last_error: Optional[str] = None
-        aggregate_results: List[Dict[str, Any]] = []
-
-        for attempt in range(self.max_replan_attempts + 1):
-            res = await self.execute(
-                current_plan, query, session_id, tool_names=tool_names, trace_callback=trace_callback
-            )
-            if res.success:
-                return res
-
-            last_error = res.error
-            aggregate_results.extend(res.steps)
-            if attempt >= self.max_replan_attempts:
-                break
-
-            current_plan = await self.replan(current_plan, res.steps, last_error)
-            if not current_plan:
-                return AgentResult(success=False, final_answer="", steps=aggregate_results, error="重规划返回空计划")
-
-        return AgentResult(success=False, final_answer="", steps=aggregate_results, error=last_error)

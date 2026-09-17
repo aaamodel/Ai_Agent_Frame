@@ -5,7 +5,7 @@
   1) explicit_plan_hint（显式步骤提示）优先级最高
         → 走 plan_execute，decision_source = "explicit_hint"
 
-  2) 规则阈值层（Rule Threshold）：
+        2) 规则阈值层（Rule Threshold）：
         estimated_steps >= MODE_DECISION_STEP_THRESHOLD
         或 estimated_tool_calls >= MODE_DECISION_TOOL_THRESHOLD
         或 has_multi_step_dependency=True
@@ -90,7 +90,7 @@ class ModeDecider:
         if decision is not None and decision.mode == "plan_execute":
             return decision
 
-        # 第三层：意图树静态模式倾向（非 LLM；task-todo-plan 等节点带 prefer_mode）
+        # 第三层：意图树静态模式倾向（非 LLM；意图树叶子节点的静态 prefer_mode 字段）
         prefer_mode_decision = self._decide_by_intent_prefer_mode(intents_result)
         if prefer_mode_decision is not None:
             return prefer_mode_decision
@@ -199,7 +199,7 @@ class ModeDecider:
     ) -> Optional[ModeDecision]:
         """读取意图聚合 raw_slots["intent_prefer_mode"]（意图树节点静态字段）。
 
-        该信号源自 DB/工厂树叶子节点的 prefer_mode 属性（如 task-todo-plan），
+        该信号源自 DB/工厂树叶子节点的 prefer_mode 静态属性，
         属于静态规则数据，与被移除的 LLM 兜底层无关。
         """
         if intents_result is None:

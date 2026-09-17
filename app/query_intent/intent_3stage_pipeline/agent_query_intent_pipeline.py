@@ -526,6 +526,13 @@ class AgentQueryIntentPipeline:
         if rewrite_result.explicit_plan_hint:
             merged["explicit_plan_hint"] = rewrite_result.explicit_plan_hint
 
+        # 本轮目标（改写阶段产出，供全链路注入复用）。
+        # 值已在解析层经 normalize_agent_goal 归一（非空 + ≤60 字），此处**只搬运**，
+        # 不再二次兜底——否则就出现"两处各自兜底"的漂移（design.md D5）。
+        agent_goal_value: str = str(getattr(rewrite_result, "agent_goal", "") or "").strip()
+        if agent_goal_value:
+            merged["agent_goal"] = agent_goal_value
+
         # 模式决策：plan 的步骤 hint / react 的首工具 hint
         if mode_decision.mode == "plan_execute" and mode_decision.initial_plan_hint:
             # 疑问-F F-1：写 intent_context.slots.initial_plan_hint

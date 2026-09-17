@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import re
 
 from typing import List, Optional, Dict, Set
