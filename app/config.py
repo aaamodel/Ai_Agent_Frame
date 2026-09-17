@@ -213,14 +213,27 @@ class Settings(BaseSettings):
     llm_tier_deep: str = Field(
         default="", description="DEEP tier 候选 model_id 列表（至少 1 个 supports_thinking=true）"
     )
+    # ⚠️ 超时语义：**单次尝试**的超时，不是"整个候选（含重试）"的总预算。
+    #    最坏总耗时 = (1 + retries) × 本值，因此两者要一起看。
     llm_tier_fast_timeout_ms: int = Field(
-        default=40_000, ge=1, description="FAST tier 总调用超时（ms）"
+        default=40_000, ge=1, description="FAST tier 单次尝试超时（ms）"
     )
     llm_tier_standard_timeout_ms: int = Field(
-        default=60_000, ge=1, description="STANDARD tier 总调用超时（ms）"
+        default=60_000, ge=1, description="STANDARD tier 单次尝试超时（ms）"
     )
     llm_tier_deep_timeout_ms: int = Field(
-        default=90_000, ge=1, description="DEEP tier 总调用超时（ms）"
+        default=90_000, ge=1, description="DEEP tier 单次尝试超时（ms）"
+    )
+    # 重试由我们这一层显式控制（底层 SDK 的隐式重试已关闭），因此每次尝试各自
+    # 享有完整的 timeout 预算；这里控制"额外尝试几次"（不含首次）。
+    llm_tier_fast_retries: int = Field(
+        default=1, ge=0, le=5, description="FAST tier 单次尝试失败后的重试次数（不含首次）"
+    )
+    llm_tier_standard_retries: int = Field(
+        default=1, ge=0, le=5, description="STANDARD tier 单次尝试失败后的重试次数（不含首次）"
+    )
+    llm_tier_deep_retries: int = Field(
+        default=1, ge=0, le=5, description="DEEP tier 单次尝试失败后的重试次数（不含首次）"
     )
 
     # ---------------- 后端 ----------------
@@ -343,7 +356,10 @@ class Settings(BaseSettings):
                 cleaned = _unwrap_quotes_and_backticks(cleaned)
                 data[key] = cleaned
         for key in ("llm_tier_fast_timeout_ms", "llm_tier_standard_timeout_ms",
-                    "llm_tier_deep_timeout_ms", "milvus_port", "port"):
+                    "llm_tier_deep_timeout_ms",
+                    "llm_tier_fast_retries", "llm_tier_standard_retries",
+                    "llm_tier_deep_retries",
+                    "milvus_port", "port"):
             if isinstance(data.get(key), str):
                 cleaned = _strip_trailing_comment(data[key]).strip()
                 data[key] = cleaned
@@ -399,9 +415,9 @@ class Settings(BaseSettings):
             "openai_llm_model": self.openai_llm_model,
             "llm_models": self.llm_models_parsed,
             "tiers": {
-                "fast": {"candidates": self.llm_tier_fast_parsed,     "timeout_ms": self.llm_tier_fast_timeout_ms},
-                "standard": {"candidates": self.llm_tier_standard_parsed, "timeout_ms": self.llm_tier_standard_timeout_ms},
-                "deep": {"candidates": self.llm_tier_deep_parsed,     "timeout_ms": self.llm_tier_deep_timeout_ms},
+                "fast": {"candidates": self.llm_tier_fast_parsed,     "timeout_ms": self.llm_tier_fast_timeout_ms,     "retries": self.llm_tier_fast_retries},
+                "standard": {"candidates": self.llm_tier_standard_parsed, "timeout_ms": self.llm_tier_standard_timeout_ms, "retries": self.llm_tier_standard_retries},
+                "deep": {"candidates": self.llm_tier_deep_parsed,     "timeout_ms": self.llm_tier_deep_timeout_ms,     "retries": self.llm_tier_deep_retries},
             },
         }
 

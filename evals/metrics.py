@@ -46,6 +46,20 @@ MIN_SAMPLES_BOUNDARY: int = 5
 任何切片/抽样导致边界样本少于 5 条时，该指标退化为未采集。
 """
 
+MIN_SAMPLES_RETRIEVAL: int = 20
+"""检索侧 mrr（首个命中排名的倒数）所需的最小样本量。
+
+为什么 mrr 单独需要这道门：它对**位置**极敏感——单条用例排第 3 就等于整体
+0.3333。实测 `--limit 2` 时只抽到 1 条可判分用例，mrr=0.333 被判红；而同一份
+黄金集全量跑（27 条判分样本）mrr=0.699 是达标的。判定的是"这个分数还不足以被
+判定"，而不是"分数低"。
+
+下限与 MIN_SAMPLES_PERCENTILE 取同一数值：黄金集 32 条、扣掉 5 条应拒答样本后
+仍有 27 条，全量跑稳定达标，因此不影响全量结论。
+
+⚠️ 只覆盖 mrr：同分母的 recall@k / hit@k 对位置不敏感，保持既有行为。
+"""
+
 
 def sample_gate(count: int, required: int) -> Optional[Dict[str, int]]:
     """样本量是否达到可判定的下限。
@@ -84,6 +98,7 @@ def format_metric(value: Any, spec: str = ".3f", na: str = "不可用") -> str:
 __all__ = [
     "MIN_SAMPLES_PERCENTILE",
     "MIN_SAMPLES_BOUNDARY",
+    "MIN_SAMPLES_RETRIEVAL",
     "sample_gate",
     "format_metric",
     "recall_at_k",
@@ -579,6 +594,13 @@ def aggregate_rag_results(
     )
     if latency_flag:
         insufficient["p95_latency_ms"] = latency_flag
+
+    # mrr 对"位置"极敏感：单条用例排第 3 就等于整体 0.3333，小样本下它测的是
+    # 那一条用例的排名，不是整体水位。⚠️ 只覆盖 mrr——recall@k / hit@k 对位置
+    # 不敏感，保持既有行为（见本变更 design.md D6 的取舍记录）。
+    mrr_flag: Optional[Dict[str, int]] = sample_gate(len(mrrs), MIN_SAMPLES_RETRIEVAL)
+    if mrr_flag:
+        insufficient["mrr"] = mrr_flag
 
     return {
         "total": len(records),

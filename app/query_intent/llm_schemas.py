@@ -785,15 +785,7 @@ def build_dynamic_plan_schema(
 class SubTaskOutcomeSchema(BaseModel):
     """plan 子任务执行产出的结构化结果：**结论 + 控制指令一次调用产出**。
 
-    与 ``SummaryVerdictSchema`` 同构——一次 LLM 调用同时拿到"业务产物"与"调度判定"，
-    **不额外发起调用**（这是它优于"注册一个 end 工具"的关键：后者要再跑一轮）。
-
-    ⚠️ 控制指令是**增值能力，不是主链路依赖**：解析失败时调用方 MUST 降级为
-    "继续执行下一子任务"，且 MUST NOT 丢弃已经花钱取回的结论。
-
-    两条字段的语义边界（与台账的两列一一对应）：
-        solved      → 本子任务是否解决了它要解决的问题（语义判断，只能模型自评）
-        next_action / skip_task_ids → 下一步怎么走（调度决策）
+    ⚠️ 控制指令是**增值能力，不是主链路依赖**
     """
 
     conclusion: str = Field(
@@ -812,7 +804,7 @@ class SubTaskOutcomeSchema(BaseModel):
     skip_task_ids: Optional[List[str]] = Field(
         default=None,
         description="要跳过的子任务 id 列表（其答案已由其它子任务取得，或已无执行必要）。"
-                    "无需跳过时为 null。只允许跳过，不允许新增或修改子任务。",
+                    "无需跳过时为 null。",
     )
     reason: str = Field(
         default="", description="选择 finish 或 skip_task_ids 的简短理由（用于留痕审计）。"

@@ -169,7 +169,10 @@ class _AppModelRouterIntentLLMAdapter(IntentLLMService):
         # 说明：旧代码调用了 self._model_router.for_purpose(...)，该方法在原方案 A
         # 和新重写方案驱动的 ModelRouter 中均未实现（必报 AttributeError）。
         # 统一改为 get_llm(purpose)：内部按 PURPOSE_TIER_MAP 自动命中 FAST tier
-        # （15s 超时，适用于意图分类/改写这类高频场景），chat 为 STANDARD 兜底。
+        # （适用于意图分类/改写这类高频场景）。该档位的**单次尝试**超时取自
+        # LLM_TIER_FAST_TIMEOUT_MS、重试次数取自 LLM_TIER_FAST_RETRIES——
+        # 两者不要再在本文件里写死数值（历史注释里的"15s"早已与实际配置不符）。
+        # chat 为 STANDARD 兜底。
         try:
             purpose_adapter = self._model_router.get_llm("intent_analysis")
         except Exception:

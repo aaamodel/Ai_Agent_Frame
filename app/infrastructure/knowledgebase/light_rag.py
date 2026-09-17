@@ -12,6 +12,9 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from app.config import get_settings
+from app.llm_model_router.async_model_executor import run_with_attempt_budget
+from app.llm_model_router.async_openai_caller import apply_thinking_dialect
+from app.llm_model_router.tier_params import read_tier_params
 
 # ==============================================================================
 # 1. 核心环境与阿里百炼参数配置
@@ -20,6 +23,28 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 light_rag_settings = get_settings()
+
+# ==============================================================================
+# 1.1 档位参数：与路由链路读**同一份**配置（模型名 / 单次预算 / 重试次数 / 思考开关）
+# ==============================================================================
+_LIGHTRAG_TIER: str = "standard"
+"""知识图谱抽取使用的档位：与路由侧"STANDARD 主用、FAST 其次"的降级顺序一致。"""
+
+_tier_params = read_tier_params(light_rag_settings, _LIGHTRAG_TIER)
+
+# ⚠️ LightRAG 的 ``openai_complete_if_cache`` 上挂了自带的
+# ``@retry(stop_after_attempt(3), wait=wait_exponential(min=4, max=10))``。
+# 我们的重试策略由**档位配置**统一决定；若与它那层叠加，会出现"我们的 N 次 ×
+# 它的 3 次"外加 4~10s 指数退避，单次调用最坏耗时被放大到不可接受。
+# tenacity 经 functools.wraps 保留了 ``__wrapped__``，因此取其未装饰原函数，
+# 由 ``run_with_attempt_budget`` 统一施放"单次预算 + 档位重试次数"。
+_complete_raw = getattr(openai_complete_if_cache, "__wrapped__", None)
+if _complete_raw is None:  # pragma: no cover - 依赖第三方实现细节，留兜底与告警
+    logger.warning(
+        "lightrag 的 openai_complete_if_cache 未暴露 __wrapped__，其内置重试（3 次）"
+        "将与档位重试叠加；如观测到重试风暴，请下调 LLM_TIER_STANDARD_RETRIES",
+    )
+    _complete_raw = openai_complete_if_cache
 
 
 def _resolve_lightrag_model(settings) -> str:
@@ -31,19 +56,14 @@ def _resolve_lightrag_model(settings) -> str:
     ``404 model_not_found: The model `qwen3.8-flash,glm-4.7` does not exist``
     （症状出现在图谱抽取的 extract LLM 阶段）。
 
-    取值顺序与 ModelRouter 的降级顺序一致：STANDARD 为主用，其次 FAST；
-    两者都空时退回单模型基础配置 ``OPENAI_LLM_MODEL``。
+    ⚠️ 历史实现自己判断"STANDARD 为主用、其次 FAST"，与路由侧是**两份口径**；
+    现已改为委托 :func:`read_tier_params`（唯一入口）——模型名 / 单次预算 /
+    重试次数 / 思考开关一并同源。
     """
-    candidates: List[str] = list(settings.llm_tier_standard_parsed) or list(
-        settings.llm_tier_fast_parsed
-    )
-    if candidates:
-        return candidates[0]
-    logger.warning(
-        "LLM_TIER_STANDARD / LLM_TIER_FAST 均为空，LightRAG 退回 OPENAI_LLM_MODEL={}",
-        settings.openai_llm_model,
-    )
-    return settings.openai_llm_model
+    # 改为委托**唯一入口**读取：模型名 / 单次预算 / 重试次数 / 思考开关同源。
+    # 历史实现只从候选池"借"了模型名，其余参数各自硬编码（超时用它自己的全局
+    # 默认、思考开关写死百炼方言、凭据写死百炼），导致同一档模型在不同链路上行为不一致。
+    return read_tier_params(settings, _LIGHTRAG_TIER).model
 
 
 llm_model: str = _resolve_lightrag_model(light_rag_settings)
@@ -71,16 +91,45 @@ async def qwen_llm_complete(
     # 「got multiple values for keyword argument 'system_prompt'」。
     if history_messages is None:
         history_messages = []
-    return await openai_complete_if_cache(
-        llm_model,
-        prompt,
-        system_prompt=system_prompt,  # 这里透传框架传入的提示词
-        history_messages=history_messages,
-        api_key=DASHSCOPE_API_KEY,
-        base_url=DASHSCOPE_BASE_URL,
-        extra_body={"enable_thinking": False},
-        **kwargs
+
+    # 思考开关按**候选厂商方言**翻译（原先写死 enable_thinking，只对百炼成立；
+    # 档位首候选若换成智谱等模型，那个参数名本身就是错的）。
+    extra_body: Dict[str, Any] = {}
+    apply_thinking_dialect(_tier_params.candidate, _tier_params.thinking, extra_body)
+
+    call_kwargs: Dict[str, Any] = dict(kwargs)
+    if extra_body:
+        call_kwargs["extra_body"] = extra_body
+
+    def _one_attempt() -> Any:
+        """**一次**尝试：携带该档的单次预算（HTTP 层），重试由外层统一施放。"""
+        return _complete_raw(
+            llm_model,
+            prompt,
+            system_prompt=system_prompt,  # 这里透传框架传入的提示词
+            history_messages=history_messages,
+            api_key=_tier_params.candidate.api_key or DASHSCOPE_API_KEY,
+            base_url=_tier_params.candidate.url or DASHSCOPE_BASE_URL,
+            timeout=int(_tier_params.timeout_s) if _tier_params.timeout_s else None,
+            **call_kwargs,
+        )
+
+    result, error = await run_with_attempt_budget(
+        _one_attempt,
+        timeout_s=_tier_params.timeout_s,
+        retries=_tier_params.retries,
+        budget_label=(
+            f"{int(_tier_params.timeout_s * 1000)}ms(tier={_tier_params.tier})"
+            if _tier_params.timeout_s
+            else f"<no-timeout>(tier={_tier_params.tier})"
+        ),
+        subject=f"lightrag:{_tier_params.model}",
     )
+    if result is None:
+        if isinstance(error, BaseException):
+            raise error
+        raise RuntimeError("LightRAG 模型调用失败")
+    return result
 
 async def qwen_embedding(texts: list[str]) -> list[list[float]]:
     # ⚠️ 关键：必须调用 openai_embed.func（未装饰原函数），不能直接调 openai_embed。

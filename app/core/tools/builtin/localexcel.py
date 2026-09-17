@@ -109,6 +109,16 @@ EXCEL_FUZZY_MIN_RATIO: float = 0.6
 # 最优候选与次优候选的最小差距：差距太小说明"像的不止一个"，此时**绝不自动纠正**。
 EXCEL_FUZZY_MIN_MARGIN: float = 0.10
 
+# 一列被判为"可聚合数值列"所需的数值转换成功率。
+# ⚠️ 为什么按"可转换性"而不是 dtype 判断：Excel 列常被读成 object（带单位、带
+#    括号的列名尤其常见），按 dtype 判会把实际能加总的列排除在外。更糟的是那会让
+#    **披露口径与聚合口径不一致**——披露说可聚合、调用却报"没有可聚合的数值"，
+#    这比不披露更差：它把模型引向一次注定失败的调用。故两侧共用同一套判定。
+EXCEL_AGGREGATABLE_MIN_RATIO: float = 0.5
+
+# 一列可用作分组依据的取值基数上限：超过这个数更像 ID / 自由文本，分组没有意义。
+EXCEL_GROUPABLE_MAX_UNIQUE: int = 50
+
 
 class LocalExcelReadTool(_BaseExcelTool):
     """只读本地表格文件（pandas 统一读取；不触发人工审批）。"""
@@ -253,6 +263,78 @@ class LocalExcelReadTool(_BaseExcelTool):
             "统计用 group_by+agg_column。"
         )
 
+    # ------------------------------------------------------------------
+    # 可聚合能力披露（任务：让"想聚合"不必先"看一眼数据"）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _numeric_series(frame: Any, column: Any) -> Any:
+        """列 → 数值序列。**聚合与披露共用这一处**，保证两侧口径同源。"""
+        import pandas as pd
+
+        return pd.to_numeric(frame[column], errors="coerce")
+
+    @classmethod
+    def _is_aggregatable_column(cls, frame: Any, column: Any) -> bool:
+        """该列能否参与数值聚合（非空值中可转成数值的比例达到阈值）。"""
+        if frame is None or frame.empty:
+            return False
+        try:
+            non_null: int = int(frame[column].notna().sum())
+            if non_null == 0:
+                return False
+            valid: int = int(cls._numeric_series(frame, column).notna().sum())
+        except Exception:  # noqa: BLE001 - 单列判定失败不影响其他列披露
+            return False
+        return (valid / non_null) >= EXCEL_AGGREGATABLE_MIN_RATIO
+
+    @staticmethod
+    def _is_groupable_column(frame: Any, column: Any) -> bool:
+        """该列能否用作分组依据：非数值 dtype 且取值基数落在可用区间。
+
+        ⚠️ 与"可聚合数值列"**刻意不做互斥**：一个文本形式存放数字的列客观上
+        既能当度量也能当维度，强行二选一会凭猜测排除掉至少一种正确用法。
+        """
+        import pandas as pd
+
+        if frame is None or frame.empty:
+            return False
+        if pd.api.types.is_numeric_dtype(frame[column]):
+            return False
+        try:
+            unique_count: int = int(frame[column].nunique(dropna=True))
+        except Exception:  # noqa: BLE001 - 单列判定失败不影响其他列披露
+            return False
+        return 2 <= unique_count <= EXCEL_GROUPABLE_MAX_UNIQUE
+
+    @classmethod
+    def _render_aggregation_affordances(cls, sheet_name: str, frame: Any) -> str:
+        """概览里每张表的「可怎么取数」块。
+
+        ⚠️ 这段是**必需信息**而不是客套话：旧版概览只列列名，不说哪些列能做
+        ``group_by``、哪些是数值列，于是模型为了写对聚合参数，只能先多打一次工具
+        "看一眼数据"（实测「三季度哪条产品线贡献最大」用了 3 次调用：概览 →
+        预览该 sheet → 才敢写聚合）。
+        """
+        groupable: List[str] = [
+            str(c) for c in frame.columns if cls._is_groupable_column(frame, c)
+        ]
+        aggregatable: List[str] = [
+            str(c) for c in frame.columns if cls._is_aggregatable_column(frame, c)
+        ]
+        lines: List[str] = [
+            "可用作分组列: " + ("、".join(groupable) if groupable else "无"),
+            "可聚合数值列: " + ("、".join(aggregatable) if aggregatable else "无"),
+        ]
+        # 每张表至多给一组可直接照抄的参数：穷举组合会让概览体积失控，
+        # 而列名本身已经给全，模型需要别的组合时能自己拼。
+        if groupable and aggregatable:
+            lines.append(
+                f'可直接调用: sheet_name="{sheet_name}", group_by="{groupable[0]}", '
+                f'agg_column="{aggregatable[0]}", agg_func="sum"'
+                "（想换其他列照此改写即可，列名以上面两行为准）"
+            )
+        return "\n".join(lines)
+
     def _render_overview(self, sheets: dict, head_rows: int) -> str:
         blocks: List[str] = []
         for name, frame in sheets.items():
@@ -260,7 +342,8 @@ class LocalExcelReadTool(_BaseExcelTool):
             block: str = (
                 f"### {name}  ({rows} 行 × {cols} 列)\n"
                 f"可用 filter_column（真实列名，任选其一作筛选列）: {', '.join(str(c) for c in frame.columns)}\n"
-                f"前 {min(head_rows, rows)} 行:\n{self._render_frame_head(frame, head_rows)}\n"
+                + self._render_aggregation_affordances(name, frame)
+                + f"\n前 {min(head_rows, rows)} 行:\n{self._render_frame_head(frame, head_rows)}\n"
                 + self._preview_hint(name, rows, head_rows, overview=True)
             )
             blocks.append(block)
@@ -268,8 +351,6 @@ class LocalExcelReadTool(_BaseExcelTool):
 
     def _render_aggregate(self, frame: Any, group_by: str, agg_column: str, agg_func: str) -> str:
         """工具内完成分组聚合，避免把 50 行明细丢给模型心算（这是 token 与准确率的双重浪费）。"""
-        import pandas as pd
-
         resolved_group, group_note = self._ground_name(group_by, list(frame.columns), "分组列")
         resolved_agg, agg_note = self._ground_name(agg_column, list(frame.columns), "聚合列")
         # 接不上就**不猜**：把真实列清单交回模型，让它下一轮用对的名字
@@ -278,7 +359,7 @@ class LocalExcelReadTool(_BaseExcelTool):
         if resolved_agg is None:
             return agg_note
 
-        numeric = pd.to_numeric(frame[resolved_agg], errors="coerce")
+        numeric = self._numeric_series(frame, resolved_agg)
         invalid_count: int = int(numeric.isna().sum() - frame[resolved_agg].isna().sum())
         working = frame.assign(__value__=numeric).dropna(subset=["__value__"])
         if working.empty:

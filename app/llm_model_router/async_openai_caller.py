@@ -83,7 +83,11 @@ def async_build_openai_client(
     规则：
       - 如果 provider.api_key 缺失但 candidate.url 是本地 Ollama 等不需要 key 的
         NOOP 来源：给占位 api_key，否则直接判定为缺配置。
-      - timeout_ms（来自 tier）可映射为 httpx 级别的 timeout。
+      - timeout_ms（来自 tier）可映射为 httpx 级别的 timeout。但**单次预算按请求传递**
+        （见 ``async_openai_chat_caller(request_timeout=...)``）：同一模型可能出现在
+        多个档位且各档预算不同（如 glm-4.7 同时在 FAST 与 STANDARD），故不在构建时固定。
+      - 构建时显式关闭 SDK 隐式重试（``max_retries=0``）：重试改由 Executor 逐次控制，
+        避免"多次尝试共用一份候选级超时预算"。
     """
     # 1) 优先使用 candidate 级别的 url / api_key，其次 provider 级别
     #    （多厂商接入时每个候选可挂不同账户/网关，candidate 级必须能覆盖 provider 级）
@@ -115,6 +119,13 @@ def async_build_openai_client(
         kwargs["base_url"] = base_url
     if timeout is not None:
         kwargs["timeout"] = timeout
+    # ⚠️ 关闭 SDK 的隐式重试。它的两宗罪（实测）：
+    #   1) 把"多次尝试"藏在一次调用里，与候选级超时**共用同一份预算**——
+    #      日志表现为 `Retrying request ... in 0.47s` 紧接 `tier-timeout (50000ms)`，
+    #      第二次尝试注定被掐掉，看起来像"模型算得慢"；
+    #   2) **吞掉首次失败的真实原因**，排查时只剩一行 SDK 重试日志。
+    #    重试改由 Executor 显式控制：逐次独立预算 + 逐次记录耗时与失败类型。
+    kwargs["max_retries"] = 0
     try:
         return AsyncOpenAI(**kwargs)
     except Exception as exc:  # pragma: no cover - 初始化异常极少见
@@ -249,6 +260,11 @@ def _apply_thinking_dialect(
     # openai 或其他标准协议：不注入任何思考参数
 
 
+# 公开别名：其他 LLM 入口（如知识图谱抽取）复用**同一套**思考方言翻译，
+# 避免各自硬编码某一家厂商的参数名（历史问题：写死 enable_thinking，只有百炼成立）。
+apply_thinking_dialect = _apply_thinking_dialect
+
+
 def _strictify_schema_node(node: Any) -> Any:
     """递归把 JSON Schema 补成 OpenAI/GLM 严格模式要求的形状。
 
@@ -349,6 +365,7 @@ async def async_openai_chat_caller(
     tools: Optional[Any] = None,
     tool_choice: Optional[Any] = None,
     stream: bool = False,
+    request_timeout: Optional[float] = None,
     **extra_kwargs: Any,
 ) -> AsyncOpenAICallResult:
     """异步调用 AsyncOpenAI.chat.completions.create。
@@ -383,6 +400,11 @@ async def async_openai_chat_caller(
         params["tools"] = tools
     if tool_choice is not None:
         params["tool_choice"] = tool_choice
+    # 单次尝试预算：按**请求**传递（同一模型可能跨多个档位、各档预算不同，不能固化
+    # 在客户端上）。底层 httpx 会在自己的超时内报错，从而使"提供方慢"与"被我们主动
+    # 掐断"在异常类型上可区分。
+    if request_timeout is not None:
+        params["timeout"] = request_timeout
 
     # thinking 统一信号 → 各厂商方言（写入 extra_body）
     if thinking is not None:
@@ -426,7 +448,10 @@ async def async_openai_chat_caller(
     if choice is not None:
         message = getattr(choice, "message", None)
         if message is not None:
-            content = getattr(message, "content") or ""
+            # 同 493 行：``getattr`` 必须带默认值。这里只被 ``is not None`` 守着，
+            # 属性缺失照样抛 AttributeError；``or ""`` 只能兜住"值为 None"，
+            # 兜不住"没有这个属性"。
+            content = getattr(message, "content", None) or ""
             # 结构化 tool_call 不是字符串 content，但 orchestrator / pipeline
             # 目前都走纯文本契约，所以取 content 即可；若为空尝试 reasoning_content
             if not content and hasattr(message, "reasoning_content"):
@@ -468,7 +493,12 @@ async def async_openai_chat_caller(
         except Exception:  # pragma: no cover
             raw = None
 
-    actual_model = getattr(resp, "model") or target.id
+    # ⚠️ 必须带默认值：原先写作 ``getattr(resp, "model")``（**无默认值**），属性缺失
+    # 即抛 AttributeError。虽然官方 SDK 的 ChatCompletion 里 ``model`` 是必填字段、
+    # 生产上基本不可达，但一旦发生，异常会走到执行器的 ``except BaseException``——
+    # 后果不是"没降级"，而是**把一个健康的候选记成失败**（误伤熔断计数），
+    # 日志里还只留下一条与真实问题无关的报错。带上默认值后回归 `target.id`。
+    actual_model = getattr(resp, "model", None) or target.id
     return AsyncOpenAICallResult(
         content=content,
         model_id=actual_model or target.id,

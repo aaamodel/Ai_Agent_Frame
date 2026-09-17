@@ -168,14 +168,17 @@ def _build_global_router() -> ModelRouter:
                 "fast": {
                     "candidates": _tier_candidates(settings.llm_tier_fast_parsed),
                     "timeout_ms": settings.llm_tier_fast_timeout_ms,
+                    "retries": settings.llm_tier_fast_retries,
                 },
                 "standard": {
                     "candidates": _tier_candidates(settings.llm_tier_standard_parsed),
                     "timeout_ms": settings.llm_tier_standard_timeout_ms,
+                    "retries": settings.llm_tier_standard_retries,
                 },
                 "deep": {
                     "candidates": _tier_candidates(settings.llm_tier_deep_parsed),
                     "timeout_ms": settings.llm_tier_deep_timeout_ms,
+                    "retries": settings.llm_tier_deep_retries,
                 },
             },
         },

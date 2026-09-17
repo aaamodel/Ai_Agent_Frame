@@ -2,9 +2,12 @@
 Configuration data classes for AI models.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +39,12 @@ STYLE_DEEPSEEK = "deepseek"
 STYLE_ZHIPU = "zhipu"
 
 API_STYLES = frozenset({STYLE_OPENAI, STYLE_DASHSCOPE, STYLE_DEEPSEEK, STYLE_ZHIPU})
+
+# 档位重试次数的默认值与上限。
+# 默认 1：让瞬时故障能自愈；上限 5：防止配置笔误把最坏总耗时
+# 放大成 (1+5) × 单次预算（FAST 档即 6 × 50s）。
+_DEFAULT_TIER_RETRIES: int = 1
+_MAX_TIER_RETRIES: int = 5
 
 # 各厂商结构化输出能力的家族默认值（条目级显式配置可覆盖）
 _STYLE_JSON_DEFAULTS: Dict[str, Dict[str, bool]] = {
@@ -154,6 +163,13 @@ class AIModelProperties:
     class TierConfig:
         candidates: List[str] = field(default_factory=list)
         timeout_ms: Optional[int] = None
+        retries: int = 1
+        """**单次尝试**失败后允许的重试次数（不含首次尝试）。
+
+        ⚠️ ``timeout_ms`` 的语义是"**一次尝试**"的预算，不是"整个候选（含重试）"的
+        预算——两者合起来决定最坏总耗时 ``(1 + retries) × timeout_ms``。
+        因此默认取保守值 1：既能让瞬时故障自愈，又不会把最坏耗时放大到不可接受。
+        """
 
     @dataclass
     class ModelGroup:
@@ -203,9 +219,20 @@ class AIModelProperties:
             )
 
         def build_tier(t: Dict) -> AIModelProperties.TierConfig:
+            # 取值校验：负数无意义 → 收敛到 0（不重试）；上限 _MAX_TIER_RETRIES
+            # 防配置笔误（如写成 50）把最坏总耗时放大到不可接受。
+            try:
+                raw_retries: int = int(t.get("retries", _DEFAULT_TIER_RETRIES))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "tier.retries 配置无法解析为整数，回退默认值 %d：%r",
+                    _DEFAULT_TIER_RETRIES, t.get("retries"),
+                )
+                raw_retries = _DEFAULT_TIER_RETRIES
             return AIModelProperties.TierConfig(
                 candidates=t.get("candidates", []),
                 timeout_ms=t.get("timeout_ms"),
+                retries=max(0, min(raw_retries, _MAX_TIER_RETRIES)),
             )
 
         def build_group(g: Dict) -> AIModelProperties.ModelGroup:
