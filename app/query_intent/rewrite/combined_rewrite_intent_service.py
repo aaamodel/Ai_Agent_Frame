@@ -43,6 +43,7 @@ from app.query_intent.llm_schemas import (
     AgentRewriteIntentCombinedSchema,
     coerce_llm_json_to_schema,
     pydantic_to_openai_response_format,
+    validate_tolerating_agent_goal,
 )
 from app.query_intent.rag_constant import AGENT_REWRITE_INTENT_COMBINED_PROMPT_PATH
 from app.query_intent.rewrite.multi_question_rewrite_service import (
@@ -345,13 +346,26 @@ class AgentCombinedRewriteIntentService(AgentMultiQuestionRewriteService):
                     (raw_response_text or "")[:300],
                 )
             else:
-                logger.warning(
-                    "解析组合意图打分失败（AgentRewriteIntentCombinedSchema），"
-                    "raw=%s，err=%s",
-                    (raw_response_text or "")[:300],
-                    parse_error,
+                # 同一容错口径：agent_goal 没输出好不该连带丢掉意图打分（design D8），
+                # 否则 Stage2 会因"没有预计算打分"而退回旧的两段链路。
+                tolerant_struct = validate_tolerating_agent_goal(
+                    AgentRewriteIntentCombinedSchema, cleaned_text, parse_error
                 )
-                return {}
+                if tolerant_struct is not None:
+                    combined_struct = tolerant_struct
+                    logger.warning(
+                        "组合输出的 agent_goal 未按 schema 输出（缺失/类型不合法），"
+                        "已按容错口径置空该字段并保留其余字段（含意图打分）。err=%s",
+                        parse_error,
+                    )
+                else:
+                    logger.warning(
+                        "解析组合意图打分失败（AgentRewriteIntentCombinedSchema），"
+                        "raw=%s，err=%s",
+                        (raw_response_text or "")[:300],
+                        parse_error,
+                    )
+                    return {}
 
         index_to_text: Dict[int, str] = {0: primary_question}
         for offset, sub_text in enumerate(sub_questions):

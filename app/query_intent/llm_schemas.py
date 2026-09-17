@@ -90,6 +90,62 @@ def pydantic_to_openai_response_format(
     return {"type": "json_schema", "json_schema": payload}
 
 
+AGENT_GOAL_FIELD: str = "agent_goal"
+"""目标字段名。它在 schema 里是**必填**（契约层），但校验层对该字段单独容错（design D8）。"""
+
+
+def _only_agent_goal_errors(parse_error: Exception) -> bool:
+    """校验失败是否**只**由 agent_goal 引起（字段缺失 / 类型不合法）。"""
+    errors = getattr(parse_error, "errors", None)
+    if not callable(errors):
+        return False
+    try:
+        details = list(errors())
+    except Exception:  # noqa: BLE001 - 不是 pydantic 的 ValidationError
+        return False
+    if not details:
+        return False
+    return all(tuple(item.get("loc") or ()) == (AGENT_GOAL_FIELD,) for item in details)
+
+
+def validate_tolerating_agent_goal(
+    schema_cls: Type[BaseModel],
+    cleaned_text: str,
+    parse_error: Exception,
+) -> Optional[BaseModel]:
+    """agent_goal 校验失败时，把该字段置空后重新校验，**保留其余字段**。
+
+    设计口径（design D8）是**两层，缺一不可**：
+
+    - **契约层**：给模型的 json_schema 里 `agent_goal` 必须在 `required` 中——
+      模型被明确要求 100% 输出该字段；
+    - **校验层**：模型没输出好（缺失 / 空串 / 类型不对 / 火星文）属**极端事件**，
+      我们接受它——只把该字段置空（后续按 D5 回退为改写后的问题），其余字段照常生效，
+      整条 agent 编排正常跑完。该轮目标"没起作用"可以接受，但**不能**让一个字段
+      毁掉整次改写，更不能让编排链路失败。
+
+    ⚠️ 只在**报错全部落在 agent_goal 上**时才容错：`rewrite` / `complexity_analysis`
+    等字段仍走原有严格校验，不做无差别放宽（否则真·畸形输出会被静默接受）。
+
+    Returns:
+        容错后校验通过的结构；若失败原因不止 agent_goal、原始文本不是 JSON 对象、
+        或置空后仍不合法，返回 None——由调用方按原逻辑判定失败。
+    """
+    if not _only_agent_goal_errors(parse_error):
+        return None
+    try:
+        payload: Any = json.loads(cleaned_text)
+    except Exception:  # noqa: BLE001 - 文本本身不是合法 JSON
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload[AGENT_GOAL_FIELD] = ""
+    try:
+        return schema_cls.model_validate(payload)
+    except Exception:  # noqa: BLE001 - 置空后仍不合法 → 问题不止 agent_goal
+        return None
+
+
 def coerce_llm_json_to_schema(
     schema_cls: Type[BaseModel],
     cleaned_text: str,
@@ -373,9 +429,10 @@ class AgentRewriteSchema(BaseModel):
     rewrite: str = Field(min_length=1, max_length=400, description="规范化后的用户问题（≤400 字）")
     # ⚠️ 只在本基类定义一次：主链路的 AgentRewriteIntentCombinedSchema 继承它即自动获得；
     #    在子类重复定义会覆盖字段顺序、且 response_format 里会出现两份。
-    # 长度约束**刻意不放进 schema**：strict 模式下超长输出会被判为非法，进而把整次
-    # 改写调用打回降级链路（多一次 LLM）。按设计 D6，长度由提示词侧要求模型压缩、
-    # 解析层硬截断兜底（见 _parse_agent_rewrite），保证"不得阻断链路"。
+    # 本字段**必须留在 required 中**：契约要明确，模型被要求 100% 输出该字段。
+    # 但长度约束**不放进 schema**：超长不判非法 → 提示词侧压缩、解析层硬截断兜底（D6）。
+    # "模型没输出好"由**校验层单独容错**（validate_tolerating_agent_goal / design D8）：
+    # 只置空该字段并保留其余字段，绝不让一个字段毁掉整次改写。
     agent_goal: str = Field(
         description="本轮要交付的最终产物/结论形态（一句话≤60字；非问题复述、非步骤计划）",
     )

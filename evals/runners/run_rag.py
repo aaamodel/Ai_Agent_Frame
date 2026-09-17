@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Runner：RAG 检索离线评测（Recall@5 / Hit@5 / MRR）。
 
-## 一个必须讲清的坑（面试会被追问，也是本文件最核心的设计点）
+## 一个必须讲清的坑（本文件最核心的设计点）
 
 ``RAGService.retrieve_contexts`` 返回的 ``RetrievalResult.id`` 是
 **LlamaIndex 的切片级 node_id**（UUID），**不是文档 ID**。文档身份只存在于

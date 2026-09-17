@@ -27,6 +27,7 @@ from app.query_intent.rewrite.query_rewrite import (
 from app.query_intent.intent_dto import (
     AgentRewriteResult,
     TaskComplexityAnalysis,
+    is_agent_goal_missing,
     normalize_agent_goal,
 )
 # 本轮结构化输出：Pydantic schema + OpenAI 协议转换工具 + 数组形状兜底
@@ -35,6 +36,7 @@ from app.query_intent.llm_schemas import (
     RagRewriteSchema,
     coerce_llm_json_to_schema,
     pydantic_to_openai_response_format,
+    validate_tolerating_agent_goal,
 )
 
 from trace_to_markdown import  trace_to_markdown
@@ -523,12 +525,25 @@ class AgentMultiQuestionRewriteService(
                     (raw_response_text or "")[:300],
                 )
             else:
-                logger.warning(
-                    "解析 Agent 改写 JSON 失败（AgentRewriteSchema）：%s，raw=%s",
-                    parse_error,
-                    (raw_response_text or "")[:300],
+                # 容错：agent_goal 没输出好（缺失 / 类型不对）不该毁掉整次改写——
+                # 置空该字段后重新校验，其余字段照常生效（design D8）。
+                tolerant_struct = validate_tolerating_agent_goal(
+                    AgentRewriteSchema, cleaned_text, parse_error
                 )
-                return None
+                if tolerant_struct is not None:
+                    parsed_struct = tolerant_struct
+                    logger.warning(
+                        "Agent 改写的 agent_goal 未按 schema 输出（缺失/类型不合法），"
+                        "已按容错口径置空该字段并保留其余字段，本轮目标按 D5 回退。err=%s",
+                        parse_error,
+                    )
+                else:
+                    logger.warning(
+                        "解析 Agent 改写 JSON 失败（AgentRewriteSchema）：%s，raw=%s",
+                        parse_error,
+                        (raw_response_text or "")[:300],
+                    )
+                    return None
 
         rewrite_value: str = str(parsed_struct.rewrite or "").strip()
         final_rewritten_question: str = rewrite_value or fallback_question
@@ -589,6 +604,16 @@ class AgentMultiQuestionRewriteService(
         # agent_goal：本轮目标锚点。归一化**只在这里做一次**（strip → 截断 →
         # 空值回退为改写后问题），下游三个注入点只读不各自兜底——否则会出现
         # "一处回退到改写后问题、另一处注入空串"的漂移（design.md D5）。
+        #
+        # 模型没提炼出验收标准时**只标记 + 回退，绝不牵连其他字段**：agent_goal
+        # 未进 required 校验（design D8），能走到这里就说明其余字段已全部解析成功。
+        # trace 侧另有 `agent.goal.source=fallback`，可据此统计发生率。
+        if is_agent_goal_missing(parsed_struct.agent_goal):
+            logger.warning(
+                "意图识别阶段模型未提炼出 agent_goal（本轮验收标准），已标记为提炼失败，"
+                "按 D5 回退为改写后问题；其余改写字段不受影响。raw=%r",
+                parsed_struct.agent_goal,
+            )
         agent_goal_value: str = normalize_agent_goal(
             parsed_struct.agent_goal, final_rewritten_question
         )

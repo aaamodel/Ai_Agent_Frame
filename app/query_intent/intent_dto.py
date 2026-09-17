@@ -94,6 +94,15 @@ AGENT_GOAL_MAX_CHARS: int = 60
 _NULL_LIKE_GOAL_VALUES = frozenset({"", "null", "none"})
 
 
+def is_agent_goal_missing(raw: Any) -> bool:
+    """目标是否**缺失或为空**（含 ``"null"`` / ``"none"`` 这类字面量）。
+
+    与 :func:`normalize_agent_goal` 共用同一套空值判定：生产侧据此**标记"模型未
+    提炼出验收标准"**，两处若各写一份就会出现"标记为成功、实际却回退了"的口径不一致。
+    """
+    return str(raw or "").strip().lower() in _NULL_LIKE_GOAL_VALUES
+
+
 def normalize_agent_goal(raw: Any, fallback_question: str) -> str:
     """把改写阶段产出的目标归一为「非空 + 限长」的一句话。
 
@@ -118,9 +127,7 @@ def normalize_agent_goal(raw: Any, fallback_question: str) -> str:
         目标文本；仅当 raw 与 fallback_question 都为空时返回空串（调用方
         此时按"无目标"处理，MUST NOT 因此中断链路）。
     """
-    text: str = str(raw or "").strip()
-    if text.lower() in _NULL_LIKE_GOAL_VALUES:
-        text = ""
+    text: str = "" if is_agent_goal_missing(raw) else str(raw or "").strip()
     if not text:
         text = str(fallback_question or "").strip()
     if len(text) > AGENT_GOAL_MAX_CHARS:

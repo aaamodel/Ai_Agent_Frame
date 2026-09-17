@@ -16,12 +16,15 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from app.query_intent.intent_dto import (  # noqa: E402
     AGENT_GOAL_MAX_CHARS,
+    is_agent_goal_missing,
     normalize_agent_goal,
 )
 from app.query_intent.rewrite.multi_question_rewrite_service import (  # noqa: E402
@@ -118,15 +121,92 @@ def test_overlong_fallback_is_also_truncated():
 
 
 # ---------------------------------------------------------------------------
-# 与 schema 的联动：字段为 required，缺失即整体解析失败（已录入 design 风险表）
+# 与 schema 的联动：字段**不在 required 里**，漏输出不牵连其他字段（design D8）
 # ---------------------------------------------------------------------------
-def test_missing_goal_field_fails_whole_parse():
-    """漏输出该字段 → 解析返回 None → 上游退回规则兜底（不中断、不抛异常）。
+def test_is_agent_goal_missing_covers_null_like():
+    assert is_agent_goal_missing("") is True
+    assert is_agent_goal_missing("   ") is True
+    assert is_agent_goal_missing(None) is True
+    assert is_agent_goal_missing("null") is True
+    assert is_agent_goal_missing("None") is True
+    assert is_agent_goal_missing("交付复盘报告") is False
 
-    这是**刻意保留**的行为：字段若改为可选默认值，模型漏输出时会静默退化成
-    "改写后问题的副本"，恰好是规范明令禁止的形态。代价是这一轮丢 LLM 改写，
-    已在 design.md 风险表记录。
+
+def test_agent_goal_is_required_in_schema():
+    """D8 契约层：字段必须留在 `required` 里——模型被明确要求 100% 输出。"""
+    from app.query_intent.llm_schemas import (  # noqa: PLC0415 - 就近导入便于阅读
+        AgentRewriteIntentCombinedSchema,
+        AgentRewriteSchema,
+        pydantic_to_openai_response_format,
+    )
+
+    for schema_cls in (AgentRewriteSchema, AgentRewriteIntentCombinedSchema):
+        schema = pydantic_to_openai_response_format(schema_cls)["json_schema"]["schema"]
+        assert "agent_goal" in schema["properties"]
+        assert "agent_goal" in schema.get("required", [])
+
+
+def test_missing_goal_field_keeps_other_fields_intact():
+    """D8 校验层：漏输出该字段 → 只置空 + 回退，**其余字段照常生效**。
+
+    契约层是必填，但"模型偶尔没输出好"属极端事件：我们接受它（本轮目标没起作用），
+    只是**不能**让一个字段把整次改写带走——否则 strict 未严格执行时（qwen 系已知会这样）
+    连本来正确的 rewrite / 复杂度一起丢，整轮退化为规则兜底。
     """
     payload = json.loads(_payload())
     payload.pop("agent_goal")
+    result = _parse(json.dumps(payload, ensure_ascii=False))
+
+    assert result is not None, "漏输出 agent_goal 不应导致整次改写解析失败"
+    assert result.agent_goal == REWRITTEN          # 置空后按 D5 回退
+    assert result.rewritten_question == REWRITTEN  # ↓ 以下均原样保留
+    assert result.should_split is False
+    assert result.complexity_analysis.estimated_steps == 3
+    assert result.complexity_analysis.estimated_tool_calls == 2
+
+
+def test_wrong_type_goal_keeps_other_fields_intact():
+    """类型不对（模型给了数字）同样只容错该字段，不牵连其他字段。"""
+    result = _parse(_payload(agent_goal=12345))
+
+    assert result is not None, "agent_goal 类型不合法不应导致整次改写解析失败"
+    assert result.agent_goal == REWRITTEN
+    assert result.complexity_analysis.estimated_steps == 3
+
+
+def test_other_field_errors_are_still_strict():
+    """容错边界刻意收窄：别的必填字段（rewrite）出错时**照旧判定失败**。
+
+    否则"只对 agent_goal 容错"就变成了"什么都接受"，畸形输出会被静默吞掉。
+    """
+    payload = json.loads(_payload())
+    payload.pop("rewrite")
     assert _parse(json.dumps(payload, ensure_ascii=False)) is None
+
+
+def test_tolerance_applies_to_combined_schema():
+    """同一容错器必须对**组合 schema** 也生效（主链路解析点的关键前提）。
+
+    主链路若只丢目标、却也把意图打分丢掉，Stage2 就会因"没有预计算打分"
+    退回旧的两段链路，白白多一次 LLM 调用——所以这里专门断言打分字段完好。
+    """
+    from app.query_intent.llm_schemas import (  # noqa: PLC0415 - 就近导入便于阅读
+        AgentRewriteIntentCombinedSchema,
+        validate_tolerating_agent_goal,
+    )
+
+    payload = json.loads(_payload())
+    payload.pop("agent_goal")
+    payload["intent_classifications"] = [{"question_index": 0, "results": []}]
+    text = json.dumps(payload, ensure_ascii=False)
+
+    with pytest.raises(Exception) as parse_error:
+        AgentRewriteIntentCombinedSchema.model_validate_json(text)
+
+    repaired = validate_tolerating_agent_goal(
+        AgentRewriteIntentCombinedSchema, text, parse_error.value
+    )
+    assert repaired is not None, "组合 schema 也应容错 agent_goal"
+    assert repaired.agent_goal == ""
+    assert repaired.rewrite == REWRITTEN                       # 其余字段完好
+    assert repaired.intent_classifications[0].question_index == 0  # 意图打分没被牵连

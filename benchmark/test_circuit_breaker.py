@@ -31,7 +31,7 @@ patch ``app.llm_model_router.async_openai_caller._chat_completion_with_langfuse`
 
 - ``--fault instant``：立刻抛 ``APITimeoutError`` → 模拟"连接被拒/快速失败"
 - ``--fault hang``（默认）：挂起到 tier 超时 → 模拟"主模型不响应"，
-  这正是简历里"手动让主模型超时"的做法
+  这相当于"手动让主模型超时"的做法
 
 ## 用法
 
@@ -265,7 +265,7 @@ def render_report(cycles: List[Dict[str, Any]], *, fault_mode: str) -> str:
         f"（model={sample.get('secondary_model')}）")
     add(f"- 轮次：{len(cycles)}（每轮 3 次请求：故障降级 ×2 → 熔断后跳过 ×1）")
     add("")
-    add("## 一、核心数字（简历里那句「检测到故障 → 完成切换」）")
+    add("## 一、核心数字（「检测到故障 → 完成切换」）")
     add("")
     add("| 指标 | 最小 | 中位 | 最大 | 说明 |")
     add("| --- | --- | --- | --- | --- |")

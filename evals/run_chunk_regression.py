@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """chunk size 回归实验：用 eval **量化证明一个改动是错的**。
 
-这是手册里的"关键动作"，也是简历里最能站住脚的一句话：
+这是整套 eval 体系里的"关键动作"：
 
     "我把 chunk size 从 512 调到 1024，用同一套黄金集跑 Recall@5，
      结果从 X 掉到 Y，所以我回滚了。"
@@ -266,7 +266,7 @@ def render_comparison(comparison: Dict[str, Any], plan: Optional[Dict[str, Any]]
         add("（本次未生成分块计划，可加 `--plan-only` 离线查看）")
     add("")
 
-    add("## 二、检索指标对比（这 3 个数字就是面试要说的）")
+    add("## 二、检索指标对比（这三个数字即实验结论）")
     add("")
     add("| 指标 | chunk_size=512 | chunk_size=1024 | 变化 | 结论 |")
     add("| --- | --- | --- | --- | --- |")

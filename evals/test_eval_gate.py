@@ -201,7 +201,7 @@ def test_quality_gate_detects_recall_regression(thresholds) -> None:
     """核心能力：**能量化证明一个改动变差了**。
 
     模拟 chunk size 512 -> 1024 之后 Recall@5 从 0.86 掉到 0.58，
-    质量门必须明确报出违规（这就是面试里"我证明了一个改动是错的"的机制）。
+    质量门必须明确报出违规（这是"用数据证明一个改动确实变差了"的机制）。
     """
     before: Dict[str, float] = {"recall@5": 0.86}
     after: Dict[str, float] = {"recall@5": 0.58}

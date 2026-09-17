@@ -6,7 +6,7 @@
     python -m evals.report --run-all
 
 它会依次跑「意图 / RAG / 工具」三组评测，把指标汇到一张表，过一遍
-``thresholds.yaml`` 质量门，从失败样本里自动挑一个**最适合在面试里讲**的案例，
+``thresholds.yaml`` 质量门，从失败样本里自动挑一个**最有代表性的**案例，
 写出 ``evals/eval_report.md``。
 
 ## 设计要点
