@@ -31,6 +31,17 @@ from app.query_intent.llm_schemas import pydantic_to_openai_response_format
 # 写操作子任务只要落在这些状态里，就代表"动作没完成"。
 _WRITE_BAD_STATUSES = frozenset({"empty_data", "error", "budget_denied", "approval_denied"})
 
+# 缺口性质与重规划门控统一到单一真源（`replan_gate`）——产出方与路由方共用同一
+# 判定，避免"summarize 等着重规划、路由却拒绝"这种不一致（会产出空答案）。
+# 这两个常量在此 re-export 是为了不打断既有引用点。
+from app.core.agent.graph.replan_gate import (  # noqa: E402  (置于此处便于就近说明)
+    INSUFFICIENCY_KIND_NO_DATA,
+    INSUFFICIENCY_KIND_OFF_TOPIC,
+    normalize_gap_kind,
+    replan_allowed,
+    replan_exclusion_reason,
+)
+
 
 class SummaryVerdictSchema(BaseModel):
     """汇总 + 证据闸门合并输出（response_format 约束）。"""
@@ -48,6 +59,16 @@ class SummaryVerdictSchema(BaseModel):
     )
     suggestion: str = Field(
         default="", description="sufficient=false 时：建议尝试的其他数据源/工具方向"
+    )
+    gap_kind: str = Field(
+        default="no_data",
+        description=(
+            "sufficient=false 时：缺口性质（**只取这两个字面值**）。"
+            "off_topic = 全部结论**跑题**（有内容返回，但无一涉及用户问题的核心实体、"
+            "指标或时间），即「方向性错误」，只有这种情形才允许重规划；"
+            "no_data = 方向正确，只是未取得有效数据（工具空召回、路径不存在、"
+            "数据源暂时不可用等）。拿不准时填 no_data。"
+        ),
     )
 
 
@@ -70,7 +91,8 @@ _SUMMARY_SYSTEM_PROMPT = """你是最终总结助手，同时负责"证据充分
   "sufficient": true 或 false,
   "answer": "最终答案（sufficient=false 时可给草稿或空字符串）",
   "missing_info": "false 时具体缺少什么，true 时空字符串",
-  "suggestion": "false 时建议尝试的其他数据源/工具，true 时空字符串"
+  "suggestion": "false 时建议尝试的其他数据源/工具，true 时空字符串",
+  "gap_kind": "false 时填 off_topic 或 no_data；true 时省略"
 }"""
 
 
@@ -133,12 +155,15 @@ def _parse_verdict(raw_text: str) -> Dict[str, Any]:
         parsed = None
     if not isinstance(parsed, dict):
         return {"sufficient": True, "answer": raw_text.strip(),
-                "missing_info": "", "suggestion": ""}
+                "missing_info": "", "suggestion": "", "gap_kind": ""}
     return {
         "sufficient": bool(parsed.get("sufficient", True)),
         "answer": str(parsed.get("answer") or "").strip(),
         "missing_info": str(parsed.get("missing_info") or "").strip(),
         "suggestion": str(parsed.get("suggestion") or "").strip(),
+        # ⚠️ 必须透传：缺口性质决定"是否允许重规划"。之前这里只返回 4 个键，
+        # 把 gap_kind 丢掉了，导致所有缺口都被归一化成 no_data。
+        "gap_kind": str(parsed.get("gap_kind") or "").strip(),
     }
 
 
@@ -251,18 +276,35 @@ async def summarize_node(state: AgentGraphState, config: RunnableConfig) -> dict
             "请据此换用其他数据源补充取数；已尝试且无效的工具不要重复调用；"
             "若确无其他数据源，则基于已有信息给出诚实的部分答案，严禁编造。"
         )
-    if replan_capacity(state):
-        logger.info("summarize L3 判定证据不足，带缺口说明回炉 replan。")
+    # ⚠️ 必须用与**路由方完全相同**的判定（`replan_allowed`），而不是只问
+    # "还有没有余量"。曾经两者不一致：summarize 把 final_answer 置空、写下不足
+    # 信号等着被重规划，而路由按收窄条件拒绝了重规划 → 用户拿到 answer="" 且
+    # success=False（实测复现：plan_execute 模式下工具子任务全失败）。
+    kind: str = normalize_gap_kind(verdict.get("gap_kind"))
+    if replan_allowed(state, signal_present=True, insufficiency_kind=kind):
+        logger.info("summarize L3 判定证据不足，带缺口说明回炉 replan（缺口性质={}）。", kind)
         trace_event(deps.tracer, trace_id, "summarize.insufficient",
                     {"missing_info": verdict["missing_info"],
                      "suggestion": verdict["suggestion"],
+                     "gap_kind": kind,
                      "failed_writes": failed_writes})
         return {
             "insufficiency_signal": signal,
+            # 结构化缺口性质：只有 off_topic（方向性错误）才允许重规划
+            "insufficiency_kind": kind,
             "draft_answer": draft or None,
             "final_answer": "",
             "success": False,
         }
+
+    # 重规划被排除 → **绝不能留空答案**，直接落到下面的"诚实部分答案"收尾路径。
+    # 留痕便于事后统计有多少请求被收窄拦下、以及被哪一条规则拦下。
+    exclusion_reason: str = replan_exclusion_reason(
+        state, signal_present=True, insufficiency_kind=kind
+    )
+    if exclusion_reason:
+        trace_event(deps.tracer, trace_id, "replan.excluded",
+                    {"gap_kind": kind, "reason": exclusion_reason})
 
     if failed_writes:
         # 写操作失败且余量耗尽：明确告知未完成，success 必须是 False（trace 事故里

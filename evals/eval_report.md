@@ -1,6 +1,6 @@
 # Ai_Agent_Frame 评测报告（eval_report）
 
-- 生成时间：2026-09-17 16:45:21
+- 生成时间：2026-09-18 10:46:37
 - 阈值版本：`thresholds.version = 1`
 - 运行环境：Windows 10 / Python 3.14.6
 - 复现命令：`python -m evals.report --run-all`
@@ -9,7 +9,7 @@
 
 ❌ **质量门未通过**，共 1 项违规：
 
-- cost.avg_tokens_per_turn_max 违规：avg_tokens_per_turn=20516.5000 > 6000.0000
+- cost.avg_tokens_per_turn_max 违规：avg_tokens_per_turn=7455.5000 > 6000.0000
 
 > 说明：阈值未配置的项、以及本次未采集到的指标会被**跳过**而不是判失败，所以「通过」的含义是「已测量的部分达标」。
 
@@ -23,8 +23,8 @@
 | RAG Hit@5 | 1 ✅ | 0.8 | `rag.hit_at_5_min` |
 | RAG MRR | 不可用 | 0.55 | `rag.mrr_min` |
 | 工具调用成功率 | 1 ✅ | 0.75 | `tool.call_success_min` |
-| 工具关键参数命中率 | 0.75 ✅ | 0.6 | `tool.key_arg_recall_min` |
-| 单轮 token 成本（端到端） | 20516.5 ❌ | 6000 | `cost.avg_tokens_per_turn_max` |
+| 工具关键参数命中率 | 1 ✅ | 0.6 | `tool.key_arg_recall_min` |
+| 单轮 token 成本（端到端） | 7455.5 ❌ | 6000 | `cost.avg_tokens_per_turn_max` |
 | P95 延迟 (ms) | 不可用 | 45000 | `cost.p95_latency_ms_max` |
 | 答案合格率（生成层） | 不可用 | 0.7 | `answer.pass_rate_min` |
 | 应拒答正确率（生成层） | 不可用 | 0.6 | `answer.abstain_correct_rate_min` |
@@ -33,7 +33,7 @@
 
 ### 3.1 意图分类
 
-- `avg_tokens_per_turn` = 3613.0000
+- `avg_tokens_per_turn` = 3614.0000
 - `boundary_accuracy` = 1.0000
 - `boundary_scored` = 1
 - `boundary_total` = 1
@@ -41,13 +41,13 @@
 - `intent_accuracy` = 1.0000
 - `intent_scored` = 2
 - `llm_calls_per_request` = 1.0000
-- `mean_latency_ms` = 12716.2150
-- `median_tokens_per_turn` = 3613.0000
+- `mean_latency_ms` = 9421.2600
+- `median_tokens_per_turn` = 3614.0000
 - `output_tokens` = 0
-- `p95_latency_ms` = 14081.9155
+- `p95_latency_ms` = 10791.5460
 - `total` = 2
 - 样本数 = 2
-- 真实 LLM 调用 2 次，input=6731 output=495 total=7226 tokens
+- 真实 LLM 调用 2 次，input=6732 output=496 total=7228 tokens
 
 - ⚠️ **样本量不足**：以下数值仅供参考，**不参与质量门判定**
   - `boundary_accuracy`：本次 1 条，需 ≥5 条。低于下限时该指标在统计上不成立（如 P95 在 n=3 时插值结果几乎等于最大值）
@@ -56,9 +56,9 @@
 ### 3.2 RAG 检索
 
 - `hit@5` = 1.0000
-- `mean_latency_ms` = 2365.8150
-- `mrr` = 0.5000
-- `p95_latency_ms` = 3949.0005
+- `mean_latency_ms` = 773.9050
+- `mrr` = 1.0000
+- `p95_latency_ms` = 1204.5055
 - `recall@5` = 1.0000
 - `scored` = 1
 - `skipped_unanswerable` = 1
@@ -71,20 +71,20 @@
 
 ### 3.3 工具调用
 
-- `avg_tokens_per_turn` = 20516.5000
+- `avg_tokens_per_turn` = 7455.5000
 - `error_rate` = 0.0000
 - `key_arg_cases` = 2
-- `key_arg_recall` = 0.7500
-- `llm_calls_per_request` = 11.5000
-- `mean_latency_ms` = 91294.3500
-- `median_tokens_per_turn` = 20516.5000
+- `key_arg_recall` = 1.0000
+- `llm_calls_per_request` = 4.5000
+- `mean_latency_ms` = 27827.0700
+- `median_tokens_per_turn` = 7455.5000
 - `memory_cleanup_failures` = 0
 - `memory_isolated` = True
-- `p95_latency_ms` = 144294.7020
+- `p95_latency_ms` = 33497.5110
 - `tool_success_rate` = 1.0000
 - `total` = 2
 - 样本数 = 2
-- 真实 LLM 调用 23 次，input=34557 output=6476 total=41033 tokens
+- 真实 LLM 调用 9 次，input=13260 output=1651 total=14911 tokens
 
 - ⚠️ **样本量不足**：以下数值仅供参考，**不参与质量门判定**
   - `p95_latency_ms`：本次 2 条，需 ≥20 条。低于下限时该指标在统计上不成立（如 P95 在 n=3 时插值结果几乎等于最大值）

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from langchain_core.runnables import RunnableConfig
 from loguru import logger
@@ -40,6 +40,22 @@ from app.core.agent.graph.nodes._fc_args import (
     resolve_tool_args_from_hint,
     resolve_tool_args_via_function_call,
     substitute_task_refs,
+)
+from app.core.agent.step_correction import (
+    Candidate,
+    EVIDENCE_COVERAGE_THRESHOLD,
+    build_candidates,
+    build_question_keywords,
+    detect_evidence_gap,
+    injection_reason,
+    remaining_quota,
+    render_candidates,
+    translate_candidate,
+)
+from app.core.skill.asset_map import (
+    extract_asset_facts,
+    merge_facts,
+    render_facts_for_prompt,
 )
 from app.core.agent.graph.state import (
     AgentGraphState,
@@ -110,6 +126,92 @@ def _parse_subtask_outcome(raw: str) -> Optional[Dict[str, Any]]:
         return SubTaskOutcomeSchema(**data).model_dump()
     except Exception:  # noqa: BLE001 - 字段缺失/取值非法同样按"未解析"处理
         return None
+
+
+def _apply_step_correction(
+    *,
+    state: AgentGraphState,
+    plan: List[Dict[str, Any]],
+    cursor: int,
+    skipped_ids: List[str],
+    candidates: Sequence[Candidate],
+    selected: Any,
+    deps: Any,
+    trace_id: str,
+    subtask_id: Any,
+    trigger: Optional[str],
+) -> Dict[str, Any]:
+    """应用一次就地纠偏；未应用时返回空 dict。
+
+    分工：模型只输出**候选项标识**，工具名 / 参数 / 路径全部在这里构造，并做一次
+    白名单复核。标识不在本次候选列表中、翻译失败、或配额耗尽时，一律忽略该指令并
+    按既有口径降级为「继续执行下一个子任务」——**本步已产出的结论绝不因此丢弃**。
+
+    作用域闸门：只改 cursor 之后的计划项；cursor 本身、已跳过记录、提前收尾标记
+    一律不动（对比重规划的"整体替换计划 + cursor 归零 + 清空跳过记录"）。
+    """
+    if not selected or not candidates:
+        return {}
+
+    record: Dict[str, Any] = {
+        "subtask_id": subtask_id,
+        "trigger": trigger or "",
+        "selected": str(selected).strip(),
+        "remaining_quota": remaining_quota(state),
+    }
+
+    def _skip(reason: str) -> Dict[str, Any]:
+        record["applied"] = False
+        record["reason"] = reason
+        # 留痕：被忽略的纠偏指令同样要可观测，便于事后判断是"模型乱选"还是"闸门过紧"
+        trace_event(deps.tracer, trace_id, "plan_execute.correction_skipped", record)
+        return {}
+
+    if remaining_quota(state) <= 0:
+        return _skip("纠偏配额已耗尽")
+
+    action = translate_candidate(
+        selected,
+        candidates=candidates,
+        allowed_tools=state.get("active_tool_names") or [],
+        facts=state.get("extracted_facts"),
+    )
+    if action is None:
+        return _skip("标识不在本次候选列表中，或未通过白名单复核")
+
+    # ⚠️ 起点是 ``cursor + 1``：`next_pending_cursor` 是**从 cursor 起（含）**找，
+    # 直接传 cursor 会把正在执行的那一步本身改掉——"只改 cursor 之后"就破了。
+    target_index = next_pending_cursor(plan, cursor + 1, skipped_ids)
+    if target_index is None:
+        return _skip("cursor 之后无待执行子任务，无可替换的目标")
+
+    new_plan: List[Dict[str, Any]] = [dict(entry) for entry in plan]
+    original: Dict[str, Any] = new_plan[target_index]
+    new_plan[target_index] = {
+        **original,
+        "title": str(action.get("title") or original.get("title") or ""),
+        "action_type": "tool",
+        "tool_name": action.get("tool_name"),
+        "tool_args_hint": dict(action.get("action_input") or {}),
+        "description": (
+            f"{original.get('description') or ''}\n"
+            f"（执行期就地纠偏：改用 {action.get('tool_name')}）"
+        ).strip(),
+    }
+
+    record.update({
+        "applied": True,
+        "target_subtask_id": original.get("id"),
+        "target_tool": action.get("tool_name"),
+        "target_args": action.get("action_input"),
+    })
+    trace_event(deps.tracer, trace_id, "plan_execute.correction_applied", record)
+
+    return {
+        "plan": new_plan,
+        # 留痕与配额计数共用同一条记录
+        "step_corrections": list(state.get("step_corrections") or []) + [record],
+    }
 
 
 def _apply_subtask_control(
@@ -424,10 +526,46 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                 skipped_task_ids=skipped_ids,
                 agent_goal=agent_goal_from_state(state),
             )
+            # 已提取的结构化事实：让后续子任务**看得见**真实路径，不必再猜目录。
+            # 只有提取到东西时才注入，避免给提示词塞空段。
+            facts_text: str = render_facts_for_prompt(state.get("extracted_facts"))
+
+            # ── 执行期就地纠偏：候选方向列表（**只在需要时**注入）────────────
+            # 候选由**代码**确定性算出：已提取事实 − 已试资产、白名单 − 已用工具。
+            # 模型只负责从这个封闭列表里挑一个。本 trace 的病根正是"让模型在没有
+            # 候选集的情况下自己发明方向"——它发明了 /data，一个已被同一份输入记录
+            # 证否的路径。有了候选集，这个矛盾在构造阶段就被结构性排除。
+            question_keywords = build_question_keywords(state)
+            evidence_gap, coverage = detect_evidence_gap(question_keywords, obs_str)
+            correction_reason = injection_reason(state, evidence_gap=evidence_gap)
+            correction_set = build_candidates(state)
+
+            correction_candidates: List[Candidate] = []
+            candidates_text: str = ""
+            if correction_reason and remaining_quota(state) > 0:
+                correction_candidates = correction_set.candidates
+                candidates_text = render_candidates(correction_candidates)
+                if evidence_gap:
+                    logger.info(
+                        "子任务 [{}] 证据缺口置位：问题核心词覆盖率={:.2f} < 阈值 {}",
+                        task.get("id"), coverage, EVIDENCE_COVERAGE_THRESHOLD,
+                    )
+            if correction_set.excluded:
+                # 留痕：存在已提取资产、但白名单里没有能消费它的工具。这同时是
+                # "白名单过窄"的观测点（本 trace 即为此情形）。
+                trace_event(
+                    deps.tracer, trace_id, "plan_execute.candidates_excluded",
+                    {"reason": "当前白名单不含可消费该资产的工具",
+                     "excluded": correction_set.excluded},
+                )
+
             prompt_content = (
                 f"{ledger}\n\n"
                 f"原始总问题：{query}\n当前子任务：{task.get('title')}\n"
-                f"详细要求：{task.get('description')}\n历史子任务结论：\n{ctx_str}\n"
+                f"详细要求：{task.get('description')}\n"
+                + (f"{facts_text}\n" if facts_text else "")
+                + (f"{candidates_text}\n" if candidates_text else "")
+                + f"历史子任务结论：\n{ctx_str}\n"
             )
             if obs_str:
                 prompt_content += f"\n本步骤工具调用返回的原始数据：\n{obs_str[:6000]}\n请结合工具数据完成本子任务。"
@@ -445,7 +583,12 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                     "- 若现有结论已足以回答【原始总问题】，把 next_action 置为 finish；\n"
                     "- 若某个尚未执行的子任务、其答案已由其它子任务取得"
                     "（见台账的『是否解决』列），把它的 id 放进 skip_task_ids；\n"
-                    "- 只允许跳过，不允许新增或修改子任务（声明了也会被忽略）。"
+                    "- 若本步取到的信息与问题对不上、需要换数据源或换工具，"
+                    "而提示词里给出了「可选的替代方向」，请把其中**一项**的方括号内容"
+                    "**原样照抄**进 selected_alternative_id（形如 asset:xxx 或 tool:xxx）；"
+                    "不需要换方向时置为 null；\n"
+                    "- ⚠️ 严禁自行编造标识、工具名、参数或路径——只能从给定列表里选，"
+                    "编造的会被忽略；也不允许自行新增或修改子任务。"
                 )
             subtask_msgs = [
                 {"role": "system", "content": system_text},
@@ -477,6 +620,24 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                         control_enabled=control_enabled, skipped_ids=skipped_ids,
                     )
                 )
+
+                # ── 就地纠偏：模型只给了标识，这里翻译并应用 ──────────────
+                correction_update = _apply_step_correction(
+                    state=state,
+                    plan=plan,
+                    cursor=cursor,
+                    skipped_ids=skipped_ids,
+                    candidates=correction_candidates,
+                    selected=outcome.get("selected_alternative_id"),
+                    deps=deps,
+                    trace_id=trace_id,
+                    subtask_id=task.get("id"),
+                    trigger=correction_reason,
+                )
+                if correction_update:
+                    update.update(correction_update)
+                    # 计划已被就地改写 → 后续的计划级闸门必须基于新计划判定
+                    plan = correction_update.get("plan") or plan
             else:
                 # 降级：控制指令解析不出来时**保留结论**、按"继续执行"处理。
                 # 控制是增值能力，绝不能因为它没解析出来就丢掉已取回的工具数据。
@@ -496,6 +657,18 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
         # 执行失败/空数据/熔断/审批拒绝的步骤**没有走结论提炼**，模型并未看到数据，
         # 因此「是否解决」必须由程序强制为否——让模型自评就是在编。
         rec["solved"] = "no"
+
+    # ── 结构化事实提取：把工具返回里的「数据资产地图」确定性搬进状态 ──────
+    # ⚠️ 这一步**不经过模型摘要**。摘要会丢掉文档里逐字写明的路径（本 trace 的
+    # 病根：摘要只说"涵盖客户线索台账等 Excel 文件"，路径全没了，重规划只能
+    # 盲猜目录）。提取器原样保留，模型摘要只负责语义、不再承担事实传递。
+    # 提取不到任何结果时保持既有事实不变，绝不中断链路。
+    if obs_str:
+        new_facts = extract_asset_facts(obs_str)
+        if new_facts:
+            update["extracted_facts"] = merge_facts(
+                state.get("extracted_facts"), new_facts
+            )
 
     # ── 步级统一收尾：记账 + cursor 推进（坏结果不再阻断计划）──────────────
     update["subtask_results"] = [rec]

@@ -297,8 +297,11 @@ class Settings(BaseSettings):
         description="ReAct 态（无 plan execute 自环）单轮最大步数。",
     )
     max_replan_attempts: int = Field(
-        default=2, ge=0,
-        description="plan 工具全坏/证据不足时最大重规划次数。",
+        # ⚠️ 由 2 改为 1（2026-09）：重规划的触发条件已收窄为"方向性错误"
+        #（全部结论跑题），步级问题交由执行期就地纠偏消化。保留 1 次是给
+        #"计划方向本身错了"这类情形留最后一条路——该情形只有重新规划能救。
+        default=1, ge=0,
+        description="plan 工具全坏/证据不足时最大重规划次数（收窄后至多 1 次）。",
     )
     agent_evidence_gate_enabled: bool = Field(
         default=True,

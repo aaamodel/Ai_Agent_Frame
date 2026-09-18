@@ -23,6 +23,7 @@ from app.core.agent.graph.deps import get_deps
 from app.core.agent.graph.nodes._common import (
     agent_goal_trace_payload,
     normalize_memory_context,
+    render_skills_index,
     render_skills_prompt,
     trace_event,
 )
@@ -279,12 +280,14 @@ async def prepare_node(state: AgentGraphState, config: RunnableConfig) -> dict:
     intent: Dict[str, Any] = state.get("intent") or {}
 
     # 1. 技能树刷新 与 记忆检索 并行（记忆支持图外并行预取直通）
-    skills_prompt_holder: Dict[str, str] = {"text": ""}
+    # text = 执行侧完整规约；index = 规划侧极简清单（两者用途不同，都要渲染）
+    skills_prompt_holder: Dict[str, str] = {"text": "", "index": ""}
 
     async def _refresh_skill_tree() -> None:
         try:
             await deps.skill_manager.scan_and_refresh_skills()
             skills_prompt_holder["text"] = render_skills_prompt(deps.skill_manager)
+            skills_prompt_holder["index"] = render_skills_index(deps.skill_manager)
             if skills_prompt_holder["text"]:
                 logger.info("【编排层】高级技能树动态刷新完成，成功挂载渐进式披露操作规约。")
         except Exception as skill_exception:  # noqa: BLE001
@@ -369,6 +372,7 @@ async def prepare_node(state: AgentGraphState, config: RunnableConfig) -> dict:
     return {
         "memory_context": memory_context,
         "skills_prompt": skills_prompt_holder["text"],
+        "skills_index": skills_prompt_holder.get("index", ""),
         "active_tool_names": active_tool_names,
         "tool_schemas": tool_schemas,
         "fc_tool_definitions": fc_definitions,

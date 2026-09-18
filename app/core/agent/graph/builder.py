@@ -21,9 +21,17 @@ from typing import Any, Dict, Optional
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from loguru import logger
 
 from app.core.agent.graph.deps import get_deps
 from app.core.agent.graph.nodes._common import next_pending_cursor
+# 重规划门控的**单一真源**：产出方（summarize_node）与路由方共用，避免出现
+# "summarize 等着重规划、路由却拒绝"的不一致（那会产出空答案）。
+from app.core.agent.graph.replan_gate import (
+    REPLAN_HARD_LIMIT,  # noqa: F401 - re-export，供既有引用点使用
+    replan_allowed,
+    replan_exclusion_reason,
+)
 from app.core.agent.graph.nodes import (
     execute_node,
     persist_node,
@@ -92,7 +100,7 @@ def route_after_execute(
         )
         if pending is not None:
             return ROUTE_EXECUTE
-        if state.get("insufficiency_signal") and replan_capacity(state):
+        if _replan_allowed(state):
             return ROUTE_REPLAN
         return ROUTE_SUMMARIZE
 
@@ -106,13 +114,30 @@ def route_after_execute(
     return ROUTE_SUMMARIZE
 
 
-def route_after_summarize(state: AgentGraphState) -> str:
-    """summarize L3 自判后：证据不足且仍有余量 → replan 补取；否则收尾持久化。
+def _replan_allowed(state: AgentGraphState) -> bool:
+    """收窄后的重规划触发判定（委托给单一真源 `replan_gate.replan_allowed`）。
 
-    信号由 summarize_node 在确认 ``replan_capacity`` 后才写入，这里再做一次
-    纯函数防御性双检；正常情况下有信号即 replan。
+    ⚠️ 判定**必须与 `summarize_node` 完全一致**。曾经两处各写一份：summarize
+    按"还有余量"就写下不足信号并置空答案，路由按收窄条件拒绝重规划 → 用户拿到
+    `answer=""` 且 `success=False`（实测复现：plan_execute 模式下工具全失败）。
     """
-    if state.get("insufficiency_signal") and replan_capacity(state):
+    allowed = replan_allowed(state)
+    if not allowed and state.get("insufficiency_signal"):
+        # 留痕：路由是纯函数、拿不到 tracer，这里落日志。事后可统计有多少请求
+        # 被收窄拦下、以及被哪一条规则拦下。
+        logger.warning(
+            "重规划被排除（{}）：本轮将直接以已有信息诚实收尾。",
+            replan_exclusion_reason(state),
+        )
+    return allowed
+
+
+def route_after_summarize(state: AgentGraphState) -> str:
+    """summarize L3 自判后：仅在**方向性错误**且仍有可用候选时 replan；否则收尾。
+
+    信号由 summarize_node 写入；这里依据结构化的 `insufficiency_kind` 再收窄一次。
+    """
+    if _replan_allowed(state):
         return ROUTE_REPLAN
     return ROUTE_PERSIST
 

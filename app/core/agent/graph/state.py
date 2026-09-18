@@ -60,7 +60,10 @@ class AgentGraphState(TypedDict, total=False):
 
     # ── prepare 节点产出的上下文 ───────────────────────────────────────
     memory_context: Dict[str, Any]       # short_term / long_term（可序列化列表）
-    skills_prompt: str                   # 技能渐进式披露规约
+    skills_prompt: str                   # 技能渐进式披露规约（**执行侧**用，含读取指引）
+    skills_index: str                    # 技能极简清单（**规划侧**用，只含名称+一句话用途）
+    extracted_facts: List[Dict[str, Any]]  # 运行期从文档中提取的结构化事实（数据资产名/位置/工具）
+    step_corrections: List[Dict[str, Any]]  # 执行期就地纠偏的留痕（同时作为配额已用计数）
     active_tool_names: List[str]         # 号令后的白名单工具
     tool_schemas: Dict[str, str]         # 文本路径的工具 schema 文本
     fc_tool_definitions: List[Dict[str, Any]]  # 原生 FC tools[] 定义
@@ -101,6 +104,9 @@ class AgentGraphState(TypedDict, total=False):
     empty_data_signal: Optional[str]     # 旧字段：单步空数据留痕（不再驱动即时 replan）
     insufficiency_signal: Optional[str]
     # 计划级"证据不足"信号（L2 规则闸门 / L3 summarize 自判写入），驱动换源 replan
+    insufficiency_kind: Optional[str]
+    # 缺口性质（结构化）：仅 "off_topic"（全部结论跑题＝方向性错误）才允许重规划；
+    # 其余取值与缺失一律按非方向性错误处理。依据自由文本推断会导致步级问题付整轮代价。
     draft_answer: Optional[str]          # summarize 判定不足时的草稿（额度耗尽直接用它收尾）
     pending_tool: Optional[Dict[str, Any]]
     # 当前激活步待执行的 ToolCall dict（危险工具 interrupt 前后保持一致；非 paused 标志）
@@ -138,6 +144,9 @@ def make_initial_state(
         "should_plan": bool(should_plan),
         "mode_source": mode_source,
         "skills_prompt": "",
+        "skills_index": "",
+        "extracted_facts": [],
+        "step_corrections": [],
         "active_tool_names": [],
         "tool_schemas": {},
         "fc_tool_definitions": [],
@@ -156,11 +165,13 @@ def make_initial_state(
         "steps": [],
         "retry_counts": {},
         "replan_attempts": 0,
-        "max_replan": 2,
+        # 与 Settings.max_replan_attempts 同口径：收窄后至多 1 次
+        "max_replan": 1,
         "max_steps": 10,
         "last_error": None,
         "empty_data_signal": None,
         "insufficiency_signal": None,
+        "insufficiency_kind": None,
         "draft_answer": None,
         "pending_tool": None,
         "reflect_failed": False,

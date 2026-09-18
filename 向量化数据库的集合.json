@@ -1,0 +1,195 @@
+{
+  "physical_collection": "knowledge_base_v3",
+  "collections": [
+    {
+      "name": "Cross_Entity_Relation",
+      "description": "描述销售域各类数据资产之间的实体、关联键与对账路径",
+      "retrieval_hint": "A 和 B 是怎么对账的,A 依赖哪些 B,这些业务之间怎么关联",
+      "document_count": 0,
+      "vector_chunk_count": 0,
+      "files": []
+    },
+    {
+      "name": "Finance_Invoice_Manual",
+      "description": "财务与发票信息手册。覆盖：开票信息查询路径与字段构成、开票信息使用规则、发票开具与红冲流程、报销流程与时限、差旅标准、付款与收款、预算与成本中心、各系统在财务事项上的归口对照",
+      "retrieval_hint": "用户问开票信息怎么查、开户行和账号是多少、专票要提供什么资料、发票怎么开/怎么红冲、报销怎么提交、报销时限多久、差旅住宿标准多少、出差补贴多少、付款日是周几、预算怎么申请、成本中心怎么新增、FSS 和 PAS 谁管什么时，检索本文件。",
+      "document_count": 1,
+      "vector_chunk_count": 7,
+      "files": [
+        {
+          "filename": "03_财务与发票信息手册.txt",
+          "chunk_count": 7,
+          "document_id": "393056e0-f079-4c91-9bf6-79425439c95e",
+          "created_at": "2026-09-14T19:04:14.944518+00:00"
+        }
+      ]
+    },
+    {
+      "name": "Human_Resources_Employee",
+      "description": "人事制度与员工手册。覆盖：入职材料与流程、试用期与转正规则、考勤与假期（年休假按司龄计算、事假/病假/婚假/产假/陪产假/丧假）、离职申请时限与工作交接六步流程、客户与商机移交口径、系统权限回收、报销与差旅流程入口、制度查询与解释入口。",
+      "retrieval_hint": "用户问入职要带什么、试用期多久、怎么转正、年假有几天/怎么算/能不能延到明年、请假怎么请、离职提前多久说、工作交接怎么做、客户和商机怎么移交、账号什么时候停、报销找谁、假期余额在哪查、制度原文在哪看时，检索本文件。",
+      "document_count": 1,
+      "vector_chunk_count": 20,
+      "files": [
+        {
+          "filename": "01_人事制度与员工手册.txt",
+          "chunk_count": 20,
+          "document_id": null,
+          "created_at": null
+        }
+      ]
+    },
+    {
+      "name": "IT_Network_Support",
+      "description": "IT 支持与办公网络故障排查手册。覆盖：报障渠道与 SLA 响应时效、报障信息模板、办公网络整体中断的分层定位模型（终端/接入/核心/出口/专线）、快速判定口诀、员工侧标准处置、机房与基础设施概况、常见故障速查表、安全与合规红线",
+      "retrieval_hint": "用户问网络断了怎么办、怎么报 IT 工单、IT 电话多少、VPN 连不上、邮箱收不到外部邮件、打印机不能打、账号密码忘了/被锁了、文件服务器很慢、视频会议卡、机房在哪、网络故障怎么分层排查、能不能私接路由器时，检索本文件。",
+      "document_count": 1,
+      "vector_chunk_count": 8,
+      "files": [
+        {
+          "filename": "02_IT支持与网络故障排查手册.txt",
+          "chunk_count": 8,
+          "document_id": "ceab80f4-02e3-4d07-b98e-6ffe7dd6a5f8",
+          "created_at": "2026-09-14T19:01:20.139949+00:00"
+        }
+      ]
+    },
+    {
+      "name": "Internal_System_Manual",
+      "description": "内部业务系统使用手册。覆盖：系统清单与归口、各系统主要功能与权限、CRM 业务对象与字段口径、OA 模块与移动端能力、PAS 功能范围与移动端支持边界、审批链按金额分级、IT 服务台定位、FSS 常用模块、企业知识库空间与权限、账号与权限通用规则。",
+      "retrieval_hint": "用户问某个内部系统能做什么、怎么用、入口在哪、权限归谁管、CRM 怎么用/字段什么意思、OA 有哪些功能/移动端能做什么、IT 服务台在哪、PAS 支持哪些操作/移动端不能做什么、FSS 怎么进、企业知识库怎么用、账号怎么开通/权限怎么变更时，检索本文件",
+      "document_count": 1,
+      "vector_chunk_count": 9,
+      "files": [
+        {
+          "filename": "04_内部业务系统使用手册.txt",
+          "chunk_count": 9,
+          "document_id": "b12987d9-284a-4689-8f4e-7a272f26c247",
+          "created_at": "2026-09-14T19:11:14.451156+00:00"
+        }
+      ]
+    },
+    {
+      "name": "Org_System_Relation",
+      "description": "组织与系统实体关系图谱。覆盖：部门职责三元组、线索流转的部门接力关系、CRM 台账“负责人”与“首次筛选部门”的口径澄清、部门负责人、系统间集成关系与未打通边界（CRM↔IT 服务台、PAS↔FSS 等）、系统归属与负责部门、数据上下游血缘、关系类问题查询指引。",
+      "retrieval_hint": "谁负责 X、X 归哪个部门、数据从哪来到哪去、CRM 和工单系统通了吗、PAS 和 FSS 怎么交互、线索谁先筛、CRM 里负责人字段什么意思、某个系统的上游/下游是什么时，检索本文件。",
+      "document_count": 0,
+      "vector_chunk_count": 0,
+      "files": []
+    },
+    {
+      "name": "_untagged",
+      "description": null,
+      "retrieval_hint": null,
+      "document_count": 3,
+      "vector_chunk_count": 10,
+      "files": [
+        {
+          "filename": "多维度打分模型.txt",
+          "chunk_count": 3,
+          "document_id": "a889f6a3-58e6-4af2-9e25-e95c89eb8eac",
+          "created_at": "2026-07-08T07:09:41.348959+00:00"
+        },
+        {
+          "filename": "思维模型提示词.txt",
+          "chunk_count": 4,
+          "document_id": "2036b907-b651-4e10-96e8-a3b9da5eba31",
+          "created_at": "2026-07-08T03:24:04.967843+00:00"
+        },
+        {
+          "filename": "报价要求响应文件.pdf",
+          "chunk_count": 3,
+          "document_id": "bb624d74-05b0-471c-9d32-324cb548d7b1",
+          "created_at": "2026-07-06T21:48:35.355239+00:00"
+        }
+      ]
+    },
+    {
+      "name": "sales_kb",
+      "description": "销售智能与销售运营知识集合（sales_kb / sales_intel）。覆盖：产品与定价、客户画像与ICP、销售方法论与商机评估、销售分析与指标诊断、目标考核、成功案例、竞品情报与应对、客户反馈、市场活动、销售培训、折扣权限与异议话术",
+      "retrieval_hint": "用户问产品报价/版本选择、线索评估/客户资质、商机推进/输单复盘、销售指标/业绩诊断、目标达成、客户案例/客户反馈、竞品动态/竞品应对、市场活动效果、销售培训、折扣审批、异议处理时，检索本集合",
+      "document_count": 13,
+      "vector_chunk_count": 60,
+      "files": [
+        {
+          "filename": "公司产品知识库.md",
+          "chunk_count": 6,
+          "document_id": "956b2718-ad7f-4999-90df-8d61bcee8d40",
+          "created_at": "2026-09-05T23:49:41.351598+00:00"
+        },
+        {
+          "filename": "客户反馈汇总.md",
+          "chunk_count": 3,
+          "document_id": "87a27902-ca38-4f78-b27d-6a6ece862218",
+          "created_at": "2026-09-06T00:22:57.707622+00:00"
+        },
+        {
+          "filename": "客户成功案例.md",
+          "chunk_count": 3,
+          "document_id": "85d32a0d-883b-4e97-8385-2d5bbafa72be",
+          "created_at": "2026-09-05T23:58:54.946349+00:00"
+        },
+        {
+          "filename": "客户画像与ICP判定标准.md",
+          "chunk_count": 5,
+          "document_id": "84444ca0-f817-4a85-975f-c9faffe221d4",
+          "created_at": "2026-09-06T00:23:25.209402+00:00"
+        },
+        {
+          "filename": "市场活动效果.md",
+          "chunk_count": 3,
+          "document_id": "4e972607-674f-45d5-8d1b-b9e2802269fe",
+          "created_at": "2026-09-06T00:23:46.645331+00:00"
+        },
+        {
+          "filename": "异议处理与竞争话术库.md",
+          "chunk_count": 6,
+          "document_id": "95b663ab-aa01-4ee2-8ee0-835767c08acf",
+          "created_at": "2026-09-06T00:26:35.400047+00:00"
+        },
+        {
+          "filename": "竞品情报与市场侦察手册.md",
+          "chunk_count": 6,
+          "document_id": "329cee64-376b-412c-a3cd-020019c75c55",
+          "created_at": "2026-09-05T23:58:14.073483+00:00"
+        },
+        {
+          "filename": "竞品成功案例.md",
+          "chunk_count": 4,
+          "document_id": "0d2d1baa-bee5-4d97-aef6-5125adb3afe2",
+          "created_at": "2026-09-05T23:58:31.184705+00:00"
+        },
+        {
+          "filename": "销售分析指标词典与诊断手册.md",
+          "chunk_count": 5,
+          "document_id": "5efa61f0-e810-4cb5-9914-5dcd8ffc94ad",
+          "created_at": "2026-09-06T00:25:09.621000+00:00"
+        },
+        {
+          "filename": "销售培训手册.md",
+          "chunk_count": 3,
+          "document_id": "63b350bb-e975-4946-becf-e2f4c0563ab4",
+          "created_at": "2026-09-06T00:26:20.796204+00:00"
+        },
+        {
+          "filename": "销售成功案例库.md",
+          "chunk_count": 6,
+          "document_id": "ca84896e-170c-4194-a3e6-b761bc63f2f2",
+          "created_at": "2026-09-06T00:24:01.929296+00:00"
+        },
+        {
+          "filename": "销售方法论与商机资质判定手册.md",
+          "chunk_count": 7,
+          "document_id": "15c0a614-3b50-4376-91e8-78d656d06e16",
+          "created_at": "2026-09-06T00:24:14.490854+00:00"
+        },
+        {
+          "filename": "销售目标与考核.md",
+          "chunk_count": 3,
+          "document_id": "6cf94797-f65a-4bf0-9d19-a5ec9cba6cae",
+          "created_at": "2026-09-06T00:26:03.602716+00:00"
+        }
+      ]
+    }
+  ]
+}

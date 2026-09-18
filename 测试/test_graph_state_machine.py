@@ -292,13 +292,21 @@ def test_route_after_execute() -> None:
         "replan_attempts": 0, "max_replan": 2,
     }) == "execute"
 
-    # plan 跑完 + L2/L3 证据不足信号 + 有次数与预算余量 → replan
+    # plan 跑完 + L2/L3 证据不足信号 + **方向性错误** + 有次数与预算余量 → replan
     assert route_after_execute({
         "final_answer": "", "plan": [{"id": "a"}], "cursor": 1,
-        "insufficiency_signal": "sig",
+        "insufficiency_signal": "sig", "insufficiency_kind": "off_topic",
         "replan_attempts": 0, "max_replan": 2,
         "budget": {"total_budget": 20, "total_used": 1},
     }) == "replan"
+
+    # 证据不足但缺口性质是"没取到数据"（非方向性错误）→ 不再整轮重规划
+    assert route_after_execute({
+        "final_answer": "", "plan": [{"id": "a"}], "cursor": 1,
+        "insufficiency_signal": "sig", "insufficiency_kind": "no_data",
+        "replan_attempts": 0, "max_replan": 2,
+        "budget": {"total_budget": 20, "total_used": 1},
+    }) == "summarize"
 
     # 次数耗尽 → summarize（不再 replan）
     assert route_after_execute({
@@ -319,7 +327,7 @@ def test_route_after_execute() -> None:
     # total_budget=0 表示不限总量 → 仍可 replan
     assert route_after_execute({
         "final_answer": "", "plan": [{"id": "a"}], "cursor": 1,
-        "insufficiency_signal": "sig",
+        "insufficiency_signal": "sig", "insufficiency_kind": "off_topic",
         "replan_attempts": 0, "max_replan": 2,
         "budget": {"total_budget": 0, "total_used": 99},
     }) == "replan"
@@ -343,12 +351,18 @@ def test_route_after_execute() -> None:
 def test_route_after_summarize() -> None:
     # 无信号 → persist
     assert route_after_summarize({}) == "persist"
-    # L3 证据不足且有余量 → replan
+    # L3 证据不足且**方向性错误**且有余量 → replan
     assert route_after_summarize({
-        "insufficiency_signal": "sig",
+        "insufficiency_signal": "sig", "insufficiency_kind": "off_topic",
         "replan_attempts": 0, "max_replan": 2,
         "budget": {"total_budget": 20, "total_used": 3},
     }) == "replan"
+    # 证据不足但只是"没取到数据" → persist（步级问题不该付整轮代价）
+    assert route_after_summarize({
+        "insufficiency_signal": "sig", "insufficiency_kind": "no_data",
+        "replan_attempts": 0, "max_replan": 2,
+        "budget": {"total_budget": 20, "total_used": 3},
+    }) == "persist"
     # 次数/预算耗尽 → persist（节点已用草稿填好 final_answer）
     assert route_after_summarize({
         "insufficiency_signal": "sig",
@@ -442,12 +456,15 @@ async def test_plan_empty_data_replan() -> None:
     assert outcome.paused is False
     assert outcome.response.success is True
     assert outcome.response.mode_used == "plan_execute"
-    assert outcome.response.degraded is True
+    # ⚠️ 触发收窄后不再 replan，因此不再被标记为 degraded——该标记目前由
+    # replan_node 写入。本次仍以"暂无记录"诚实收尾，只是不再付出整轮代价。
+    assert outcome.response.degraded is False
     assert "暂无记录" in outcome.response.answer
-    # 取数工具只调用一次（空数据记账后计划收尾；L2 判全坏 → replan 纯推理，无新工具）
+    # 取数工具只调用一次（空数据记账后计划收尾）
     assert len(registry.invocations) == 1
-    # 初始 plan + 1 次 replan；summarize 只调 1 次（replan 后纯推理被判定 sufficient）
-    assert deps.model_router._plan_calls == 2
+    # 触发收窄后：缺口只是"没取到数据"（非方向性错误）→ **不再整轮重规划**，
+    # 因此只有初始 1 次规划；summarize 1 次即以诚实的部分答案收尾。
+    assert deps.model_router._plan_calls == 1
     assert deps.model_router.summary_call_count == 1
     assert [t["role"] for t in memory.turns] == ["user", "assistant"]
 
@@ -489,8 +506,10 @@ async def test_plan_irrelevant_result_summary_triggers_replan() -> None:
     router = FakeModelRouter(
         plan_tools=["echo_tool"],
         summary_verdicts=[
+            # 跑题＝方向性错误，只有这种缺口才允许重规划
             {"sufficient": False, "answer": "草稿：只有无关信息",
-             "missing_info": "缺少退货率数据", "suggestion": "改用售后类数据源"},
+             "missing_info": "缺少退货率数据", "suggestion": "改用售后类数据源",
+             "gap_kind": "off_topic"},
             {"sufficient": True, "answer": "补数后最终答案：退货率为 12%。",
              "missing_info": "", "suggestion": ""},
         ],
@@ -660,3 +679,129 @@ async def test_control_finish_skips_remaining() -> None:
     # 3 个取数子任务，第 1 个之后即提前收尾 → 只调用 1 次
     assert len(registry.invocations) == 1
     assert router.summary_call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 6.3 方向性错误场景：重规划恰好 1 次，之后不再触发（硬上限）
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_off_topic_replans_exactly_once_then_stops() -> None:
+    """全部结论跑题（方向性错误）→ 允许 1 次重规划；再次判定不足时诚实收尾。
+
+    ⚠️ 即便配置把 max_replan_attempts 放到 2，硬上限仍是 1——"至多一次"是无条件
+    约束，配置只能把它调得更小（`agent/replan-context` 的硬性上限需求）。
+    """
+    router = FakeModelRouter(
+        plan_tools=["echo_tool"],
+        summary_verdicts=[
+            {"sufficient": False, "answer": "草稿：只有无关信息",
+             "missing_info": "缺少退货率数据", "suggestion": "换数据源",
+             "gap_kind": "off_topic"},
+            {"sufficient": False, "answer": "仍是草稿：依然无关",
+             "missing_info": "仍然缺少", "suggestion": "再换一个",
+             "gap_kind": "off_topic"},
+        ],
+    )
+    runner, deps, registry, _ = _build_runner(
+        {"echo_tool": FakeTool("echo_tool", "今日体育新闻：某足球比赛 2:1 结束")},
+        _base_config(max_replan_attempts=2),
+        model_router=router,
+    )
+    outcome = await runner.run(
+        deps=deps, user_input="查退货率", session_id="s-one-replan",
+        mode="plan_execute", intent=IntentContext(),
+    )
+
+    assert outcome.paused is False
+    # 初始 plan + 恰好 1 次 replan
+    assert router._plan_calls == 2
+    # 汇总两次判不足：第一次触发重规划，第二次不再触发
+    assert router.summary_call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# 8.3 端到端：取到了数据但数据不对 → 证据缺口 → 注入候选 → 模型选中后换源
+# ---------------------------------------------------------------------------
+_ASSET_TABLE = (
+    "| 资产 | 位置 | 用途(调用工具） |\n"
+    "|---|---|---|\n"
+    "| 客户线索台账.xlsx | `raw_data/sales_intel/客户线索台账.xlsx` | 线索查询（alt_tool） |\n"
+)
+_QUESTION = "我们优先做哪些行业？哪些行业算次优先？"
+
+
+@pytest.mark.asyncio
+async def test_evidence_gap_lets_model_switch_data_source_midflight() -> None:
+    """本 trace 的核心失败场景，端到端跑通。
+
+    t1 返回了内容但与问题无关（体育新闻 vs 行业优先级）——**它不是空的、也不是
+    错的**，所以"取数失败"类触发条件覆盖不到它。证据缺口检测必须把它抓住，
+    注入候选方向列表，并让模型从封闭列表里选中一个替代方向。
+    """
+    router = FakeModelRouter(
+        plan_tools=["t1_tool", "t2_tool"],
+        subtask_outcomes=[
+            {"conclusion": "本步返回与问题无关", "solved": "no",
+             "next_action": "continue", "selected_alternative_id": "tool:alt_tool"},
+        ],
+        summary_verdicts=[
+            {"sufficient": True, "answer": "已完成", "missing_info": "", "suggestion": ""}
+        ],
+    )
+    runner, deps, registry, _ = _build_runner(
+        {
+            "t1_tool": FakeTool("t1_tool", _ASSET_TABLE + "今日体育新闻：某足球比赛 2:1 结束"),
+            "t2_tool": FakeTool("t2_tool", "原始第二步结果"),
+            "alt_tool": FakeTool("alt_tool", "替代方向取到了行业优先级数据"),
+        },
+        _base_config(),
+        model_router=router,
+    )
+
+    outcome = await runner.run(
+        deps=deps, user_input=_QUESTION, session_id="s-step-corr",
+        mode="plan_execute", intent=IntentContext(),
+    )
+
+    assert outcome.paused is False
+    names = [inv["name"] for inv in registry.invocations]
+    assert names[0] == "t1_tool"
+    # 第二步被就地纠偏成 alt_tool（原计划是 t2_tool）
+    assert names[1] == "alt_tool", f"就地纠偏未生效，实际调用序列={names}"
+    assert "t2_tool" not in names
+
+
+@pytest.mark.asyncio
+async def test_no_injection_when_step_is_healthy_so_plan_is_untouched() -> None:
+    """对照实验：不满足注入条件时，模型给的标识必须被忽略、计划原样不动。
+
+    这同时验证了"标识不在本次候选列表中 → 忽略该指令并降级为继续执行"——
+    没有注入就没有候选集，因此任何标识都无效。
+    """
+    router = FakeModelRouter(
+        plan_tools=["t1_tool", "t2_tool"],
+        subtask_outcomes=[
+            {"conclusion": "行业优先级已给出", "solved": "yes",
+             "next_action": "continue", "selected_alternative_id": "tool:alt_tool"},
+        ],
+        summary_verdicts=[
+            {"sufficient": True, "answer": "已完成", "missing_info": "", "suggestion": ""}
+        ],
+    )
+    runner, deps, registry, _ = _build_runner(
+        {
+            "t1_tool": FakeTool("t1_tool", "行业优先级排序结论：金融行业优先，其次先进制造。"),
+            "t2_tool": FakeTool("t2_tool", "第二步结果"),
+            "alt_tool": FakeTool("alt_tool", "替代结果"),
+        },
+        _base_config(),
+        model_router=router,
+    )
+
+    outcome = await runner.run(
+        deps=deps, user_input=_QUESTION, session_id="s-step-corr-ctrl",
+        mode="plan_execute", intent=IntentContext(),
+    )
+
+    assert outcome.paused is False
+    assert [inv["name"] for inv in registry.invocations] == ["t1_tool", "t2_tool"]

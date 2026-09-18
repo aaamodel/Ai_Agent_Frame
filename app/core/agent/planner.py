@@ -48,6 +48,81 @@ UNKNOWN_TOOL_FALLBACK: str = "rag_knowledge_search"
 REPLAN_SUMMARY_MAX_CHARS: int = 400
 REPLAN_PAYLOAD_MAX_CHARS: int = 4000
 
+# 归属不可得时的**显式标记**。绝不能用空值表示：空值无法与"未设置"区分，
+# 重规划会把"不知道是谁"误读成"这一步没有归属"。
+NO_OWNER_MARK: str = "(无归属)"
+
+# 尝试记录里值得回传给重规划的参数名（路径 / 查询条件类）
+_ATTEMPT_ARG_KEYS: tuple = (
+    "file_path", "path", "dir", "directory", "query",
+    "collection", "collection_names", "pattern",
+)
+
+
+def compact_attempt(record: Any) -> str:
+    """把一次工具调用的**关键入参**压成一句话，让重规划知道"已经试过什么"。
+
+    只取路径 / 查询条件类的参数，不把整个入参 dict 塞进 payload（有 4000 字符
+    上限）。实测价值（2026-09）：本 trace 连续两次盲扫 `/data`，直接原因就是
+    重规划拿不到"上一轮已经试过什么"。
+    """
+    if not isinstance(record, dict):
+        return ""
+    args = record.get("action_input")
+    if not isinstance(args, dict):
+        return ""
+    parts: List[str] = []
+    for key in _ATTEMPT_ARG_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}={value.strip()[:80]}")
+        elif isinstance(value, (list, tuple)) and value:
+            parts.append(f"{key}={str(list(value))[:80]}")
+    if not parts:
+        # 回退：取第一个非空字符串值，避免"试过什么"彻底丢失
+        for value in args.values():
+            if isinstance(value, str) and value.strip():
+                parts.append(str(value.strip())[:80])
+                break
+    return "，".join(parts)[:120]
+
+
+# "未取得有效数据"的措辞集合（供失效工具去重使用）。
+# 比 `_EMPTY_RESULT_SENTINELS` 宽：后者服务于"是否触发 replan"这一更保守的判断，
+# 而这里服务于"这个工具本轮是否已被证明无效"——宁可多判一个工具失效（后果只是
+# 不重复调用它），也不要漏判（后果是新计划重复撞同一面墙）。
+_NO_EFFECTIVE_DATA_SENTINELS: tuple = (
+    "未返回任何",
+    "检索失败",
+    "未找到任何",
+    "没有任何",
+    "无匹配",
+    "未匹配到",
+    "没有找到",
+    "Sorry, I'm not able to",
+)
+
+
+def result_is_ineffective(record: Any) -> bool:
+    """该次执行是否**实际上未取得有效数据**（用于失效工具去重）。
+
+    ⚠️ 不能只看 status：实测（2026-09）知识图谱检索未返回任何数据，但 status
+    被记为 "ok"，于是逃过了失效去重，新计划仍可能重复调用它。
+    """
+    if not isinstance(record, dict):
+        return False
+    status: str = str(record.get("status") or "")
+    if status in {"empty_data", "error", "budget_denied", "approval_denied"}:
+        return True
+    if record.get("empty_result"):
+        return True
+    text: str = str(record.get("llm_output") or record.get("observation") or "")
+    if not text.strip():
+        return True
+    if _is_empty_data(text):
+        return True
+    return any(sentinel in text for sentinel in _NO_EFFECTIVE_DATA_SENTINELS)
+
 
 # 一刀切用 <=60 字符的长度闸门会把它们漏掉，导致"空数据"被当成"正常结果"继续提炼。
 _EMPTY_RESULT_SENTINELS: tuple = (
@@ -615,12 +690,16 @@ class PlannerAgent:
 
     @staticmethod
     def _compact_results_for_replan(results: Any) -> List[Dict[str, Any]]:
-        """把完整执行记录压成〔id / 工具 / 状态 / 摘要〕四元组。
+        """把完整执行记录压成〔归属 / 工具 / 状态 / 摘要 / 尝试〕元组。
 
-        重规划只需要知道"哪些做完了、结论是什么、哪些失败了"，**不需要**原始观测。
-        旧实现直接把 ``results`` 全量 json.dumps 后截断 16000 字符，而单条
-        observation 在上游就被截到了 8000 字符 —— 于是整篇 SKILL.md 会原样进入
-        replan 提示词，这是 replan 单笔 7149 token 的主要来源。
+        重规划只需要知道"哪些做完了、结论是什么、哪些失败了、已经试过什么"，
+        **不需要**原始观测。旧实现直接把 ``results`` 全量 json.dumps 后截断
+        16000 字符，而单条 observation 在上游就被截到了 8000 字符 —— 于是整篇
+        SKILL.md 会原样进入 replan 提示词，这是 replan 单笔 7149 token 的主要来源。
+
+        ⚠️ 归属键是 ``subtask_id``，**不是** ``id``。历史事故（2026-09 实测）：
+        读 ``item.get("id")`` 时每条结果的归属都是 ``null``，重规划因此无法判断
+        哪一步做完了、哪一步失败了，只能依据文本摘要猜测。
 
         摘要优先取子任务 LLM 提炼结论（``llm_output``），没有才退回原始观测。
         """
@@ -631,11 +710,16 @@ class PlannerAgent:
             summary: str = str(
                 item.get("llm_output") or item.get("observation") or ""
             )[:REPLAN_SUMMARY_MAX_CHARS]
+            owner: str = str(item.get("subtask_id") or "").strip()
             compact.append({
-                "id": item.get("id"),
+                # 归属不可得时给**显式标记**，绝不留白——留白会让重规划把
+                # "不知道是谁"误读成"没有归属这一步"。
+                "subtask_id": owner or NO_OWNER_MARK,
                 "tool_name": item.get("tool_name"),
                 "status": item.get("status"),
                 "summary": summary,
+                # 已试过什么：让重规划不必重复试探同一方向
+                "attempted": compact_attempt(item),
             })
         return compact
 
@@ -683,7 +767,11 @@ class PlannerAgent:
         mem_block = "\n".join(f"- {s}" for s in long_term_snippets) if long_term_snippets else "（无）"
 
         # 整合skills
-        skills_section = f"## 可用高级技能 (渐进式披露)\n{skills_block}\n\n" if skills_block else ""
+        # ⚠️ 不再在这里另加「## 可用高级技能」标题：该标题已由
+        # _build_planner_skills_block 与技能清单**一并**输出。放在这里会出现
+        # "标题下方直接跟另一个块的标题"的空标题（实测：标题下紧跟着
+        # 「## 本轮目标」，技能清单却远在后面）。
+        skills_section = skills_block or ""
 
         messages: Sequence[Dict[str, str]] = [
             {"role": "system", "content": PLAN_SYSTEM_PROMPT},
@@ -787,6 +875,7 @@ class PlannerAgent:
         plan: List[SubTask],
         results: List[Dict[str, Any]],
         error: Optional[str],
+        available_assets: Optional[List[Dict[str, Any]]] = None,
     ) -> List[SubTask]:
         """A-C2：Planner 重计划（执行过程遭遇异常后的计划修订）。
 
@@ -810,6 +899,9 @@ class PlannerAgent:
                 for task in plan
             ],
             "results_so_far": self._compact_results_for_replan(results),
+            # 已提取的结构化事实（数据资产名 / 位置 / 消费工具）：让重规划不必
+            # 再猜目录。本 trace 的两次盲扫 /data，根源就是它拿不到这张地图。
+            "available_assets": list(available_assets or []),
             "error": (error or "")[:500],
         }
         messages: Sequence[Dict[str, str]] = [

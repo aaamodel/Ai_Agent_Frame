@@ -11,6 +11,7 @@ import time
 import unicodedata
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+import re
 from loguru import logger
 
 from app.core.agent.graph.state import budget_to_ledger
@@ -53,6 +54,37 @@ def render_skills_prompt(skill_manager: Any) -> str:
         )
     except Exception as skill_exc:  # noqa: BLE001 - 技能渲染失败不阻断主链路
         logger.warning("技能提示词渲染失败（按无技能运行）: {}", skill_exc)
+        return ""
+
+
+def render_skills_index(skill_manager: Any) -> str:
+    """扫描技能树，渲染**规划侧**用的极简技能清单（失败返回空串，非致命）。
+
+    与 :func:`render_skills_prompt` 的分工：
+
+      - ``render_skills_prompt``：执行侧用的**完整规约**，含"如何读取技能文件、
+        如何遵守其工作流"的操作指引；
+      - ``render_skills_index``：规划侧只需要知道"有哪些技能、各自解决什么"。
+        读取与遵守发生在执行期，不属于规划需要的信息。
+
+    实测（2026-09）：完整规约约 1071 字符，占 planner 提示词的 36%；而里面
+    "How to Use Skills"那一整段讲的是执行动作，规划器用不上——更矛盾的是，
+    planner 读完这段后把"读 SKILL.md"排成了第一个子任务。
+    """
+    try:
+        skills_lines: List[str] = []
+        for name, meta in skill_manager.state.available_skills.items():
+            description: str = str(meta.get("description") or "").strip().replace("\n", " ")
+            # 只取第一句：规划需要的是"这个技能解决什么"，不是完整说明书
+            brief: str = re.split(r"[。；;\n]", description)[0].strip()
+            skills_lines.append(
+                f"- {name}：{brief}（Source File: `{meta.get('file_path')}`）"
+            )
+        if not skills_lines:
+            return ""
+        return "\n".join(skills_lines)
+    except Exception as skill_exc:  # noqa: BLE001 - 技能渲染失败不阻断主链路
+        logger.warning("技能清单渲染失败（按无技能运行）: {}", skill_exc)
         return ""
 
 

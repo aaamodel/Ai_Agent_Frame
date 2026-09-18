@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.runnables import RunnableConfig
 from loguru import logger
@@ -15,8 +15,24 @@ from app.core.agent.graph.state import AgentGraphState, budget_from_ledger
 from app.core.agent.planner import PlannerAgent
 
 
-def _build_planner_skills_block(state: AgentGraphState) -> str:
-    """合并顺序：本轮目标 → 意图锚点 → 初始计划 hint → 子问题拆分约束 → 技能树规约。"""
+def _flatten(text: Any) -> str:
+    """去掉全部空白，用于"逐字相同"判定（忽略换行与缩进差异）。"""
+    return "".join(str(text or "").split())
+
+
+def _build_planner_skills_block(
+    state: AgentGraphState,
+    intent_confidence_threshold: float = 0.0,
+) -> str:
+    """合并顺序：本轮目标 → 意图锚点 → 初始计划 hint → 子问题拆分约束 → 技能清单。
+
+    Args:
+        state: 图状态。
+        intent_confidence_threshold: 意图锚点的最低置信度门槛。低于该值（含置信度
+            缺失或无法解析）时**不注入**意图方向约束——错误意图比没有意图更糟，
+            实测一个不该通过的意图标签让 planner 把子任务分配给了知识图谱检索，
+            白跑一次工具调用与一次子任务提炼。
+    """
     # 本轮目标：作为**最高层**约束放在最前——规划要围绕"最终交付什么"来拆解，
     # 而意图标签只说明"问题属于哪个领域"。缺失（两侧都空）时不注入占位噪音。
     goal_text: str = agent_goal_from_state(state)
@@ -30,22 +46,49 @@ def _build_planner_skills_block(state: AgentGraphState) -> str:
     intent: Dict[str, Any] = state.get("intent") or {}
     slots: Dict[str, Any] = intent.get("slots") or {}
 
-    # 主意图锚点（非 general 才注入）
+    # 主意图锚点（非 general 才注入，且**必须达到置信度门槛**）
+    # ⚠️ 置信度缺失或无法解析一律按"不足"处理，不得默认视为达标。
     anchor_block: str = ""
     primary_intent_text: str = str(intent.get("intent") or "").strip()
-    if primary_intent_text and primary_intent_text.lower() != "general":
+    raw_confidence: Any = intent.get("confidence")
+    try:
+        effective_confidence: Optional[float] = (
+            float(raw_confidence) if raw_confidence is not None else None
+        )
+    except (TypeError, ValueError):
+        effective_confidence = None
+    confidence_ok: bool = (
+        effective_confidence is not None
+        and effective_confidence >= intent_confidence_threshold
+    )
+    if (
+        primary_intent_text
+        and primary_intent_text.lower() != "general"
+        and confidence_ok
+    ):
         anchor_block = (
             f"## 当前识别用户意图（Pipeline 决策层分析结果）\n{primary_intent_text}\n\n"
+            f"（置信度 {effective_confidence:.2f}）\n\n"
             "请围绕以上意图方向进行子任务拆解。\n\n"
         )
 
     # initial_plan_hint 冷启动宏观步骤建议
+    #
+    # ⚠️ 与用户问题逐字相同时**整段不注入**：该段的意义是提供 planner 无法自行推导
+    # 的步骤语义；内容等于用户原问题时，它既不携带新信息，又会让"复述问题"看起来
+    # 像一条计划依据。实测（2026-09）中该段与「当前用户新目标」逐字重复——根因是
+    # 步骤提示抽取把整句问题当成了步骤（已在改写层修掉），这里再做一道确定性防御。
     hint_block: str = ""
     initial_plan_hint_value: Any = slots.get("initial_plan_hint")
-    if isinstance(initial_plan_hint_value, str) and initial_plan_hint_value.strip():
+    hint_text: str = (
+        initial_plan_hint_value.strip()
+        if isinstance(initial_plan_hint_value, str)
+        else ""
+    )
+    if hint_text and _flatten(hint_text) != _flatten(state.get("user_input")):
         hint_block = (
             "## Pipeline 阶段给出的宏观计划参考（冷启动 hint）\n"
-            f"{initial_plan_hint_value.strip()}\n\n"
+            f"{hint_text}\n\n"
             "以上是前置决策层的参考步骤建议，可直接采纳，也可结合记忆与工具情况进行合理调整，"
             "但请保证最终拆解方向与上述宏观目标保持一致。\n\n"
         )
@@ -89,12 +132,21 @@ def _build_planner_skills_block(state: AgentGraphState) -> str:
         )
         sub_constraint_block = "\n".join(lines) + "\n\n"
 
+    # 技能清单：规划侧**只给清单**，不给"如何读取 / 如何遵守"的操作指引——那是
+    # 执行期的事，同一份指引在 planner 与 executor 各出现一次等于让渐进式披露被
+    # 承担两遍。
+    #
+    # 标题与清单**紧邻**：标题由本函数自己输出，无技能时不输出标题，避免出现
+    # "## 可用高级技能" 底下直接跟另一个块标题的空标题现象（实测存在）。
+    skills_index: str = str(state.get("skills_index") or "").strip()
+    skills_block: str = f"## 可用技能\n{skills_index}\n\n" if skills_index else ""
+
     return (
         goal_block
         + anchor_block
         + hint_block
         + sub_constraint_block
-        + (state.get("skills_prompt") or "")
+        + skills_block
     )
 
 
@@ -123,7 +175,15 @@ async def plan_node(state: AgentGraphState, config: RunnableConfig) -> dict:
         allowed_tool_names=list(state.get("active_tool_names") or []),
     )
 
-    skills_block = _build_planner_skills_block(state)
+    # 意图锚点的最低置信度门槛。
+    # ⚠️ 实测（2026-09）：意图聚合给出的 aggregated_confidence 普遍偏高
+    #（0.75 / 1.0 / 1.0，连"你好"都是 1.0），因此这道门槛**拦不住**那种"高置信度
+    # 但方向错误"的意图标签。它的作用是挡掉真正低置信度的情形；更根本的方向修正
+    # 需要另外的信号，不属本变更范围。
+    intent_confidence_threshold: float = float(
+        deps.cfg("agent_intent_confidence_threshold", 0.5)
+    )
+    skills_block = _build_planner_skills_block(state, intent_confidence_threshold)
     # 子问题数只认 slots["per_sub_questions"]：该键**仅在实际拆分时存在**
     #（与 prepare_node 计算工具配额、_build_planner_skills_block 判定是否注入
     # 约束块的口径完全一致）。未拆分时为 0 → 解析层不做覆盖校验。

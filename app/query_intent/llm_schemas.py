@@ -806,6 +806,12 @@ class SubTaskOutcomeSchema(BaseModel):
         description="要跳过的子任务 id 列表（其答案已由其它子任务取得，或已无执行必要）。"
                     "无需跳过时为 null。",
     )
+    selected_alternative_id: Optional[str] = Field(
+        default=None,
+        description="就地纠偏：从提示词「可选的替代方向」里**原样照抄**一个标识"
+                    "（形如 asset:xxx 或 tool:xxx）。没有该列表、或不需要换方向时为 null。"
+                    "⚠️ 严禁自行编造标识、工具名、参数或路径——只能从给定列表里选。",
+    )
     reason: str = Field(
         default="", description="选择 finish 或 skip_task_ids 的简短理由（用于留痕审计）。"
     )

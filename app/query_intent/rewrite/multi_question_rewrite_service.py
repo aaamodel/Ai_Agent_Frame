@@ -191,10 +191,33 @@ class AgentMultiQuestionRewriteService(
         prompt_template_loader: .st 模板加载器。
     """
 
-    # 显式步骤提示的正则：匹配"先A再B然后C"、"步骤1 ... 2 ..."等表述
-    _EXPLICIT_STEP_HINT_REGEX: re.Pattern = re.compile(
-        r"(先|步骤|第\s*\d+\s*步|\d+[\.\)、]\s*)"
+    # ------------------------------------------------------------------
+    # 显式步骤提示的判定（词级）
+    # ------------------------------------------------------------------
+    # ⚠️ 历史事故（2026-09 实测）：旧实现是
+    #       _EXPLICIT_STEP_HINT_REGEX = re.compile(r"(先|步骤|第\s*\d+\s*步|\d+[\.\)、]\s*)")
+    #     它做**子串**匹配，于是「我们优**先**做哪些行业」里的「先」命中 —— 一个
+    #     与步骤毫无关系的商务问句被判定为"用户明确说出了步骤"，进而：
+    #       ① 以 0.92 的伪造高置信度强制 plan_execute；
+    #       ② 把**整句问题**当作步骤参考回填（旧实现 return 原问题[:120]），
+    #          又被 planner 注入成"冷启动 hint"，与用户新目标逐字重复。
+    #     任何含「优先」「首先」的中文请求都会走到这条路径。
+    #
+    # 现在的判定分两类，都要求"能表达步骤语义的证据"：
+    #   · 编号类：只认明确写法（步骤N / 第N步），避免 "2026." "3.15" 误命中；
+    #   · 序列类：要求至少两个**不同的**序列标记（单个「先」不构成顺序），
+    #     且「先」必须独立成词（排除 优先/首先/领先… 与 先进/先生/先后…）。
+    _STEP_ENUM_REGEX: re.Pattern = re.compile(
+        r"(?:步骤\s*\d+|第\s*\d+\s*步)"
     )
+    # 「先」独立成词：前后各有一组常见吞并字，命中即不算步骤语义
+    _STEP_XIAN_REGEX: re.Pattern = re.compile(
+        r"(?<![优首领先当事预原率祖])先(?![进生后前锋导例决头驱河])"
+    )
+    _STEP_ZAI_REGEX: re.Pattern = re.compile(r"再(?![见来三说次者])")
+    _STEP_SEQUENCE_MARKERS: tuple = ("先", "再", "然后", "接着", "其次", "随后", "最后")
+    # 分句符：用于只抽取"带步骤语义的分句"，而不是把整句问题原样返回
+    _STEP_SEGMENT_SPLIT_REGEX: re.Pattern = re.compile(r"[，。；！？、\n\r]+")
 
     # ------------------------------------------------------------------
     # AgentQueryRewriteService 抽象实现
@@ -478,19 +501,89 @@ class AgentMultiQuestionRewriteService(
         ordered_keys.extend(sorted(union_set.keys()))
         return ordered_keys
 
+    def _step_marker_hit(self, text: str, marker: str) -> bool:
+        """某个序列标记是否**独立成词**地出现在文本中。
+
+        只有「先」「再」需要词级判定——它们极易被常用词吞掉（优先、首先、先进、
+        先生、再见…）。其余序列词（然后 / 接着 / 其次 / 随后 / 最后）本身不构成
+        其他常用词，直接子串判断即可。
+        """
+        if marker == "先":
+            return self._STEP_XIAN_REGEX.search(text) is not None
+        if marker == "再":
+            return self._STEP_ZAI_REGEX.search(text) is not None
+        return marker in text
+
+    def _has_explicit_step_semantics(self, text: str) -> bool:
+        """文本是否表达了**步骤语义**（而非只是含有一个步骤相关的字）。
+
+        两类证据，满足其一即可：
+
+        1. 编号类：`步骤N` / `第N步` —— 明确写法，不会误命中年份或小数；
+        2. 序列类：至少 **2 个不同的**序列标记同现。要求"至少两个"是因为单个
+           「先」只说明有个先后关系，不足以构成"用户给出了步骤清单"。
+        """
+        if not text:
+            return False
+        if self._STEP_ENUM_REGEX.search(text) is not None:
+            return True
+        distinct_markers = {
+            marker
+            for marker in self._STEP_SEQUENCE_MARKERS
+            if self._step_marker_hit(text, marker)
+        }
+        return len(distinct_markers) >= 2
+
+    def _has_step_marker(self, text: str) -> bool:
+        """文本是否含有**任一**步骤标记（不要求构成完整步骤语义）。
+
+        与 `_has_explicit_step_semantics` 的分工：后者用于**判定整句是否算步骤**，
+        前者用于**从命中的整句里挑出带步骤语义的分句**——分句只带一个标记是常态。
+        """
+        if not text:
+            return False
+        if self._STEP_ENUM_REGEX.search(text) is not None:
+            return True
+        return any(
+            self._step_marker_hit(text, marker)
+            for marker in self._STEP_SEQUENCE_MARKERS
+        )
+
     def _extract_plan_hint_if_present(self, raw_question: str) -> Optional[str]:
         """规则层面抽显式步骤提示。
 
         仅用于兜底 & Prompt hint，最终以 LLM 返回为准。
+
+        ⚠️ 返回值 MUST 是**步骤语义片段**，MUST NOT 是整句问题：该值会被
+        ModeDecider 当作"用户明确说出的步骤"并原样注入 planner 的冷启动参考段，
+        若它与用户问题逐字相同，那段参考就成了纯粹的问题复述（既不携带新信息，
+        又会让 planner 把复述当成一条计划依据）。
         """
         if raw_question is None or not raw_question.strip():
             return None
 
         stripped: str = raw_question.strip()
-        if self._EXPLICIT_STEP_HINT_REGEX.search(stripped) is None:
+        if not self._has_explicit_step_semantics(stripped):
+            return None
+
+        # 只保留"带步骤标记"的分句，把与步骤无关的部分（往往正是问题本身）排除掉。
+        #
+        # ⚠️ 这里用的是 `_has_step_marker`（**任一**标记）而不是
+        # `_has_explicit_step_semantics`（完整步骤语义）：像
+        # 「先清洗数据，然后聚合，最后出报表」这种清单，拆开后每个分句只带一个
+        # 标记是**正常**的；若在这里也要求"至少两个标记"，就会把真正的步骤清单
+        # 整段过滤掉（已在单测里复现过一次）。
+        segments: List[str] = [
+            segment.strip()
+            for segment in self._STEP_SEGMENT_SPLIT_REGEX.split(stripped)
+            if segment.strip() and self._has_step_marker(segment)
+        ]
+        if not segments:
+            # 整体命中但分不出任何"带步骤语义"的分句 → 视为未命中，
+            # 绝不退化成返回整句问题。
             return None
         # 简单裁剪到最多 120 字，避免污染 Prompt
-        return stripped[:120]
+        return "；".join(segments)[:120]
 
     def _parse_agent_rewrite(
         self,
