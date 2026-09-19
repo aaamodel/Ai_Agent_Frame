@@ -319,6 +319,27 @@ bash benchmark/run_bench.sh 20 2m --mode mock
 
 ---
 
+## 前端控制台
+
+仓库内含一个 React 前端控制台（`web/`），提供三个区：**对话**（含危险工具审批与降级提示）、
+**文档**（RAG 集合管理）、**知识库**（图谱集合管理）。
+
+```bash
+# 开发：前端 dev server 经 vite proxy 调后端
+uvicorn app.main:app --reload        # 终端 1
+cd web && npm install && npm run dev # 终端 2 → http://localhost:5173
+
+# 日常使用：构建后由后端托管，单进程、同源、无 CORS
+cd web && npm run build              # 产出 web/dist/
+uvicorn app.main:app                 # 访问 http://127.0.0.1:8000/
+```
+
+前端测试：`cd web && npm test -- --run`
+
+设计文档见 `docs/superpowers/specs/2026-09-19-agent-console-frontend-design.md`，
+实现计划见 `docs/superpowers/plans/2026-09-19-agent-console-frontend.md`，
+运行说明与常见坑见 `web/README.md`。
+
 ## 配置说明
 
 所有配置通过 `app/config.py`（Pydantic-settings）读取，优先级：**进程环境变量 > `./.env` > 默认值**。
