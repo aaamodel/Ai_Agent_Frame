@@ -63,6 +63,28 @@ export function listSessions(): Session[] {
   return readAll().sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+type SessionsListener = () => void;
+
+const listeners = new Set<SessionsListener>();
+
+/**
+ * 订阅会话变更。
+ *
+ * 为什么需要：会话存储是模块级的 localStorage，而**侧栏**与**对话页**是两个
+ * 互不相干的组件树分支。没有订阅的话，对话页新建会话后，侧栏的列表不会刷新，
+ * 用户看不到刚产生的会话——功能上是坏的。
+ */
+export function subscribeSessions(fn: SessionsListener): () => void {
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}
+
+function notifySessions(): void {
+  for (const fn of listeners) fn();
+}
+
 export function getSession(id: string): Session | undefined {
   return readAll().find((s) => s.id === id);
 }
@@ -70,8 +92,10 @@ export function getSession(id: string): Session | undefined {
 export function saveSession(session: Session): void {
   const rest = readAll().filter((s) => s.id !== session.id);
   writeAll([...rest, { ...session, updatedAt: Date.now() }]);
+  notifySessions();
 }
 
 export function deleteSession(id: string): void {
   writeAll(readAll().filter((s) => s.id !== id));
+  notifySessions();
 }
