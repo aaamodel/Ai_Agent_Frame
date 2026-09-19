@@ -151,5 +151,16 @@ export function useChatStream(onMessage: MessageUpdater) {
     abortRef.current?.abort();
   }, []);
 
-  return { send, approve, abort, isStreaming, pendingApproval };
+  /**
+   * 重新接管一个**已存在的**挂起审批（刷新后按 run_id 回查恢复用）。
+   *
+   * 没有它的话，页面刷新后卡片虽然从 localStorage 渲染出来了，
+   * 但 `pendingApproval` 是 null，`approve()` 会在第一行静默返回 ——
+   * 用户看到一个点不动的"批准"按钮，且那个 run 永远悬着。
+   */
+  const restoreApproval = useCallback((req: ApprovalRequest) => {
+    setPendingApproval(req);
+  }, []);
+
+  return { send, approve, abort, restoreApproval, isStreaming, pendingApproval };
 }

@@ -56,7 +56,10 @@ export function Sidebar({
             </span>
           </div>
           <div className="mt-1 truncate text-[10px] text-neutral-400">
-            {pendingItems[0]?.query ?? pendingItems[0]?.tool_name ?? "—"}
+            {/* ⚠️ 后端字段是 user_input；工具名在嵌套的 approvals[] 里 */}
+            {pendingItems[0]?.user_input ??
+              pendingItems[0]?.approvals?.[0]?.tool_name ??
+              "—"}
           </div>
           {backend === "memory" && (
             <div className="mt-1 text-[10px] text-warn-text">

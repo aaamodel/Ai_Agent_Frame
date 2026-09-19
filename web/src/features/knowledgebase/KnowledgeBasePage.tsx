@@ -123,8 +123,9 @@ export function KnowledgeBasePage() {
     );
   }
 
+  // ⚠️ 图谱侧的字段是 chunks_count（多一个 s），与 RAG 侧不同名
   const totalChunks = (detail.data?.files ?? []).reduce(
-    (n, f) => n + (f.chunk_count ?? 0),
+    (n, f) => n + (f.chunks_count ?? f.chunk_count ?? 0),
     0,
   );
 
@@ -214,7 +215,7 @@ export function KnowledgeBasePage() {
                 {f.status ?? "—"}
               </td>
               <td className="px-3 py-2 text-neutral-500">
-                {f.chunk_count ?? "—"}
+                {f.chunks_count ?? f.chunk_count ?? "—"}
               </td>
               <td className="px-3 py-2 text-right">
                 <button

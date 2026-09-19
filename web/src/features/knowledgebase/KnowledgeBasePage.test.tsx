@@ -62,6 +62,27 @@ describe("KnowledgeBasePage", () => {
     expect(screen.getByText("处理中")).toBeInTheDocument();
   });
 
+  /**
+   * Important：图谱侧的字段名是 `chunks_count`（多一个 s），
+   * 与 RAG 侧的 `chunk_count` 不同名。用错名字会让切片数恒为 0 / "—"。
+   */
+  it("用后端真实字段 chunks_count 显示切片数", async () => {
+    vi.spyOn(api, "getGraphCollectionFiles").mockResolvedValue({
+      name: "c",
+      legacy: false,
+      description: null,
+      document_count: 1,
+      files: [{ filename: "a.pdf", status: "已处理", chunks_count: 86 }],
+    });
+    renderAt("/knowledgebase/c");
+
+    // 统计卡与表格行都会显示 86，故用 getAllByText
+    await waitFor(() =>
+      expect(screen.getAllByText("86").length).toBeGreaterThanOrEqual(2),
+    );
+    expect(screen.queryByText("—")).not.toBeInTheDocument();
+  });
+
   it("如实说明无法查询进度（后端没有任务查询接口）", async () => {
     vi.spyOn(api, "getGraphCollectionFiles").mockResolvedValue({
       name: "c",
