@@ -38,8 +38,8 @@ GOAL = "输出 8 月销售复盘，含赢单率与输单原因结论"
 _MISSING = object()
 
 PLAN = [
-    {"id": "task_1", "description": "读月度汇总表 8 月行", "tool_name": "local_excel_read_tool"},
-    {"id": "task_2", "description": "统计输单原因", "tool_name": "local_excel_read_tool"},
+    {"id": "task_1", "description": "读月度汇总表 8 月行", "tool_name": "sales_sql_query"},
+    {"id": "task_2", "description": "统计输单原因", "tool_name": "sales_sql_query"},
     {"id": "task_3", "description": "汇总成复盘结论", "tool_name": None},
 ]
 

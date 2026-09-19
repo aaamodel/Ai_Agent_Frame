@@ -30,12 +30,14 @@ async def upsert_vector_collection(
     session: AsyncSession,
     name: str,
     description: Optional[str],
-    retrieval_hint: Optional[str],
     engine: str = ENGINE_RAG,
 ) -> VectorCollection:
     """登记/更新集合描述。
 
-    新字段为 None 时表示「本次未提供」，保留库内既有值不覆盖；
+    ``description`` 是集合**唯一**的路由语义字段——它同时回答"这个集合是什么"与
+    "什么时候该选它"，因此不再有第二份"检索时机"文本。
+
+    ``description`` 为 None 时表示「本次未提供」，保留库内既有值不覆盖；
     显式空串表示清空。``engine``（rag/graph）在建行时确定，不允许同名集合
     在两种引擎间漂移——撞名直接抛 ValueError（由路由层转 409）。
     """
@@ -46,7 +48,6 @@ async def upsert_vector_collection(
             name=name,
             engine=engine,
             description=description,
-            retrieval_hint=retrieval_hint,
         )
         session.add(row)
     else:
@@ -57,8 +58,6 @@ async def upsert_vector_collection(
             )
         if description is not None:
             row.description = description or None
-        if retrieval_hint is not None:
-            row.retrieval_hint = retrieval_hint or None
     return row
 
 
@@ -108,9 +107,6 @@ async def refresh_kb_registry(
             return KbCollectionDescriptor(
                 name=name,
                 description=str(row.description) if row and row.description else "",
-                retrieval_hint=str(row.retrieval_hint)
-                if row and row.retrieval_hint
-                else "",
                 engine=str(row.engine) if row and row.engine else fallback_engine,
             )
 

@@ -5,6 +5,14 @@ from typing import Any, List, Dict
 from app.core.tools.base import BaseTool, ToolParameter
 from app.core.rag.rag_service import RAGService
 from app.models.agent_schemas import RetrievalResult
+from app.query_intent.kb_collection_registry import KbCollectionRegistry
+
+#: ``collection_names`` 的基础说明。**不得**包含任何具体集合名——可用的集合名由
+#: ``schema_parameters()`` 在运行时逐条追加，写死示例等于教模型编造。
+_COLLECTION_PARAM_BASE_DESC: str = (
+    "限定的知识库集合名列表；省略时不限定集合检索。"
+    "取值只能是下列可用集合之一——没有把握时请直接省略该参数，不要猜一个名字。"
+)
 
 
 class RagSearchTool(BaseTool):
@@ -55,9 +63,49 @@ class RagSearchTool(BaseTool):
             ToolParameter(
                 name="collection_names",
                 type="array",
-                description="限定的知识库集合名列表，如 [\'hr_docs\']；未指定时可省略，由系统在默认全库检索。",
-                required=False)
+                description=_COLLECTION_PARAM_BASE_DESC,
+                required=False,
+                items={"type": "string"},
+            )
         ]
+
+    def schema_parameters(self) -> Dict[str, Any]:
+        """导出参数结构，并把**运行时集合清单**注入 ``collection_names``。
+
+        集合是**运行时资产**：用户可以随时上传/删除逻辑集合，因此取值域不能静态写死，
+        必须每次构造 schema 时现取。这里不需要任何刷新机制——调用方每请求都会调一次
+        本方法，枚举天然新鲜。
+
+        为什么非做不可：一次实测中 Planner 传入了 `product_docs` / `sales_policies` /
+        `pricing_guide` 三个**并不存在**的集合名，两个子任务全部空召回、工具被连续
+        无效计数硬熔断、整轮降级收尾。而当时该参数的说明里写着一个示例
+        `如 ['hr_docs']`——`hr_docs` 本身也不是真实集合。模型照抄的是"名字长这样"，
+        不是"名字只能是这些"。
+        """
+        schema: Dict[str, Any] = super().schema_parameters()
+        properties: Dict[str, Any] = schema.get("properties") or {}
+        prop: Dict[str, Any] = properties.get("collection_names") or {}
+        if not prop:
+            return schema
+
+        described = KbCollectionRegistry.described()
+        if not described:
+            # 注册表尚未加载（或确实没有带描述的集合）→ 不下发枚举、也不编造候选。
+            # 这比下发一个空 enum 诚实：空取值域会让模型无从选择。
+            prop["description"] = _COLLECTION_PARAM_BASE_DESC
+            return schema
+
+        # 每个取值都带一句来自集合自身元数据的描述——只给名字不给出语义，模型仍然只能盲选。
+        lines: List[str] = [
+            f"- {row.name}：{row.description.strip()}" for row in described
+        ]
+        prop["description"] = (
+            f"{_COLLECTION_PARAM_BASE_DESC}\n可用集合：\n" + "\n".join(lines)
+        )
+        # ⚠️ 枚举必须挂在 items 上：挂在数组同一层的 enum 会被解读为
+        # "整个数组只能恰好等于这几个值之一"，而不是"元素只能从这几个值里取"。
+        prop["items"] = {"type": "string", "enum": [row.name for row in described]}
+        return schema
         
     async def execute(self, **kwargs: Any) -> str:
         """异步执行知识库检索并将结构化结果序列化为可供模型阅读的文本块。

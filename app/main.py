@@ -349,6 +349,17 @@ async def lifespan(app: FastAPI):
                 "NOT NULL DEFAULT 'rag'"
             )
         )
+        # 退役列移除：``retrieval_hint`` 已废弃——集合的路由语义由 ``description``
+        # 唯一承载。项目无 Alembic，因此沿用同一套启动期幂等 DDL；``IF EXISTS``
+        # 保证在已删除该列的库上重复启动不报错。
+        # ⚠️ 不可逆：回滚只能用部署前导出的
+        # ``SELECT name, retrieval_hint FROM vector_collections;`` 回灌重建。
+        await conn.execute(
+            text(
+                "ALTER TABLE vector_collections "
+                "DROP COLUMN IF EXISTS retrieval_hint"
+            )
+        )
     logger.info(f"⏱️  PostgreSQL 数据库建表初始化完成，耗时: {time.perf_counter() - t_db:.3f}s")
 
     # ==========================================

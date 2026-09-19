@@ -8,7 +8,7 @@
     1. Milvus 向量 —— metadata 里带 ``document_id`` / ``chunk_index`` /
        ``filename`` / ``collection``；
     2. Postgres —— ``documents``（文件与集合标签）、``document_chunks``（切片正文 +
-       ``vector_id``）、``vector_collections``（集合的 description / retrieval_hint）。
+       ``vector_id``）、``vector_collections``（集合的 description）。
 
 Milvus 侧被清空（例如历史遗留的 ``MILVUS_KB_OVERWRITE=true`` 启动即 drop 重建集合）
 时，Postgres 那半边完好无损。所以恢复检索能力只要拿 ``document_chunks.content``
@@ -17,8 +17,8 @@ Milvus 侧被清空（例如历史遗留的 ``MILVUS_KB_OVERWRITE=true`` 启动�
     - 切片边界与原文完全一致（直接复用已存切片，不重新分块）；
     - ``document_id`` / ``filename`` / ``collection`` 全部沿用 Postgres 原值 →
       Milvus 与 Postgres 的文档身份继续对齐，``GET /vector/collections`` 立刻恢复；
-    - 集合的 description / retrieval_hint 存在 ``vector_collections`` 表里，本脚本
-      **完全不碰**，因此不需要再填一遍上传表单。
+    - 集合的 description 存在 ``vector_collections`` 表里，本脚本**完全不碰**，
+      因此不需要再填一遍上传表单。
 
 ## 只补缺，不重复灌（重要）
 

@@ -39,16 +39,16 @@ from app.core.agent.step_correction import (  # noqa: E402
 FACTS = [
     {"name": "客户线索台账.xlsx",
      "location": "raw_data/sales_intel/客户线索台账.xlsx",
-     "tool": "local_excel_read_tool"},
+     "tool": "sales_sql_query"},
     {"name": "产品与报价表.xlsx",
      "location": "raw_data/sales_intel/产品与报价表.xlsx",
-     "tool": "local_excel_read_tool"},
+     "tool": "sales_sql_query"},
     {"name": "销售业绩月度表.xlsx",
      "location": "raw_data/sales_intel/销售业绩月度表.xlsx",
-     "tool": "local_excel_read_tool"},
+     "tool": "sales_sql_query"},
 ]
 
-ALLOWED_WITH_EXCEL = ["local_excel_read_tool", "rag_knowledge_search", "web_search"]
+ALLOWED_WITH_EXCEL = ["sales_sql_query", "rag_knowledge_search", "web_search"]
 
 _DEPS = SimpleNamespace(tracer=None)  # trace_event 对 tracer=None 是安全的
 
@@ -99,7 +99,7 @@ def test_asset_description_carries_verbatim_location():
 # ═══════════════════════════════════════════════════════════════════════════
 def test_attempted_asset_is_excluded():
     state = _state(subtask_results=[_rec(
-        tool_name="local_excel_read_tool",
+        tool_name="sales_sql_query",
         action_input={"file_path": "raw_data/sales_intel/客户线索台账.xlsx"},
     )])
     ids = [item.id for item in build_candidates(state).candidates]
@@ -114,7 +114,7 @@ def test_attempted_asset_is_excluded():
 def test_basename_only_match_counts_as_attempted():
     """覆盖"模型自己拼了目录、但文件名写对"的情形。"""
     state = _state(subtask_results=[_rec(
-        tool_name="local_excel_read_tool",
+        tool_name="sales_sql_query",
         action_input={"file_path": "/some/other/dir/客户线索台账.xlsx"},
     )])
     hit = attempted_asset_locations(FACTS, state["subtask_results"])
@@ -266,7 +266,7 @@ def test_translate_asset_builds_tool_and_verbatim_path():
         allowed_tools=ALLOWED_WITH_EXCEL, facts=FACTS,
     )
     assert action is not None
-    assert action["tool_name"] == "local_excel_read_tool"
+    assert action["tool_name"] == "sales_sql_query"
     assert action["action_input"]["file_path"] == "raw_data/sales_intel/客户线索台账.xlsx"
 
 

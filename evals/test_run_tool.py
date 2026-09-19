@@ -47,7 +47,7 @@ def test_reconcile_bypass_backfill_when_steps_missing():
         called,
         expected_tool="knowledge_graph_search",
         acceptable_tools=[
-            "local_excel_read_tool",
+            "sales_sql_query",
             "file_read_tool",
             "rag_knowledge_search",
         ],

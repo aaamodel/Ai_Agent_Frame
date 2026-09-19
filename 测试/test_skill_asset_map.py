@@ -30,9 +30,9 @@ SKILL_MD = """# 公司销售情报与销售分析助手
 
 | 资产 | 位置 | 用途(调用工具）                                             |
 |------|------|------------------------------------------------------|
-| 客户线索台账.xlsx | `raw_data/sales_intel/客户线索台账.xlsx` | 线索查询（local_excel_read_tool）/ 单格更新（local_excel_write_tool，人工审批） |
-| 产品与报价表.xlsx | `raw_data/sales_intel/产品与报价表.xlsx` | 产品的报价与毛利查询（local_excel_read_tool）                         |
-| 销售业绩月度表.xlsx | `raw_data/sales_intel/销售业绩月度表.xlsx` | 业绩分析（local_excel_read_tool）                               |
+| 客户线索台账.xlsx | `raw_data/sales_intel/客户线索台账.xlsx` | 线索查询（sales_sql_query）/ 单格更新（sales_sql_write，人工审批） |
+| 产品与报价表.xlsx | `raw_data/sales_intel/产品与报价表.xlsx` | 产品的报价与毛利查询（sales_sql_query）                         |
+| 销售业绩月度表.xlsx | `raw_data/sales_intel/销售业绩月度表.xlsx` | 业绩分析（sales_sql_query）                               |
 
 注意：数据基准目录是项目根（本表路径均为相对项目根的路径）。
 """
@@ -53,8 +53,8 @@ def test_extracts_all_assets_verbatim():
 
 def test_extracts_the_consuming_tool():
     facts = {fact.name: fact for fact in extract_asset_facts(SKILL_MD)}
-    assert facts["客户线索台账.xlsx"].tool == "local_excel_read_tool"
-    assert facts["销售业绩月度表.xlsx"].tool == "local_excel_read_tool"
+    assert facts["客户线索台账.xlsx"].tool == "sales_sql_query"
+    assert facts["销售业绩月度表.xlsx"].tool == "sales_sql_query"
 
 
 def test_locations_are_free_of_backticks_and_spaces():

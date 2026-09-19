@@ -81,7 +81,7 @@ _SUMMARY_SYSTEM_PROMPT = """你是最终总结助手，同时负责"证据充分
    - sufficient=false 的**唯一**情形：没有任何一条子任务结论能支撑回答（全部为空数据/错误/跑题）。
    - 只要能给出部分可靠答案，就必须 sufficient=true，并在答案中说明已知部分与缺口。
    - **操作类任务硬规则**：用户要的是"修改/更新/写入/导出/删除"等动作（不是查信息）时，
-     只要对应的写操作子任务（local_excel_write_tool / sales_report_export_tool 等）状态
+     只要对应的写操作子任务（sales_sql_write / sales_report_export_tool 等）状态
      不是 ok（error、审批拒绝、empty_data 等），sufficient 一律为 false——
      **严禁把"更新失败/未执行，请手动修改"包装成成功答复**；应说明哪一步失败、为什么失败。
    - 严禁偷懒（动辄 false 回避作答），也严禁拿着跑题数据编造答案。
@@ -242,7 +242,7 @@ async def summarize_node(state: AgentGraphState, config: RunnableConfig) -> dict
         if not verdict["suggestion"]:
             verdict["suggestion"] = (
                 "根据错误信息修正参数后重试写操作；修改某条记录优先使用 "
-                "local_excel_write_tool 的 filter_column+filter_value+target_column+new_value "
+                "sales_sql_write 的 table+filter_column+filter_value+target_column+new_value "
                 "语义模式（不要自己算 A1 坐标）；审批被拒则不要重复提交。"
             )
 

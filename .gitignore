@@ -61,3 +61,9 @@ docker-compose副本.yml
 
 # ===== WorkBuddy 项目记忆（本地私有） =====
 .workbuddy
+
+# superpowers brainstorming companion (视觉伴侣的临时产物)
+.superpowers/
+
+# 运行时生成物（ChromaDB 索引 / SQLite 库，可由 seed.py 与 train_vanna 重建）
+data/

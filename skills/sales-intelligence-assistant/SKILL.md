@@ -4,7 +4,7 @@ description: |
   公司销售情报与销售分析助手。当用户咨询产品信息与卖点、查找/评估/跟进销售线索、分析销售业绩与漏斗、
   调研竞品与市场情报、制定客户拜访或报价策略时激活。
   不适用于：与销售业务无关的通用闲聊、公司制度/报销咨询（走 finance 技能）、纯技术实现问题。
-allowed-tools: rag_knowledge_search local_excel_read_tool local_excel_query_tool local_excel_write_tool sales_report_export_tool web_search file_read_tool file_grep_tool
+allowed-tools: rag_knowledge_search sales_sql_query sales_sql_write sales_report_export_tool web_search file_read_tool file_grep_tool
 license: Proprietary
 ---
 
@@ -22,58 +22,63 @@ license: Proprietary
 
 ## 数据资产地图（先看这里）
 
-| 资产 | 位置 | 用途(调用工具）                                             |
-|------|------|------------------------------------------------------|
-| 客户线索台账.xlsx | `raw_data/sales_intel/客户线索台账.xlsx` | 线索查询（local_excel_read_tool）/ 单格更新（local_excel_write_tool，人工审批） |
-| 产品与报价表.xlsx | `raw_data/sales_intel/产品与报价表.xlsx` | 产品的报价与毛利查询（local_excel_read_tool）                         |
-| 销售业绩月度表.xlsx | `raw_data/sales_intel/销售业绩月度表.xlsx` | 业绩分析（local_excel_read_tool）                               |
-| 输赢单分析表.xlsx | `raw_data/sales_intel/输赢单分析表.xlsx` | 关闭商机归因明细（local_excel_read_tool），赢单/输单数量与金额须与月度汇总对账        |
-| 竞品追踪台账.xlsx | `raw_data/sales_intel/竞品追踪台账.xlsx` | 竞品档案与竞争对手的销售情况（local_excel_read_tool） |
-| 市场活动效果.xlsx | `raw_data/sales_intel/市场活动效果.xlsx` | 市场活动线索质量与转化效果（local_excel_read_tool），线索明细与台账关联            
+**业务数据已经入库（SQLite 销售业务库），不要再按文件路径读 Excel。**
 
-注意：数据基准目录是项目根（本表路径均为相对项目根的路径）。调用 `local_excel_read_tool` 时 `file_path` 必须**逐字使用上表中的路径（如 `raw_data/sales_intel/销售业绩月度表.xlsx`）**，严禁臆造、改写、拼接或补全文件名/路径（例如禁止把 `销售业绩月度表.xlsx` 改成 `8月销售业绩报表.xlsx`）。部署位置变更时需同步更新本表路径。
+| 业务表 | 内容 | 取数方式 |
+|------|------|------|
+| `线索` | 客户线索台账（主键 `线索编号`） | `sales_sql_query` |
+| `市场活动` | 市场活动明细与转化效果（线索明细与台账关联） | `sales_sql_query` |
+| `竞品` / `竞品动态` | 竞品档案与动态时间线 | `sales_sql_query` |
+| `输赢单` | 关闭商机归因明细（赢单/输单数量与金额须与 `月度业绩` 对账） | `sales_sql_query` |
+| `月度业绩` | 月度经营指标 | `sales_sql_query` |
+| `产品` | 产品目录、报价与毛利 | `sales_sql_query` |
+
+改记录 → `sales_sql_write`（条件必须唯一命中一行）。
+
+**规则与口径不在库里，分两处：**
+
+- **字段口径与判据**（如"ICP 达标 ＝ 员工规模 ≥ 200"、"赢单率 = 赢单数/(赢单数+输单数)"）
+  **已预置进取数引擎**——直接问即可，**不要自己假设阈值或公式**；
+- **阶段流转规则 / 折扣权限与审批规则 / 产品组合与折扣策略** → `rag_knowledge_search`
+  （`collection_names: ["sales_kb"]`）。
+
+⚠️ `raw_data/sales_intel/*.xlsx` 仍然保留，但已**降级为导出视图**，不是数据源；
+不要用它们取数，也不要用 `file_list_tool` 去找它们。
 上线验收与回归测试使用 `raw_data/sales_intel/销售助手评测问题集.md`（人工执行，不作为 Agent 数据源）。
 
 ## 工具使用规则（按优先级）
 
-1. **产品/竞品/方法论类事实** → 先用 `rag_knowledge_search`（指定 `collection_names: ["sales_kb"]`），私有知识库有答案就用私有答案；
-2. **台账/业绩/报价数据** → 精确取数/汇总计算/透视/TopN/环比等"要算答案"的问题优先用 `local_excel_query_tool`（自然语言直接在**全量数据**上算，一次出结果）；只需看表结构/列名或简单按列筛行时用 `local_excel_read_tool`，先读"字段字典"sheet 确认字段含义，再读数据 sheet；
+1. **产品/竞品/方法论/规则口径类事实** → 先用 `rag_knowledge_search`（指定 `collection_names: ["sales_kb"]`），私有知识库有答案就用私有答案；
+2. **业务数据取数/统计** → 一律用 `sales_sql_query`，**只传一句中文问题**即可（筛选、分组聚合、透视、排序、TopN、占比、同环比、多表关联都支持）。**不要**再构造文件路径 / 工作表名 / 过滤列这类参数，也不要用 `file_list_tool` 去找 xlsx——业务数据不在文件里；
 3. **外部公司最新情报**（客户公司动态、竞品新闻、融资、招标）→ 用 `web_search`，结果必须标注来源与日期，并按竞品手册的"情报可信度分级"标注可信度；
 4. **多步骤任务**（如"给10个高优先级线索制定跟进计划"）→ 先在心智上排出步骤顺序再逐步执行；每完成一步在回复里说明进度，全部完成后给出汇总结论；
-5. **首次定位数据文件前，先用 `file_read_tool` 读取本 SKILL.md**（Source File 见技能摘要），严格按「数据资产地图」选择 `file_path`；若仍需确认实际文件，用 `file_list_tool`/`file_grep_tool` 在 `raw_data/` 下探查真实文件名，**绝不以臆造的文件名直接调用 `local_excel_read_tool`**；
-6. **写操作（台账单格更新/报表导出）** → 分别用 `local_excel_write_tool`、`sales_report_export_tool`；两者都是高危写操作，**调用后会中断等待人工审批**，审批通过才执行，被拒绝则不得重试，改用文字回复用户。
+5. **规则类问题（阶段流转 / 折扣权限 / 组合策略）** → 走 `rag_knowledge_search`，**不要**试图用 SQL 去查——业务库里没有这些表；
+6. **写操作（记录修改/报表导出）** → 分别用 `sales_sql_write`、`sales_report_export_tool`；两者都是高危写操作，**调用后会中断等待人工审批**，审批通过才执行，被拒绝则不得重试，改用文字回复用户。
 
-### Excel 读取协议（重要）
+### 业务库取数协议（重要）
 
-**优先用 `local_excel_query_tool` 回答"是多少/有哪些/排名/占比/趋势"类问题**：
-它把整 sheet 的全量数据载入后用 pandas 计算，参数只有 `file_path` + 一句中文 `query`
-（多 sheet 文件给 `sheet_name`）。⚠️ 铁律：**目标数据不在预览/样例行里，绝不代表数据不存在**——
-query 工具跑的是全量数据；问"2026年8月赢单金额"就直接问，不要因为只在前几行看到上半年数据
-就判"8 月无数据"（历史事故：8 月数据在第 12 行，误判后空转十几轮）。
+**一句中文问题直接问**，参数只有 `question`：工具会在库上生成并执行 SQL，返回结构化结果。
 
-`local_excel_read_tool` 是**摘要制**读取，用于看结构与简单算子，不要一次索要整表：
-- **不传 `sheet_name`** → 返回该文件**所有 sheet** 的 列名 / 行列数 / 前 5 行，一次就能看清有哪些表、字段叫什么（不必猜 sheet 名，字段字典 sheet 的列名也会一并列出）；
-- 看某条/某类记录 → `sheet_name` + `filter_column` + `filter_value`（包含匹配，不区分大小写）；**带过滤参数时单 sheet 文件可省略 sheet_name，多 sheet 必填**；
-- **统计类问题优先 `local_excel_query_tool`**；简单单列汇总也可走 `group_by` + `agg_column`（`agg_func` 默认 sum），聚合在工具内完成——不要自己从明细里累加，既慢又容易算错；
-- 需要更多明细 → 调大 `head_rows`（默认 5，最大 50）；
-- 读单格 → 传 `cell`（如 "D7"），工具会顺带返回该列的列名。
+- 统计类问题（"是多少/有哪些/排名/占比/趋势"）**直接算**，不要先取明细再自己累加——既慢又容易算错；
+- 结果里会附上生成的 SQL，可用于自查；若 SQL 与你的预期不符，**换一种问法**
+  （明确时间范围 / 对象 / 口径），而不是自己改写 SQL 或去读文件绕开工具；
+- ⚠️ 铁律：**检索结果为空 ≠ 数据不存在**。换一个更宽的条件再试一次，再下结论。
+  （历史事故：曾因只看到部分数据就判"该月无数据"，空转十余轮。）
+- **需要口径时不要自己假设**：ICP 达标、赢单率、ACV 口径等已预置进取数引擎，直接问即可。
 
-### 台账更新协议（写操作纪律）
+### 记录修改协议（写操作纪律）
 
-`local_excel_write_tool` 有三种模式：
-1. **【推荐】语义定位更新**：`filter_column` + `filter_value`（唯一定位一行）+ `target_column` + `new_value`，
-   单元格坐标由工具内部计算——**严禁自己数行列、手算 B3/J3 这类坐标**（历史事故：第 10 列"负责人"
-   被数成 B 列，把公司名写成了人名）。条件命中 0 行或多行会被拒绝，需先收紧/核对条件；
-2. **批量** `rows`（JSON 数组：对象数组，或「首行为列名」的二维数组）+ `write_mode`
-   （`append` 默认追加 / `replace` 覆盖该 sheet）。需要落多行结果（汇总表、清单）时用 `rows` 一次写完，**不要一格一格写**；
-3. **单格** `cell`+`value`：仅在已通过读取确认过坐标时使用。
+`sales_sql_write` 的参数：`table` + `filter_column` / `filter_value`（唯一定位一行）
++ `target_column` / `new_value`。
 
-改台账走语义模式，该模式立即落盘且**调用即触发人工审批**，因此：
-1. 先用 local_excel_read_tool / local_excel_query_tool 定位目标线索，向用户复述"我将更新 XX 公司的 XX 字段：旧值 A → 新值 B"；
-2. 得到用户确认后再用语义四参数 write（系统会二次弹出人工审批）；
-3. 一次只改与本次操作直接相关的字段（如状态、最近跟进日期、MEDDIC 评分、下一步动作），**绝不重写整行**；
-4. 涉及金额、负责人变更时，必须同时更新"备注"说明变更原因与日期；
-5. 审批拒绝或写入失败立即停止并报告，不要盲目重试或换工具绕过审批。
+- 条件**必须唯一命中一行**：命中 0 行或多行都会被拒绝（防一次误改一批），需先收紧 / 核对条件；
+- **严禁自己拼 SQL**：表名与列名由工具按白名单校验，传错会返回真实列清单供你纠正；
+- 改记录**调用即触发人工审批**，因此：
+  1. 先用 `sales_sql_query` 定位目标记录，向用户复述"我将更新 XX 公司的 XX 字段：旧值 A → 新值 B"；
+  2. 得到用户确认后再调用写入（系统会二次弹出人工审批）；
+  3. 一次只改与本次操作直接相关的字段（如状态、最近跟进日期、MEDDIC 评分、下一步动作），**绝不重写整行**；
+  4. 涉及金额、负责人变更时，必须同时更新"备注"说明变更原因与日期；
+  5. 审批拒绝或写入失败立即停止并报告，不要盲目重试或换工具绕过审批。
 
 ### 报表导出协议（sales_report_export_tool）
 

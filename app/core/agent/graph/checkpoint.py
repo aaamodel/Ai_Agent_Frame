@@ -159,3 +159,46 @@ def snapshot_exists(snapshot: Any) -> bool:
     if snapshot is None:
         return False
     return bool(snapshot_values(snapshot)) or bool(snapshot_next_nodes(snapshot))
+
+
+# ---------------------------------------------------------------------------
+# 线程枚举（待审批列表）
+# ---------------------------------------------------------------------------
+async def alist_thread_ids(checkpointer: Any, *, max_threads: int = 500) -> List[str]:
+    """枚举 checkpointer 中全部 run（thread）id，最新检查点所属线程在前、去重。
+
+    - InMemorySaver：直接读其 ``storage``（thread_id -> {checkpoint_id: tuple}）；
+    - 其它后端（AsyncRedisSaver 等）：走标准 ``alist(None)``，按返回顺序去重
+      （标准实现按 checkpoint 时间倒序产出，因此每线程第一次出现即为最新）。
+
+    后端不支持全量列举时返回空列表并告警——调用方据此诚实返回，不抛 500。
+    """
+    # InMemorySaver 的内存字典是公开属性，读键即可，免去逐条 aget_tuple
+    storage = getattr(checkpointer, "storage", None)
+    if isinstance(storage, dict):
+        return list(storage.keys())[:max_threads]
+
+    thread_ids: List[str] = []
+    seen: set = set()
+    try:
+        async for checkpoint_tuple in checkpointer.alist(None):
+            configurable = (
+                (getattr(checkpoint_tuple, "config", None) or {}).get("configurable") or {}
+            )
+            thread_id = configurable.get("thread_id")
+            if thread_id and thread_id not in seen:
+                seen.add(thread_id)
+                thread_ids.append(str(thread_id))
+                if len(thread_ids) >= max_threads:
+                    break
+    except Exception as enumerate_error:  # noqa: BLE001 — 列举是辅助能力，失败降级空列表
+        logger.warning("枚举 checkpointer 线程失败（待审批列表将为空）: {}", enumerate_error)
+        return []
+    return thread_ids
+
+
+def checkpointer_backend_name(checkpointer: Any) -> str:
+    """按实例类型推断后端名（列表接口要告诉前端内存模式下重启即失效）。"""
+    if isinstance(checkpointer, InMemorySaver):
+        return BACKEND_MEMORY
+    return BACKEND_REDIS

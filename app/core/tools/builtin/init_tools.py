@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker  # 假设你使用的工�
 
 from app.core.tools.builtin.feishu import FeishuBitableTool
 from app.core.tools.builtin.graph_search import KnowledgeGraphSearchTool
-from app.core.tools.builtin.localexcel import LocalExcelReadTool, LocalExcelWriteTool
-from app.core.tools.builtin.excel_query import LocalExcelQueryTool
+
+from app.core.tools.builtin.sql_vanna import SalesSqlQueryTool, SalesSqlWriteTool
 from app.core.tools.builtin.sales_report import SalesReportExportTool
 from app.core.tools.builtin.rag_search import RagSearchTool
 from app.core.tools.registry import ToolRegistry
@@ -65,14 +65,14 @@ def bootstrap_tools(
     registry.register(db_describe_table_tool)
     registry.register(db_list_table_tool)
     """
-    # 🌟【改动点 3】Excel 工具注入规范数据根（fs_backend.cwd），
-    # 让相对路径稳定解析到项目根，并在模型臆造路径时返回真实文件清单接地。
-    # 读 / 写 拆分为两个独立工具名：读不审批，写进危险名单走人工审批。
-    registry.register(LocalExcelReadTool(base_dir=str(fs_backend.cwd)))
-    registry.register(LocalExcelWriteTool(base_dir=str(fs_backend.cwd)))
-    # 自然语言表格查询（只读，不审批）：全量数据 pandas 取数 + AST 护栏 + 报错自修复，
-    # LLM 通道复用全局 ModelRouter（代码生成走 react/FAST tier）。
-    registry.register(LocalExcelQueryTool(base_dir=str(fs_backend.cwd), model_router=model_router))
+    # ── 销售业务库（SQLite）自然语言取数 ──────────────────────────────
+    # Excel 取数三件套已退役（见变更 migrate-sales-excel-to-sqlite-vanna）：
+    # Excel 不携带 schema，模型只能猜列名与类型，于是要补偿出 9 个参数、difflib 模糊匹配、
+    # "预览几行"推断结构——换到 SQLite 后 schema 由建表语句定死，这些补偿全部不需要。
+    # ⚠️ 查询工具只读（另有只读护栏拒绝非 SELECT）；写工具登记进危险名单走人工审批。
+    registry.register(SalesSqlQueryTool())
+    registry.register(SalesSqlWriteTool())
+
     # 销售分析报表导出（写操作，人工审批）
     registry.register(SalesReportExportTool(base_dir=str(fs_backend.cwd)))
 

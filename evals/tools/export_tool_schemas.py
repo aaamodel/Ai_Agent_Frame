@@ -69,7 +69,7 @@ STATIC_TOOL_CATALOG: List[Dict[str, Any]] = [
         "source_file": "app/core/tools/builtin/doubao_search.py",
     },
     {
-        "name": "local_excel_read_tool",
+        "name": "sales_sql_query",
         "description": "本地表格只读（pandas 摘要/过滤/聚合，不审批）。",
         "parameters": {"type": "object", "properties": {
             "file_path": {"type": "string", "description": "表格路径（绝对或相对项目根）"},
@@ -82,10 +82,10 @@ STATIC_TOOL_CATALOG: List[Dict[str, Any]] = [
             "agg_func": {"type": "string", "description": "sum/mean/count/max/min/median"},
             "head_rows": {"type": "integer", "description": "展示行数，默认 5"},
         }, "required": ["file_path"]},
-        "source_file": "app/core/tools/builtin/localexcel.py",
+        "source_file": "app/core/tools/builtin/sql_vanna.py",
     },
     {
-        "name": "local_excel_query_tool",
+        "name": "sales_sql_query",
         "description": "自然语言直接查询/统计本地 Excel/CSV（全量数据 pandas 计算，只读不审批）：筛选、分组、透视、TopN、环比、跨列运算均支持。",
         "parameters": {"type": "object", "properties": {
             "file_path": {"type": "string", "description": "表格路径（绝对或相对项目根）"},
@@ -95,7 +95,7 @@ STATIC_TOOL_CATALOG: List[Dict[str, Any]] = [
         "source_file": "app/core/tools/builtin/excel_query.py",
     },
     {
-        "name": "local_excel_write_tool",
+        "name": "sales_sql_write",
         "description": "本地表格写入（危险工具，走人工审批）：语义定位更新（推荐）/ 单格 / 批量。",
         "parameters": {"type": "object", "properties": {
             "file_path": {"type": "string", "description": "目标表格路径"},
@@ -109,7 +109,7 @@ STATIC_TOOL_CATALOG: List[Dict[str, Any]] = [
             "rows": {"type": "string", "description": "批量模式：JSON 数组（对象数组或首行为列名的二维数组）"},
             "write_mode": {"type": "string", "description": "append（默认）/ replace"},
         }, "required": ["file_path"]},
-        "source_file": "app/core/tools/builtin/localexcel.py",
+        "source_file": "app/core/tools/builtin/sql_vanna.py",
     },
     {
         "name": "sales_report_export_tool",

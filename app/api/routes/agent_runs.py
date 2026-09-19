@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Agent 运行态 API（2.2 标准档 HITL）：
 
+- GET  /agent/approvals/pending         列出全部暂停等待人工审批的 run（含区分摘要）
 - GET  /agent/runs/{run_id}            查询运行快照（是否暂停/下一节点/interrupt 载荷）
 - POST /agent/runs/{run_id}/approval   审批决策后从 interrupt 点恢复（SSE 续流）
 
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -44,6 +45,21 @@ class ApprovalDecision(BaseModel):
 
     approved: bool = Field(..., description="是否批准本次危险工具调用")
     comment: str = Field(default="", description="审批意见（拒绝时回注给模型）")
+
+
+@router.get("/agent/approvals/pending")
+async def list_pending_approvals(
+    limit: int = Query(default=50, ge=1, le=200, description="最多返回条数"),
+    agent_graph_runner: Any = Depends(get_agent_graph_runner),
+) -> Dict[str, Any]:
+    """列出全部暂停等待人工审批的 run。
+
+    返回 ``backend``（memory=进程内、重启即失效；redis=可跨进程/重启）与每条 run 的
+    区分摘要：run_id/session_id/trace_id/原始问题/意图/模式/计划进度/暂停时间，
+    以及审批内容（工具名、参数预览、subtask_id、模型思考）。
+    完整工具入参再用 GET /agent/runs/{run_id} 查看。
+    """
+    return await agent_graph_runner.list_paused_runs(limit=limit)
 
 
 @router.get("/agent/runs/{run_id}")

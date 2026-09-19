@@ -103,7 +103,7 @@ class SalesReportExportTool(BaseTool):
         if not self._content_is_substantive(content):
             return (
                 "错误：报表正文缺少实质业务数据，已拒绝导出（未落盘、未消耗审批）。"
-                "请先完成取数再导出：用 local_excel_read_tool 指定 sheet_name，"
+                "请先完成取数再导出：用 sales_sql_query 查询，"
                 "并按 filter_column+filter_value 精确定位目标期间（例如 月份=2026-08），"
                 "拿到具体指标数值后再汇总成报表正文。"
             )

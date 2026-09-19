@@ -22,6 +22,8 @@ from loguru import logger
 
 from app.core.agent.graph.checkpoint import (
     aget_snapshot,
+    alist_thread_ids,
+    checkpointer_backend_name,
     is_paused_for_approval,
     snapshot_exists,
     snapshot_interrupts,
@@ -213,6 +215,71 @@ class GraphRunner:
             "mode_used": values.get("mode_used"),
             "success": values.get("success"),
         }
+
+    # ------------------------------------------------------------------
+    async def list_paused_runs(self, *, limit: int = 50) -> Dict[str, Any]:
+        """供 GET /agent/approvals/pending：列出全部暂停等待人工审批的 run。
+
+        枚举 checkpointer 中的线程，逐个读最新快照，只保留
+        ``next 非空且存在未处理 interrupt`` 的 run。每条带区分度摘要
+        （原始问题/会话/trace/模式/计划进度/暂停时间）与审批内容精简版，
+        避免"多个图审批内容相同无法区分"。
+        """
+        backend: str = checkpointer_backend_name(self._checkpointer)
+        if self._checkpointer is None:
+            return {"backend": "none", "count": 0, "items": []}
+
+        items: List[Dict[str, Any]] = []
+        for run_id in await alist_thread_ids(self._checkpointer):
+            try:
+                snapshot: Any = await aget_snapshot(self._graph, run_id)
+            except Exception:  # noqa: BLE001 — 单条损坏不拖垮整个列表
+                logger.warning("读取 run 快照失败，已跳过: {}", run_id)
+                continue
+            if not snapshot_exists(snapshot) or not is_paused_for_approval(snapshot):
+                continue
+
+            values: Dict[str, Any] = snapshot_values(snapshot)
+            intent: Dict[str, Any] = values.get("intent") or {}
+            plan = values.get("plan") or []
+            cursor = int(values.get("cursor") or 0)
+            created_at = getattr(snapshot, "created_at", None)
+            # langgraph 各版本 created_at 类型不一（datetime 或 ISO 字符串），统一成字符串
+            paused_at = created_at.isoformat() if hasattr(created_at, "isoformat") else created_at
+
+            # 审批载荷：列表只给预览（完整 arguments 在 GET /agent/runs/{run_id}）
+            approvals: List[Dict[str, Any]] = []
+            for payload in snapshot_interrupts(snapshot):
+                approvals.append({
+                    "type": payload.get("type", "tool_approval"),
+                    "tool_name": payload.get("tool_name", ""),
+                    "arguments_preview": payload.get("arguments_preview", ""),
+                    "source": payload.get("source", ""),
+                    "subtask_id": payload.get("subtask_id"),
+                    "thought": payload.get("thought"),
+                })
+
+            session_id = values.get("session_id") or str(run_id).split(":", 1)[0]
+            items.append({
+                "run_id": run_id,
+                "session_id": session_id,
+                "trace_id": values.get("trace_id", ""),
+                "user_input": values.get("user_input", ""),
+                "intent": str(intent.get("intent") or "") if isinstance(intent, dict) else "",
+                "mode_used": values.get("mode_used") or MODE_REACT,
+                "steps_executed": len(values.get("steps") or []),
+                # plan 路径下的进度（react 路径 plan 为空 → 不给该字段）
+                "plan_progress": (
+                    {"cursor": cursor, "total": len(plan)} if plan else None
+                ),
+                "next": list(snapshot.next or ()),
+                "paused_at": paused_at,
+                "approvals": approvals,
+            })
+
+        # 最新暂停的排最前（created_at 缺失的沉底）
+        items.sort(key=lambda item: item.get("paused_at") or "", reverse=True)
+        return {"backend": backend, "count": len(items), "items": items[:limit]}
 
     # ------------------------------------------------------------------
     # 内部
