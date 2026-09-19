@@ -67,3 +67,8 @@ docker-compose副本.yml
 
 # 运行时生成物（ChromaDB 索引 / SQLite 库，可由 seed.py 与 train_vanna 重建）
 data/
+
+# 前端静态资源是**源码**，不应被上面那条 `*.svg`（本意是"生成的架构图"）误伤。
+# 否则新克隆的仓库会缺 favicon —— index.html 引用了 /favicon.svg。
+!web/public/*.svg
+!web/src/assets/*.svg

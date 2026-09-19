@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+/* ⚠️ Tailwind v4：主题配置写在这里，**不存在 tailwind.config.js**。
+   若你发现样式完全没生效，第一个要检查的就是上面这行 @import。 */
+@theme {
+  --color-agent-primary: oklch(0.55 0.22 265);
+  --color-warn-bg: oklch(0.98 0.03 85);
+  --color-warn-border: oklch(0.78 0.15 65);
+  --color-warn-text: oklch(0.45 0.13 55);
+  --color-ok-bg: oklch(0.97 0.03 155);
+  --color-ok-border: oklch(0.75 0.16 155);
+  --color-ok-text: oklch(0.42 0.12 155);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+}
