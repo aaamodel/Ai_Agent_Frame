@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+/* Markdown 排版插件：Agent 的回答里全是表格 / SQL / 长路径，
+   没有它，Markdown.tsx 里的 `prose` 类就是无效类，内容会渲染成无样式裸文本。
+   Tailwind v4 用 CSS 内的 @plugin 挂载插件（v3 是写在 tailwind.config.js 的 plugins 数组）。 */
+@plugin "@tailwindcss/typography";
+
 /* ⚠️ Tailwind v4：主题配置写在这里，**不存在 tailwind.config.js**。
    若你发现样式完全没生效，第一个要检查的就是上面这行 @import。 */
 @theme {
