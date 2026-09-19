@@ -19,7 +19,11 @@ from app.llm_model_router.model_router_config import (
 # 导入期计时起点：放在所有重型依赖导入之前，用于量化 import 阶段耗时
 _IMPORT_T0 = time.perf_counter()
 
-from fastapi import FastAPI
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from sqlalchemy import text
 import redis.asyncio as aioredis
@@ -465,6 +469,42 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 所有资源已安全关闭，服务顺利下线")
 
 
+def _mount_frontend(application: FastAPI, dist_dir: Path) -> None:
+    """把前端构建产物挂到应用上；``dist_dir`` 不存在时安静跳过。
+
+    设计要点（见 docs/superpowers/specs/2026-09-19-agent-console-frontend-design.md 4.1）：
+      - 真实静态文件走 StaticFiles
+      - **非 /api/ 前缀**的未知路径回退 index.html（前端路由刷新不 404）
+      - **/api/ 前缀一律 404**，绝不能被回退逻辑吞掉——否则前端会把 HTML 当 JSON 解析
+      - dist 不存在时只告警，不影响后端启动（前端尚未构建也能起服务）
+    """
+    index_file = dist_dir / "index.html"
+    if not index_file.is_file():
+        logger.warning(
+            "未找到前端构建产物 {}，跳过静态挂载（后端照常启动）。"
+            "构建命令：cd web && npm run build",
+            index_file,
+        )
+        return
+
+    assets_dir = dist_dir / "assets"
+    if assets_dir.is_dir():
+        application.mount(
+            "/assets", StaticFiles(directory=assets_dir), name="assets"
+        )
+
+    @application.get("/{full_path:path}", include_in_schema=False)
+    async def _spa_fallback(full_path: str) -> FileResponse:
+        # 回退路由注册在 router 之后，因此 /api/v1/* 已由 router 匹配；
+        # 走到这里说明该 /api 路径确实不存在 —— 必须 404，不能用 index.html 冒充。
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        candidate = dist_dir / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(index_file)
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     application = FastAPI(
@@ -477,6 +517,10 @@ def create_app() -> FastAPI:
     application.include_router(agent_runs.router, prefix=settings.api_prefix)
     application.include_router(document.router, prefix=settings.api_prefix)
     application.include_router(kownledgebase.router, prefix=settings.api_prefix)
+
+    # 前端静态托管：必须在所有 router 注册**之后**，回退路由才不会抢在 router 前面
+    # 把 /api/ 请求吃掉。前后端同源，因此不需要任何 CORS 配置。
+    _mount_frontend(application, Path(__file__).resolve().parents[1] / "web" / "dist")
     return application
 
 
