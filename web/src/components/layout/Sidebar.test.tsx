@@ -8,7 +8,7 @@ describe("Sidebar", () => {
   it("三个区导航都在", () => {
     render(
       <MemoryRouter>
-        <Sidebar pendingCount={0} pendingItems={[]} lower={<div />} />
+        <Sidebar pendingCount={0} pendingItems={[]} />
       </MemoryRouter>,
     );
     expect(screen.getByText(/对话/)).toBeInTheDocument();
@@ -19,7 +19,7 @@ describe("Sidebar", () => {
   it("有待审批时不显示角标；有条数时显示数字", () => {
     const { rerender } = render(
       <MemoryRouter>
-        <Sidebar pendingCount={0} pendingItems={[]} lower={<div />} />
+        <Sidebar pendingCount={0} pendingItems={[]} />
       </MemoryRouter>,
     );
     // 用正则而非精确串：角标那行的直接文本是"⚠ 待审批"，精确匹配会漏
@@ -32,7 +32,6 @@ describe("Sidebar", () => {
           pendingItems={[
             { run_id: "r1", session_id: "s1", query: "问一句" } as never,
           ]}
-          lower={<div />}
         />
       </MemoryRouter>,
     );
@@ -43,12 +42,7 @@ describe("Sidebar", () => {
   it("内存后端时如实提示重启会失效", () => {
     render(
       <MemoryRouter>
-        <Sidebar
-          pendingCount={1}
-          pendingItems={[]}
-          backend="memory"
-          lower={<div />}
-        />
+        <Sidebar pendingCount={1} pendingItems={[]} backend="memory" />
       </MemoryRouter>,
     );
     expect(screen.getByText(/后端重启/)).toBeInTheDocument();

@@ -55,13 +55,13 @@ export function DocumentsPage() {
 
   if (!collectionName) {
     return (
-      <div className="p-6">
-        <h1 className="mb-4 text-lg font-semibold">文档</h1>
-        <p className="mb-4 text-sm text-neutral-500">
+      <div className="min-h-0 flex-1 overflow-y-auto p-6">
+        <h1 className="mb-3 text-[18px] font-semibold text-fg">文档</h1>
+        <p className="mb-4 text-sm text-fg-muted">
           从左侧选择或点击下方任一集合，查看其文件并上传。
         </p>
         {collections.isError && (
-          <div className="mb-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <div className="mb-3 rounded-lg border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-text">
             集合列表加载失败：{(collections.error as Error).message}
             <button
               className="ml-2 underline"
@@ -71,37 +71,42 @@ export function DocumentsPage() {
             </button>
           </div>
         )}
-        <table className="w-full text-sm">
-          <thead className="bg-neutral-50 text-left text-neutral-500">
-            <tr>
-              <th className="px-3 py-2">集合</th>
-              <th className="px-3 py-2">描述</th>
-              <th className="px-3 py-2">文件</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(collections.data ?? []).map((c) => (
-              <tr key={c.name} className="border-t border-neutral-100">
-                <td className="px-3 py-2">
-                  <Link
-                    className="text-blue-600 hover:underline"
-                    to={`/documents/${encodeURIComponent(c.name)}`}
-                  >
-                    {c.name}
-                  </Link>
-                </td>
-                <td className="px-3 py-2 text-neutral-500">
-                  {c.description ?? "—"}
-                </td>
-                <td className="px-3 py-2 text-neutral-500">
-                  {c.document_count}
-                </td>
+        <div className="overflow-hidden rounded-lg border border-line">
+          <table className="w-full text-sm">
+            <thead className="bg-surface-2 text-left text-fg-muted">
+              <tr>
+                <th className="px-3 py-2 font-medium">集合</th>
+                <th className="px-3 py-2 font-medium">描述</th>
+                <th className="px-3 py-2 font-medium">文件</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {(collections.data ?? []).map((c) => (
+                <tr
+                  key={c.name}
+                  className="border-t border-line hover:bg-surface-2/60"
+                >
+                  <td className="px-3 py-2">
+                    <Link
+                      className="text-accent-text hover:underline"
+                      to={`/documents/${encodeURIComponent(c.name)}`}
+                    >
+                      {c.name}
+                    </Link>
+                  </td>
+                  <td className="px-3 py-2 text-fg-muted">
+                    {c.description ?? "—"}
+                  </td>
+                  <td className="px-3 py-2 text-fg-muted">
+                    {c.document_count}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
         {!collections.isLoading && (collections.data ?? []).length === 0 && (
-          <div className="py-6 text-center text-sm text-neutral-400">
+          <div className="py-6 text-center text-sm text-fg-subtle">
             还没有集合。上传文档时填写集合名即可创建。
           </div>
         )}
@@ -110,44 +115,44 @@ export function DocumentsPage() {
   }
 
   return (
-    <div className="p-6">
-      <h1 className="text-lg font-semibold">{collectionName}</h1>
-      <p className="mb-4 text-sm text-neutral-500">
+    <div className="min-h-0 flex-1 overflow-y-auto p-6">
+      <h1 className="text-[18px] font-semibold text-fg">{collectionName}</h1>
+      <p className="mb-4 text-sm text-fg-muted">
         {files.data?.description ?? "（该集合暂无描述）"}
       </p>
 
-      <div className="mb-5 rounded border border-neutral-200 p-3">
-        <label className="block text-sm font-medium" htmlFor="kb-file">
+      <div className="mb-5 rounded-lg border border-line bg-surface-2 p-3">
+        <label className="block text-sm font-medium text-fg" htmlFor="kb-file">
           选择文件
         </label>
         <input
           id="kb-file"
           type="file"
-          className="mt-1 block text-sm"
+          className="mt-1 block text-sm text-fg-muted"
           onChange={(e) => setPendingFile(e.target.files?.[0] ?? null)}
         />
         <input
-          className="mt-2 w-full rounded border border-neutral-300 px-2 py-1 text-sm"
+          className="mt-2 w-full rounded-lg border border-line bg-surface-3 px-2 py-1.5 text-sm text-fg placeholder:text-fg-subtle focus:border-accent-ring focus:outline-none"
           placeholder="集合描述（留空则不更新；这个描述会影响后续意图路由）"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
         />
         <button
-          className="mt-2 rounded bg-blue-600 px-3 py-1 text-sm text-white disabled:opacity-40"
+          className="mt-2 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
           disabled={!pendingFile || upload.isPending}
           onClick={() => upload.mutate()}
         >
           上传
         </button>
         {upload.isError && (
-          <div className="mt-2 text-sm text-red-600">
+          <div className="mt-2 text-sm text-danger-text">
             上传失败：{(upload.error as Error).message}
           </div>
         )}
       </div>
 
       {files.isError && (
-        <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+        <div className="rounded-lg border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-text">
           加载失败：{(files.error as Error).message}
           <button className="ml-2 underline" onClick={() => void files.refetch()}>
             重试
@@ -155,40 +160,42 @@ export function DocumentsPage() {
         </div>
       )}
 
-      <table className="w-full text-sm">
-        <thead className="bg-neutral-50 text-left text-neutral-500">
-          <tr>
-            <th className="px-3 py-2">文件</th>
-            <th className="px-3 py-2">切片</th>
-            <th className="px-3 py-2" />
-          </tr>
-        </thead>
-        <tbody>
-          {(files.data?.files ?? []).map((f) => (
-            <tr key={f.filename} className="border-t border-neutral-100">
-              <td className="px-3 py-2">{f.filename}</td>
-              <td className="px-3 py-2 text-neutral-500">
-                {f.chunk_count ?? f.chunks ?? "—"}
-              </td>
-              <td className="px-3 py-2 text-right">
-                <button
-                  className="text-neutral-500 underline"
-                  onClick={() => {
-                    // 二次确认：删除是破坏性操作且不可撤销
-                    if (window.confirm(`确认删除 ${f.filename}？`)) {
-                      remove.mutate(f.filename);
-                    }
-                  }}
-                >
-                  删除
-                </button>
-              </td>
+      <div className="overflow-hidden rounded-lg border border-line">
+        <table className="w-full text-sm">
+          <thead className="bg-surface-2 text-left text-fg-muted">
+            <tr>
+              <th className="px-3 py-2 font-medium">文件</th>
+              <th className="px-3 py-2 font-medium">切片</th>
+              <th className="px-3 py-2" />
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {(files.data?.files ?? []).map((f) => (
+              <tr key={f.filename} className="border-t border-line hover:bg-surface-2/60">
+                <td className="px-3 py-2">{f.filename}</td>
+                <td className="px-3 py-2 text-fg-muted">
+                  {f.chunk_count ?? f.chunks ?? "—"}
+                </td>
+                <td className="px-3 py-2 text-right">
+                  <button
+                    className="text-fg-subtle underline hover:text-danger-text"
+                    onClick={() => {
+                      // 二次确认：删除是破坏性操作且不可撤销
+                      if (window.confirm(`确认删除 ${f.filename}？`)) {
+                        remove.mutate(f.filename);
+                      }
+                    }}
+                  >
+                    删除
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
       {!files.isLoading && (files.data?.files ?? []).length === 0 && (
-        <div className="py-6 text-center text-sm text-neutral-400">
+        <div className="py-6 text-center text-sm text-fg-subtle">
           该集合还没有文件。
         </div>
       )}

@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { deleteKbCollectionFile, getKbCollectionFiles } from "./documents";
+import {
+  deleteKbCollectionFile,
+  getKbCollectionFiles,
+  listKbCollections,
+} from "./documents";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -47,5 +51,53 @@ describe("集合名与文件名的 URL 编码", () => {
     expect(url()).toBe(
       `/api/v1/vector/collections/${encodeURIComponent("客户 线索")}/files/${encodeURIComponent("a b.md")}`,
     );
+  });
+});
+
+/**
+ * 回归：``/vector/collections`` 返回的是 ``{"physical_collection", "collections"}``，
+ * **不是裸数组**。
+ *
+ * ⚠️ 这条必须锁住：``apiGet<T>`` 只做断言转型，运行时不校验，所以把返回类型
+ * 写成 ``Promise<KbCollection[]>`` 是**编译期查不出来**的谎——一进文档区就崩在
+ * ``(collections.data ?? []).map is not a function``。
+ */
+describe("listKbCollections 的返回形态", () => {
+  it("后端返回 {collections:[...]} 时拆出真正的数组", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          physical_collection: "knowledge_base_v3",
+          collections: [
+            { name: "sales_kb", description: "销售", document_count: 2 },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const list = await listKbCollections();
+    expect(Array.isArray(list)).toBe(true);
+    expect(list).toHaveLength(1);
+    expect(list[0]?.name).toBe("sales_kb");
+  });
+
+  it("后端若改成裸数组同样兼容，不再崩在同一个地方", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify([{ name: "x", description: null, document_count: 0 }]),
+        { status: 200 },
+      ),
+    );
+    expect(await listKbCollections()).toHaveLength(1);
+  });
+
+  it("collections 字段缺失时返回空数组，而不是把 undefined 交给页面", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ physical_collection: "p" }), {
+        status: 200,
+      }),
+    );
+    expect(await listKbCollections()).toEqual([]);
   });
 });

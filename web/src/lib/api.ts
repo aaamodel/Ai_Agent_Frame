@@ -52,12 +52,17 @@ export async function apiDelete<T>(path: string): Promise<T> {
   return asJson<T>(await fetch(`${API_BASE}${path}`, { method: "DELETE" }));
 }
 
-export async function apiPostJson<T>(path: string, body: unknown): Promise<T> {
+export async function apiPostJson<T>(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   return asJson<T>(
     await fetch(`${API_BASE}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal,
     }),
   );
 }

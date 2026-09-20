@@ -37,6 +37,33 @@ describe("DocumentsPage", () => {
     );
   });
 
+  /**
+   * 回归：``/vector/collections`` 的真实形态是 ``{physical_collection, collections}``。
+   *
+   * ⚠️ 这条**故意不 mock api 层**——现有用例都把 ``listKbCollections`` mock 成数组，
+   *    与那个错误的类型声明是同一个谎，所以页面从来没在这里被真正验证过，
+   *    用户一进 /documents 就 ``(collections.data ?? []).map is not a function``。
+   *    这里只 mock 最底层的 fetch，让请求真的穿过 api 层的拆包装。
+   */
+  it("集合列表返回对象形态时页面照常渲染（真实链路回归）", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          physical_collection: "knowledge_base_v3",
+          collections: [
+            { name: "sales_kb", description: "销售知识", document_count: 3 },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    renderAt("/documents");
+    await waitFor(() =>
+      expect(screen.getByText("sales_kb")).toBeInTheDocument(),
+    );
+  });
+
   it("显示集合内文件与切片数", async () => {
     vi.spyOn(api, "getKbCollectionFiles").mockResolvedValue({
       name: "sales_kb",

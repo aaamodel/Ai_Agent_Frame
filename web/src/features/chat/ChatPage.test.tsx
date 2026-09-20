@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Link, MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -64,7 +64,10 @@ describe("ChatPage", () => {
     await userEvent.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(spy).toHaveBeenCalled());
-    expect(screen.getByText("优先做哪些行业")).toBeInTheDocument();
+    // 限定在消息区内查找：顶部标题栏会拿首条用户消息当会话名再渲染一遍
+    expect(
+      within(screen.getByTestId("message-list")).getByText("优先做哪些行业"),
+    ).toBeInTheDocument();
   });
 
   it("带 session 参数时从本地恢复历史消息", async () => {
@@ -76,7 +79,9 @@ describe("ChatPage", () => {
 
     renderChat(`/?session=${s.id}`);
     await waitFor(() =>
-      expect(screen.getByText("历史提问")).toBeInTheDocument(),
+      expect(
+        within(screen.getByTestId("message-list")).getByText("历史提问"),
+      ).toBeInTheDocument(),
     );
   });
 
@@ -108,17 +113,20 @@ describe("ChatPage", () => {
     saveSession(a);
     saveSession(b);
 
+    // 会话名会出现在顶部标题栏，因此消息断言一律限定在消息区内
+    const messages = () => within(screen.getByTestId("message-list"));
+
     renderWithSwitcher(`/?session=${a.id}`, `/?session=${b.id}`);
     await waitFor(() =>
-      expect(screen.getByText("会话A的问题")).toBeInTheDocument(),
+      expect(messages().getByText("会话A的问题")).toBeInTheDocument(),
     );
 
     await userEvent.click(screen.getByText("去另一个会话"));
 
     await waitFor(() =>
-      expect(screen.getByText("会话B的问题")).toBeInTheDocument(),
+      expect(messages().getByText("会话B的问题")).toBeInTheDocument(),
     );
-    expect(screen.queryByText("会话A的问题")).not.toBeInTheDocument();
+    expect(messages().queryByText("会话A的问题")).not.toBeInTheDocument();
   });
 
   /**

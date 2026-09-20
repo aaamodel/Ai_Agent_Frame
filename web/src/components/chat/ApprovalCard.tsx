@@ -24,20 +24,25 @@ export function ApprovalCard({
 }) {
   const [comment, setComment] = useState("");
   return (
-    <div className="my-3 rounded-md border border-l-4 border-warn-border border-l-warn-border bg-warn-bg p-3">
-      <div className="mb-1 font-semibold text-warn-text">⚠ 需要你审批</div>
+    <div className="my-3 rounded-lg border border-warn-border border-l-4 border-l-warn-border bg-warn-bg p-3">
+      <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-warn-text">
+        <span>⚠ 需要你审批</span>
+        <span className="rounded-full border border-warn-border px-1.5 text-[11px] font-normal">
+          {request.approvals.length} 项
+        </span>
+      </div>
       <ul className="mb-2 space-y-1 text-sm text-warn-text">
         {request.approvals.map((a, i) => (
           <li
             key={i}
-            className="rounded bg-white/70 px-2 py-1 font-mono text-xs break-all"
+            className="rounded-md bg-surface-0/50 px-2 py-1 font-mono text-xs break-all"
           >
             {describe(a)}
           </li>
         ))}
       </ul>
       <input
-        className="mb-2 w-full rounded border border-neutral-300 px-2 py-1 text-sm"
+        className="mb-2 w-full rounded-lg border border-warn-border/60 bg-surface-0/40 px-2 py-1.5 text-sm text-fg placeholder:text-fg-subtle focus:border-warn-border focus:outline-none"
         placeholder="备注（拒绝时会回注给模型）"
         value={comment}
         onChange={(e) => setComment(e.target.value)}
@@ -45,14 +50,14 @@ export function ApprovalCard({
       />
       <div className="flex gap-2">
         <button
-          className="rounded bg-blue-600 px-3 py-1 text-sm text-white disabled:opacity-50"
+          className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           disabled={disabled}
           onClick={() => onDecide({ approved: true, comment })}
         >
           批准
         </button>
         <button
-          className="rounded border border-neutral-300 bg-white px-3 py-1 text-sm disabled:opacity-50"
+          className="rounded-lg border border-line bg-transparent px-3 py-1.5 text-sm text-fg-muted transition-colors hover:bg-surface-2 hover:text-fg disabled:opacity-50"
           disabled={disabled}
           onClick={() => onDecide({ approved: false, comment })}
         >
