@@ -83,4 +83,36 @@ describe("Message", () => {
     );
     expect(screen.getByText(/审批已失效/)).toBeInTheDocument();
   });
+
+  // ---------- 换候选废弃段落：保留并标注，不静默丢弃 ----------
+
+  it("被废弃的半截答案仍然可见，且带明确标注", () => {
+    render(
+      <Message
+        message={msg({
+          text: "第二候选的答案",
+          abandoned: ["第一候选的开头"],
+        })}
+        isStreaming={false}
+        onApprove={vi.fn()}
+      />,
+    );
+    // 废弃内容没有被丢掉
+    expect(screen.getByText("第一候选的开头")).toBeInTheDocument();
+    // 且明确标注了作废原因，用户不会以为答案凭空换了
+    expect(screen.getByText(/上段因模型切换已废弃/)).toBeInTheDocument();
+    // 当前答案照常显示
+    expect(screen.getByText("第二候选的答案")).toBeInTheDocument();
+  });
+
+  it("没有废弃段落时不渲染标注", () => {
+    render(
+      <Message
+        message={msg()}
+        isStreaming={false}
+        onApprove={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/上段因模型切换已废弃/)).not.toBeInTheDocument();
+  });
 });

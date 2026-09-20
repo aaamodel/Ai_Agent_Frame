@@ -62,24 +62,39 @@ function StepRow({ step, index }: { step: AgentStep; index: number }) {
 }
 
 /**
- * 执行过程（工具调用 / 子任务结论）。
+ * 执行过程（工具调用 / 子任务结论 / 改写逐字）。
  *
  * 后端在**图还在跑**的时候逐条推送，所以这块是"Agent 还在工作"的主要反馈。
  *
  * 两级折叠：整块可收起；每条的工具观测默认两行、可单独展开看全文
  * （后端最多推 5000 字符，够看原始检索片段）。
+ *
+ * `rewriteText` 是问题改写的逐字缓冲——它比第一个工具步骤更早出现，
+ * 所以"还没有任何步骤、但已有改写内容"是正常的中间态，不能因为没有步骤
+ * 就整块不渲染。
  */
 export function RunSteps({
   steps,
   running,
+  rewriteText,
 }: {
   steps: AgentStep[];
   running: boolean;
+  /** 改写阶段的逐字内容（可能先于任何步骤出现） */
+  rewriteText?: string;
 }) {
   const [open, setOpen] = useState(true);
 
-  if (steps.length === 0) return null;
+  if (steps.length === 0 && !rewriteText) return null;
   const last = steps[steps.length - 1];
+
+  // 只有改写、还没有步骤时不能说"0 步"——那是假信息
+  const label =
+    steps.length > 0
+      ? `${running ? "执行中" : "执行过程"} · ${steps.length} 步`
+      : running
+        ? "改写中"
+        : "问题改写";
 
   return (
     <div className="mb-3 overflow-hidden rounded-lg border border-line bg-surface-2/60">
@@ -96,7 +111,7 @@ export function RunSteps({
           </span>
         ) : null}
         <span className="shrink-0 text-[12px] font-medium text-fg-muted">
-          {running ? "执行中" : "执行过程"} · {steps.length} 步
+          {label}
         </span>
         <span className="min-w-0 flex-1 truncate text-[11px] text-fg-subtle">
           {last?.tool || last?.title || last?.node || ""}
@@ -117,6 +132,24 @@ export function RunSteps({
 
       {open && (
         <ol className="border-t border-line px-3 py-2">
+          {/* 改写逐字：排在所有步骤之前——它就是链路里最早发生的一步 */}
+          {rewriteText && (
+            <li className="py-1 text-[12px]">
+              <div className="flex gap-2">
+                <span className="shrink-0 pt-0.5 text-fg-subtle">·</span>
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium text-fg-muted">改写后的问题</div>
+                  <div className="mt-0.5 break-words whitespace-pre-wrap text-[11px] text-fg-muted">
+                    {rewriteText}
+                    {running && !steps.length && (
+                      <span className="agent-caret" aria-hidden="true" />
+                    )}
+                  </div>
+                </div>
+              </div>
+            </li>
+          )}
+
           {steps.map((s, i) => (
             <StepRow key={i} step={s} index={i} />
           ))}

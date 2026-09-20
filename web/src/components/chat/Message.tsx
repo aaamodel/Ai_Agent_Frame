@@ -39,7 +39,26 @@ export function Message({
       {/* 助手正文占满剩余宽度：长回复 / 代码块 / 表格不塞进窄气泡 */}
       <div className="min-w-0 flex-1">
         {/* 执行过程：答案出来之前唯一的进展反馈 */}
-        <RunSteps steps={message.steps ?? []} running={showCursor} />
+        <RunSteps
+          steps={message.steps ?? []}
+          running={showCursor}
+          rewriteText={message.rewriteText}
+        />
+
+        {/* 换候选/重试而作废的半截答案：保留并标注，不静默丢弃 */}
+        {(message.abandoned ?? []).map((text, i) => (
+          <div
+            key={i}
+            className="mb-3 rounded-lg border border-line bg-surface-2 px-3 py-2"
+          >
+            <div className="mb-1 text-[11px] text-fg-subtle">
+              上段因模型切换已废弃
+            </div>
+            <div className="text-[12px] break-words whitespace-pre-wrap text-fg-subtle line-through">
+              {text}
+            </div>
+          </div>
+        ))}
 
         {/* 闲聊模式产生的回答：标注来源，和工作任务的回答区分开 */}
         {message.mode === "chat" && (
