@@ -81,7 +81,6 @@ class GraphDocumentUploadResponse(BaseModel):
     collection_name: str
     track_id: Optional[str] = None
     description: Optional[str] = None
-    retrieval_hint: Optional[str] = None
     message: str
 
 
@@ -107,7 +106,6 @@ class GraphCollectionInfo(BaseModel):
     name: str
     legacy: bool = False
     description: Optional[str] = None
-    retrieval_hint: Optional[str] = None
     document_count: int = 0
     files: List[GraphFileInfo] = []
 
@@ -371,18 +369,15 @@ async def upload_kownledgebase_document(
     ),
     description: str = Form(
         default="",
-        description="集合功能描述：这个图谱集合里是什么内容、覆盖什么主题",
-    ),
-    retrieval_hint: str = Form(
-        default="",
-        description="检索时机描述：用户出现什么样的问题/表达时应该检索这个图谱集合",
+        description="集合描述：这个图谱集合里是什么内容、覆盖什么主题，"
+                    "以及用户出现什么样的问题时应检索它",
     ),
     db_session: AsyncSession = Depends(get_async_session),
 ) -> GraphDocumentUploadResponse:
     """上传 PDF/TXT：解析并织入指定图谱集合（LightRAG workspace）。
 
-    可选 description / retrieval_hint 登记到集合注册表（engine=graph），
-    供意图识别把关系/实体类问题路由到本集合，最终以
+    可选 description 登记到集合注册表（engine=graph），是集合**唯一**的路由语义
+    字段，供意图识别把关系/实体类问题路由到本集合，最终以
     ``knowledge_graph_search(collection=集合名)`` 透传给 Agent 编排层。
     """
     workspace = _resolve_collection(collection_name)
@@ -395,7 +390,6 @@ async def upload_kownledgebase_document(
         )
 
     description = (description or "").strip()
-    retrieval_hint = (retrieval_hint or "").strip()
 
     # 引擎撞名预检：同名集合若已注册为 RAG，拒绝入库（避免写入后才发现）
     existing = await db_session.get(VectorCollection, workspace)
@@ -447,12 +441,11 @@ async def upload_kownledgebase_document(
 
     # 3. 登记/更新集合描述（空值保留既有描述，与 RAG 上传同口径）
     try:
-        if description or retrieval_hint:
+        if description:
             await upsert_vector_collection(
                 db_session,
                 workspace,
                 description=description or None,
-                retrieval_hint=retrieval_hint or None,
                 engine=ENGINE_GRAPH,
             )
         await db_session.commit()
@@ -475,7 +468,6 @@ async def upload_kownledgebase_document(
         collection_name=workspace,
         track_id=str(track_id) if track_id else None,
         description=description or None,
-        retrieval_hint=retrieval_hint or None,
         message="文件已成功上传，并完成 LightRAG 知识图谱的解析与本地固化！",
     )
 
@@ -567,7 +559,6 @@ async def upload_multiple_documents(
     files: List[UploadFile] = File(...),
     collection_name: str = Form(default=""),
     description: str = Form(default=""),
-    retrieval_hint: str = Form(default=""),
     db_session: AsyncSession = Depends(get_async_session),
 ) -> TaskResponse:
     """多文件批量上传到指定图谱集合（后台抽取，立即返回 202）。"""
@@ -576,7 +567,6 @@ async def upload_multiple_documents(
 
     workspace = _resolve_collection(collection_name)
     description = (description or "").strip()
-    retrieval_hint = (retrieval_hint or "").strip()
 
     existing = await db_session.get(VectorCollection, workspace)
     if existing is not None and (existing.engine or "rag") != ENGINE_GRAPH:
@@ -617,13 +607,12 @@ async def upload_multiple_documents(
             await upload.close()
 
     # 描述先登记（后台抽取完成后集合才会进入意图候选）
-    if description or retrieval_hint:
+    if description:
         try:
             await upsert_vector_collection(
                 db_session,
                 workspace,
                 description=description or None,
-                retrieval_hint=retrieval_hint or None,
                 engine=ENGINE_GRAPH,
             )
             await db_session.commit()
@@ -671,9 +660,6 @@ async def list_graph_collections_api(
                 name=LEGACY_WORKSPACE_ALIAS if legacy else name,
                 legacy=legacy,
                 description=descriptor.description if descriptor else None,
-                retrieval_hint=descriptor.retrieval_hint
-                if descriptor
-                else None,
                 document_count=len(docs),
                 files=[_to_file_info(doc) for doc in docs],
             )
@@ -710,7 +696,6 @@ async def list_graph_collection_files_api(
         name=api_name,
         legacy=legacy,
         description=descriptor.description if descriptor else None,
-        retrieval_hint=descriptor.retrieval_hint if descriptor else None,
         document_count=len(docs),
         files=[_to_file_info(doc) for doc in docs],
     )

@@ -54,9 +54,8 @@ MODE_DECISION_LLM_MIN_CONFIDENCE: float = 0.55
 #   1) Pipeline.fill_allowed_tools() 做白名单交叉过滤时的对照参考；
 #   2) P2 prompt 示例 suggested_tools 字面量必须从此集合取，避免 LLM 幻觉。
 # 数据来源（已代码核验）：
-#   local_excel_read_tool  ← LocalExcelReadTool.name（只读，不审批）
-#   local_excel_query_tool ← LocalExcelQueryTool.name（自然语言 pandas 取数，只读，不审批）
-#   local_excel_write_tool ← LocalExcelWriteTool.name（单格/语义/批量写入，危险名单，人工审批）
+#   sales_sql_query      ← SalesSqlQueryTool.name（业务库自然语言取数，只读，不审批）
+#   sales_sql_write      ← SalesSqlWriteTool.name（受约束 UPDATE，危险名单，人工审批）
 #   sales_report_export_tool ← SalesReportExportTool.name（报表导出，危险名单，人工审批）
 #   feishu_bitable_tool   ← FeishuBitableTool.name
 #   web_search            ← DoubaoWebSearchTool.name（豆包搜索 API 直连；联网搜索**唯一**对外工具）
@@ -66,9 +65,8 @@ MODE_DECISION_LLM_MIN_CONFIDENCE: float = 0.55
 #   file_list_tool        ← FileListTool.name
 #   file_grep_tool        ← FileGrepTool.name
 REGISTERED_ENABLED_TOOL_NAMES: list[str] = [
-    "local_excel_read_tool",
-    "local_excel_query_tool",
-    "local_excel_write_tool",
+    "sales_sql_query",
+    "sales_sql_write",
     "sales_report_export_tool",
     "feishu_bitable_tool",
     "web_search",

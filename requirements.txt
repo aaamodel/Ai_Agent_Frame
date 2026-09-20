@@ -15,6 +15,11 @@ pydantic-settings>=2.7.0
 python-multipart>=0.0.18
 tiktoken>=0.8.0
 jieba>=0.42.1
+# 销售业务库的自然语言取数（Vanna）
+# ⚠️ 必须锁 0.x：2.0 重构了包结构（vanna.chromadb.* → vanna.legacy.*），
+#    且连接方法命名不同，升级会直接打断工具。
+vanna>=0.7.3,<0.8
+chromadb>=1.5.9
 sentence-transformers>=3.3.0
 httpx>=0.28.0
 loguru>=0.7.0

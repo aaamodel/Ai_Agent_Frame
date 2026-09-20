@@ -24,6 +24,9 @@ from llama_index.core.schema import NodeWithScore, TextNode
 
 from loguru import logger
 
+from app.core.rag.collection_guard import partition_collection_names, record_fallback
+from app.query_intent.kb_collection_registry import KbCollectionRegistry
+
 from app.core.rag.bm25_builder import BM25IndexBuilder
 from app.core.rag.retriever import HybridRetriever
 from app.infrastructure.vectordb.milvus_store import MilvusIndexManager
@@ -148,11 +151,28 @@ class RAGService:
             logger.exception("RAG 混合检索失败: {}", retr_error)
             return []
 
+        # ── 集合白名单：先按注册表过滤越界取值，再决定是否限定检索 ────────────
+        # 这里是所有调用路径（Planner 子任务 / ReAct / evals 直连）的唯一收口，
+        # 因此校验放这一层，而不是放在工具层——否则绕过工具直连 service 的调用点会漏。
+        requested: List[str] = [
+            str(c).strip() for c in (collection_names or []) if str(c).strip()
+        ]
+        kept: List[str] = []
+        dropped: List[str] = []
+        if requested:
+            kept, dropped = partition_collection_names(
+                requested, KbCollectionRegistry.is_valid
+            )
+
         allow_collections: Optional[set[str]] = None
-        if collection_names:
-            allow_collections = {str(c).strip() for c in collection_names if str(c).strip()}
-            if not allow_collections:
-                allow_collections = None
+        if requested:
+            allow_collections = set(kept) or None
+            if dropped:
+                # 静默回落（有意设计，见 collection_guard 模块文档）：不报错、不改用
+                # 硬拒绝。代价是幻觉被吸收，因此留痕是必要配套而非可选项。
+                record_fallback(
+                    requested, kept, dropped, fell_back_to_all=not allow_collections
+                )
 
         out: List[RetrievalResult] = []
         for hit in hits:

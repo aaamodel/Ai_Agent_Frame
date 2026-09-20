@@ -160,7 +160,7 @@ summarize ─┬─ 证据不足且仍有余量 ─→ replan ──────
 
 ### 人工审批与检查点
 
-危险工具（由 `AGENT_DANGER_TOOLS` 指定，默认 `local_excel_write_tool,sales_report_export_tool`）在**真正执行之前**命中闸门：
+危险工具（由 `AGENT_DANGER_TOOLS` 指定，默认 `sales_sql_write,sales_report_export_tool`）在**真正执行之前**命中闸门：
 
 1. `interrupt(payload)` 抛出中断信号，LangGraph 把当前图状态与 pending interrupt 写入 checkpointer，`astream` 正常结束而非报错；
 2. 本次工具**未执行、预算未扣**，`execute` 节点不返回任何 state 更新；
@@ -319,6 +319,27 @@ bash benchmark/run_bench.sh 20 2m --mode mock
 
 ---
 
+## 前端控制台
+
+仓库内含一个 React 前端控制台（`web/`），提供三个区：**对话**（含危险工具审批与降级提示）、
+**文档**（RAG 集合管理）、**知识库**（图谱集合管理）。
+
+```bash
+# 开发：前端 dev server 经 vite proxy 调后端
+uvicorn app.main:app --reload        # 终端 1
+cd web && npm install && npm run dev # 终端 2 → http://localhost:5173
+
+# 日常使用：构建后由后端托管，单进程、同源、无 CORS
+cd web && npm run build              # 产出 web/dist/
+uvicorn app.main:app                 # 访问 http://127.0.0.1:8000/
+```
+
+前端测试：`cd web && npm test -- --run`
+
+设计文档见 `docs/superpowers/specs/2026-09-19-agent-console-frontend-design.md`，
+实现计划见 `docs/superpowers/plans/2026-09-19-agent-console-frontend.md`，
+运行说明与常见坑见 `web/README.md`。
+
 ## 配置说明
 
 所有配置通过 `app/config.py`（Pydantic-settings）读取，优先级：**进程环境变量 > `./.env` > 默认值**。
@@ -352,7 +373,7 @@ Embedding 模型固定为 DashScope `text-embedding-v3`（dim=1024），**不进
 | `AGENT_CHECKPOINT_PREFIX` | `agent_cp` | Redis key 前缀（多服务共库隔离） |
 | `AGENT_EVIDENCE_GATE_ENABLED` | `true` | 汇总阶段的证据充分性闸门；不足时触发重规划补取 |
 | `AGENT_APPROVAL_ENABLED` | `false` | 危险工具人工审批总开关；关闭时闸门直接放行 |
-| `AGENT_DANGER_TOOLS` | `local_excel_write_tool,sales_report_export_tool` | 需人工审批的工具名单（逗号分隔） |
+| `AGENT_DANGER_TOOLS` | `sales_sql_write,sales_report_export_tool` | 需人工审批的工具名单（逗号分隔） |
 | `AGENT_REFLECT_ENABLED` | `false` | 反思质量门；开启后不通过会回到 `execute` 重试 |
 | `AGENT_REFLECT_MIN_SCORE` | `60` | 反思质量门通过分数线 |
 | `AGENT_NODE_RETRY_MAX` | `1` | 节点级最大重试次数 |
@@ -460,14 +481,55 @@ data: {"awaiting_approval": true, "run_id": "...", "approvals": [...], "done": t
 | `web_search` | 联网搜索（豆包 API 直连；空结果/异常时代码层自动降级内部 Tavily 通道，该通道不注册、模型不可见） |
 | `rag_knowledge_search` | 混合检索知识库 |
 | `knowledge_graph_search` | 知识图谱检索 |
-| `local_excel_read_tool` | 表格只读（pandas）：全 sheet 结构摘要 / 按列过滤 / 工具内分组聚合 / 单格取值 |
-| `local_excel_query_tool` | 表格**自然语言查询**：由 ModelRouter 解析问句为查询参数后取数 |
-| `local_excel_write_tool` | 表格写入：单格更新 或 批量 `rows` 落表（写操作，默认走人工审批） |
+| `sales_sql_query` | 业务库（SQLite）**自然语言取数**：一句中文问题，Vanna 生成并执行 SQL，返回结构化结果（只读） |
+| `sales_sql_write` | 业务库受约束写入：语义参数映射为 `UPDATE`，条件须唯一命中一行（写操作，默认走人工审批） |
 | `sales_report_export_tool` | 销售分析报表导出为 `.xlsx`（写操作，默认走人工审批） |
 | `feishu_bitable_tool` | 飞书多维表格 |
 | `file_read_tool` / `file_list_tool` / `file_grep_tool` | 安全文件沙箱（虚拟模式）；`file_list_tool` 支持递归 `depth`（默认 3 层）与文件名 `pattern` 过滤 |
 
 > 数据库工具（`database` / `describe_table` / `list_tables`）目前为可选，默认未注册（见 `init_tools.py` 注释块），可按需启用。
+
+### ⚠️ 业务库取数引擎（Vanna）：口径变更后**必须**手动重训
+
+销售业务数据存在 SQLite（`data/sales.db`），自然语言取数由 `sales_sql_query` 承载，
+底层是 **Vanna**（0.x，已锁 `vanna>=0.7.3,<0.8`）。它有**两类**训练数据，介入方式完全不同：
+
+| 训练数据 | 是否自动 | 说明 |
+|---|---|---|
+| **DDL**（表名 / 列名 / 类型 / `CHECK` 枚举） | ✅ **全自动** | 工具首次使用时 `SalesVanna.sync_ddl()` 从 `sqlite_master` 增量同步；改表结构后无需人工介入 |
+| **口径**（如"ICP 达标 ＝ 员工规模 ≥ 200"、"赢单率 = 赢单数/(赢单数+输单数)"） | ❌ **需手动** | Vanna **无法**从 DDL 推出这类业务判据 |
+
+**口径改动后（改了字段字典的"说明"/判据、或新增业务口径），必须执行：**
+
+```bash
+python -m app.core.sales_db.train_vanna   # 幂等：先移除旧 documentation 再重训
+```
+
+> 不重训的后果：模型写 SQL 时**不知道这个口径**，会自行假设阈值——例如把 ICP 判据
+> 猜成 `员工规模 >= 100`，查询结果看起来正常、实际全错且难以察觉。
+>
+> 口径来源：`app/core/sales_db/knowledge.py` 会从 5 张"字段字典" sheet 中**只提取口径与判据**
+> （列名/类型/枚举取值已被 DDL 覆盖，刻意丢弃，避免重复注入）。
+
+**业务库的构建与导出：**
+
+```bash
+python -m app.core.sales_db.seed --rebuild   # 建表（带约束）+ 从 xlsx 导入 + 扩量
+python -m app.core.sales_db.seed --export    # 导出 xlsx（xlsx 已降级为导出视图）
+```
+
+**⚠️ 规则文档走的是另一个入口，不要和上面的 Vanna 训练混起来。**
+
+上面那个入口只写 **Vanna 的训练数据**（口径 → Vanna 的 ChromaDB）。
+而"阶段流转规则 / 折扣权限 / 组合策略"是 **RAG 文档**（→ 项目的 Milvus 知识库
+`sales_kb`，由 `rag_knowledge_search` 消费），两者的目的地与消费者都不同：
+
+```bash
+python -m app.core.sales_db.export_rule_docs   # 写出 raw_data/sales_kb_docs/*.md
+```
+
+导出后需**人工上传**到知识库集合 `sales_kb`（`POST /documents/upload`）。
+业务数据不在知识库里，无需上传。
 
 `ToolCallBudget` 提供四重熔断：单工具上限、累计无效次数、相关性抽查（第 N 次做 LLM 相关性判定）、全局总闸；熔断状态实时注入 Agent 提示词，引导其转向或作答。
 

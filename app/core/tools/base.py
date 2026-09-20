@@ -17,6 +17,14 @@ class ToolParameter(BaseModel):
     type: str = "string"
     description: str = ""
     required: bool = True
+    #: 取值约束：非空时以 JSON Schema ``enum`` 导出，把"自由文本参数"变成"受约束选择"。
+    #: 承载的是**运行时实时清单**（知识库集合、图谱集合、工具名…），这些资产会随
+    #: 上传/删除变化，因此不能静态写死——模型凭空编造名字的根因正是这里曾经无从表达约束。
+    enum: list[Any] | None = None
+    #: 数组元素的取值约束（JSON Schema ``items``）。
+    #: ⚠️ ``type="array"`` 的取值域必须写在这里：把 ``enum`` 放在数组同一层，语义会变成
+    #: "整个数组只能恰好等于这几个值之一"，而不是"数组元素只能从这几个值里取"。
+    items: dict[str, Any] | None = None
 
 
 class BaseTool(ABC):
@@ -29,11 +37,20 @@ class BaseTool(ABC):
         self.parameters: list[ToolParameter] = []
 
     def schema_parameters(self) -> dict[str, Any]:
-        """导出为 OpenAI tools 风格的 parameters 结构。"""
+        """导出为 OpenAI tools 风格的 parameters 结构。
+
+        只有**显式设置**了 ``enum`` / ``items`` 的参数才会带上对应键——存量工具的导出
+        结果必须与改动前逐字一致，不因新增能力而平白增加每次请求的 schema 体积。
+        """
         properties: dict[str, Any] = {}
         required: list[str] = []
         for p in self.parameters:
-            properties[p.name] = {"type": p.type, "description": p.description}
+            prop: dict[str, Any] = {"type": p.type, "description": p.description}
+            if p.enum:
+                prop["enum"] = list(p.enum)
+            if p.items:
+                prop["items"] = dict(p.items)
+            properties[p.name] = prop
             if p.required:
                 required.append(p.name)
         return {"type": "object", "properties": properties, "required": required}

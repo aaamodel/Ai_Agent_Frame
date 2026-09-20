@@ -220,7 +220,7 @@ def test_tool_call_success():
     assert tool_call_success(["web_search"], "rag_knowledge_search") is False
     # acceptable_tools 兜底
     assert tool_call_success(
-        ["file_list_tool"], "local_excel_read_tool",
+        ["file_list_tool"], "sales_sql_query",
         acceptable_tools=["file_list_tool"],
     ) is True
     # inspect_first_n 只看前 N 次：第 3 次才调对，只看前 2 次 -> 失败

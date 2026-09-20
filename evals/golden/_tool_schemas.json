@@ -50,8 +50,8 @@
     {
       "type": "function",
       "function": {
-        "name": "local_excel_read_tool",
-        "description": "读取本地表格（xlsx/xls/csv/tsv/xlsm），返回结构摘要而不是整表内容：不给 sheet_name 时列出**所有 sheet 的名称/行列数/列名/前若干行**；给 sheet_name 时看该表明细，可按列过滤（filter_column+filter_value）或直接做分组聚合（group_by+agg_column+agg_func，聚合在工具内完成，不要自己心算累加）；给 cell（如 'D7'）读单个单元格。写入请用 local_excel_write_tool。",
+        "name": "sales_sql_query",
+        "description": "读取本地表格（xlsx/xls/csv/tsv/xlsm），返回结构摘要而不是整表内容：不给 sheet_name 时列出**所有 sheet 的名称/行列数/列名/前若干行**；给 sheet_name 时看该表明细，可按列过滤（filter_column+filter_value）或直接做分组聚合（group_by+agg_column+agg_func，聚合在工具内完成，不要自己心算累加）；给 cell（如 'D7'）读单个单元格。写入请用 sales_sql_write。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -102,8 +102,8 @@
     {
       "type": "function",
       "function": {
-        "name": "local_excel_write_tool",
-        "description": "写入本地表格，两种模式二选一：(1) 单格更新 cell+value（改台账某一条的某个字段）；(2) 批量写入 rows（JSON 数组：对象数组，或「首行为列名」的二维数组），一次落多行，write_mode=append 追加 / replace 覆盖该 sheet。写操作需人工审批；写入前先用 local_excel_read_tool 确认列名与目标行。",
+        "name": "sales_sql_write",
+        "description": "写入本地表格，两种模式二选一：(1) 单格更新 cell+value（改台账某一条的某个字段）；(2) 批量写入 rows（JSON 数组：对象数组，或「首行为列名」的二维数组），一次落多行，write_mode=append 追加 / replace 覆盖该 sheet。写操作需人工审批；写入前先用 sales_sql_query 确认列名与目标行。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -252,7 +252,7 @@
       "type": "function",
       "function": {
         "name": "file_read_tool",
-        "description": "读取文本类文件（代码/配置/文档/日志等）。不用于 Excel 等二进制文件（请用 local_excel_read_tool）。",
+        "description": "读取文本类文件（代码/配置/文档/日志等）。不用于 Excel 等二进制文件（请用 sales_sql_query）。",
         "parameters": {
           "type": "object",
           "properties": {

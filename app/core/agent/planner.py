@@ -208,10 +208,10 @@ tool_name（tool 必填）/ tool_args_hint（可选）。
 此时必须改写取数方式：改用 filter_column+filter_value 按条件精确定位，
 或补上 sheet_name / 调大 head_rows（检索类工具则调大 top_k），
 并在子任务描述里写清"要用哪个字段的哪个值来筛"；
-涉及计算/统计的，优先改用 local_excel_query_tool 直接在全量数据上算。
+涉及计算/统计的，直接用 sales_sql_query 在业务库上算。
 只有工具**明确报错**或**明确返回空数据**时，才允许更换工具或数据源。
 
-⚠️ 若失败的是写操作（local_excel_write_tool 等），重试子任务必须改用语义参数
+⚠️ 若失败的是写操作（sales_sql_write 等），重试子任务必须改用语义参数
 filter_column + filter_value + target_column + new_value，并先安排一次读取定位拿到
 真实列名与唯一条件值；**禁止**再次让执行方自己算 A1 单元格坐标，也禁止重复提交
 已知会被拒绝的相同调用（如审批已拒绝）。

@@ -325,8 +325,9 @@ class Settings(BaseSettings):
         description="危险工具人工审批总开关（HITL interrupt），默认开启。",
     )
     agent_danger_tools: str = Field(
-        default="local_excel_write_tool,sales_report_export_tool",
-        description="需人工审批的危险工具名，逗号分隔（默认含 Excel 写入与销售报表导出）。",
+        default="sales_sql_write,sales_report_export_tool",
+        description="需人工审批的危险工具名，逗号分隔"
+                    "（默认含业务库 SQL 写入与销售报表导出）。",
     )
     agent_reflect_enabled: bool = Field(
         default=False,

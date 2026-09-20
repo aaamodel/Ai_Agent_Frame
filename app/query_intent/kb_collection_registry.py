@@ -60,17 +60,20 @@ class KbCollectionDescriptor:
 
     name: str
     description: str = ""
-    retrieval_hint: str = ""
     engine: str = ENGINE_RAG
 
     def intent_text(self) -> str:
-        """供 embedding / LLM 匹配的检索文本（功能描述 + 检索时机）。"""
+        """供 embedding / LLM 匹配的检索文本（**只用功能描述**）。
+
+        ⚠️ 这里曾经还拼接一段独立的"检索时机"文本。实测表明问题从来不在两份文本哪份
+        更好——即使描述里已经写了"产品与定价""折扣权限与异议话术"，模型仍然编造了
+        `pricing_guide`。真正的缺口是真实集合名从未作为**受约束选项**给过模型。
+        既然描述已足以承载路由语义，第二份文本只增加维护面与注入长度，已退役。
+        """
         label = "知识图谱集合" if self.engine == ENGINE_GRAPH else "知识库集合"
         parts: List[str] = [f"{label}「{self.name}」"]
         if self.description.strip():
             parts.append(self.description.strip())
-        if self.retrieval_hint.strip():
-            parts.append(f"适用检索时机：{self.retrieval_hint.strip()}")
         return "。".join(parts)
 
 
@@ -97,7 +100,6 @@ class KbCollectionRegistry:
             deduped[name] = KbCollectionDescriptor(
                 name=name,
                 description=str(getattr(row, "description", "") or ""),
-                retrieval_hint=str(getattr(row, "retrieval_hint", "") or ""),
                 engine=engine,
             )
         with cls._lock:
@@ -112,6 +114,32 @@ class KbCollectionRegistry:
     @classmethod
     def names(cls) -> list[str]:
         return [row.name for row in cls.rows()]
+
+    @classmethod
+    def described(cls) -> tuple[KbCollectionDescriptor, ...]:
+        """具备**非空描述**的集合——工具参数枚举的取值口径。
+
+        为什么以"有描述"为门槛：没有描述的集合无法被判定适用场景，把它放进候选只会
+        诱导误选。实测里系统兜底桶 ``_untagged``（3 篇未分类文档）即属此类，因此它
+        **不进枚举**，其文档只能靠不限定集合的检索命中——这是有意接受的取舍。
+        """
+        return tuple(row for row in cls.rows() if row.description.strip())
+
+    @classmethod
+    def describe_names(cls) -> list[str]:
+        """具备描述的集合名列表（按注册顺序）。"""
+        return [row.name for row in cls.described()]
+
+    @classmethod
+    def is_valid(cls, name: Any) -> bool:
+        """该集合名是否属于**当前注册表**里的真实集合（含无描述者）。
+
+        越界过滤用的口径是"注册表内全部集合"，而不是枚举口径：枚举只决定"模型能不能
+        显式选到"，而过滤决定"传进来的名字是不是真实存在的资产"。两者混用会让
+        `_untagged` 这种"不可显式指定、但确实存在"的集合被误判为幻觉并丢弃。
+        """
+        target = str(name or "").strip()
+        return bool(target) and target in {row.name for row in cls.rows()}
 
     @classmethod
     def clear(cls) -> None:

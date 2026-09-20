@@ -24,6 +24,20 @@ from app.llm_model_router.model_router_config import (
 )
 from app.llm_model_router.model_router_enums import ModelProvider, ModelTarget
 
+
+def _stream_sink_module():
+    """惰性取旁观通道模块。
+
+    ⚠️ **不能**在模块顶层 import：``app.core.agent`` 包在导入期会反向依赖
+    ``app.llm_model_router.model_router``，顶层导入会把整个 model_router
+    变成 partially initialized（实测：`ImportError: cannot import name
+    'ModelRouter' from partially initialized module`）。
+    这里只在真正调用时查一次 sys.modules，开销可忽略。
+    """
+    from app.core.agent import stream_sink
+
+    return stream_sink
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -381,8 +395,16 @@ async def async_openai_chat_caller(
       - 所有 Provider 异常（APIError/RateLimitError）都向上抛出，由 Executor 统一
         做熔断计数 + 降级。
     """
-    if stream:  # 兼容上层偶发 stream=True，但本调用器是非流式的
-        stream = False
+    # 只有"有旁观观测者"时才开流；否则保持本调用器的历史契约（非流式）。
+    #
+    # ⚠️ 判定**不参考传入的 stream 参数**：该参数在本调用器里一直被强制关闭
+    #    （原实现 `if stream: stream = False`），没有任何上游真的传它。
+    #    以它为门禁会让流式永远不触发。真正的门禁是"此刻有没有人在听"。
+    #
+    # ⚠️ 即便开了流，对外仍返回完整结果 —— 上游的重试/熔断/候选降级/业务解析
+    #    全部不受影响，因为它们的调用方式一个字都没变。
+    stream_enabled: bool = _stream_sink_module().has_sink()
+    stream = False
 
     # 1) 组装参数
     params: Dict[str, Any] = {
@@ -423,6 +445,12 @@ async def async_openai_chat_caller(
             params.update(sanitized)
 
     # 2) 发起调用（带 Langfuse generation 观测；未启用或观测层异常时原样调用）
+    if stream_enabled:
+        # 旁路观测模式：改走流式收流 + 增量推送，返回值仍是完整结果。
+        return await _streaming_chat_call(
+            client=client, params={**params, "stream": True}, target=target,
+        )
+
     try:
         resp = await _chat_completion_with_langfuse(
             client,
@@ -441,6 +469,16 @@ async def async_openai_chat_caller(
         raise
 
     # 3) 标准化结果
+    return _standardize_completion(resp, target)
+
+
+def _standardize_completion(resp: Any, target: ModelTarget) -> AsyncOpenAICallResult:
+    """把 OpenAI 的 ChatCompletion 响应标准化为 ``AsyncOpenAICallResult``。
+
+    ⚠️ 这是**非流式路径与"探测回落"共用**的标准化入口：两条路径必须给出完全
+    一致的字段，否则"厂商不支持流式"时用户拿到的结果与原来不同。
+    本函数是从原 ``async_openai_chat_caller`` 内联块**原样搬移**而来。
+    """
     choice = resp.choices[0] if getattr(resp, "choices", None) else None
     content: str = ""
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -507,3 +545,116 @@ async def async_openai_chat_caller(
         tool_calls=tool_calls,
         reasoning_content=reasoning_content,
     )
+
+
+async def _streaming_chat_call(
+    *,
+    client: AsyncOpenAI,
+    params: Dict[str, Any],
+    target: ModelTarget,
+) -> AsyncOpenAICallResult:
+    """流式收流 + 旁路推送，**返回与 ``async_openai_chat_caller`` 相同的完整结果**。
+
+    为什么必须返回完整结果：上游（``run_with_attempt_budget`` 的重试、
+    ``execute_with_candidate_fallback`` 的候选降级与熔断回写、以及节点里的
+    结构化解析与全部闸门）都依赖"一次调用一个完整结果"这个契约。
+    只要契约不变，它们一行都不用改。
+
+    ⚠️ 这里刻意不经过 ``_chat_completion_with_langfuse``：那个包装不感知流式。
+    代价是流式调用在 langfuse 里不可见（spec 风险 3，已知并记录）。
+    """
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    usage: Optional[Dict[str, Any]] = None
+    # tool_calls 在流里是按 index 分片下发的，必须按 index 聚合成完整调用
+    tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+    received_any_chunk: bool = False
+
+    try:
+        stream = await client.chat.completions.create(**params)
+        async for chunk in stream:
+            received_any_chunk = True
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = {
+                    "prompt_tokens": getattr(chunk_usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(chunk_usage, "completion_tokens", None),
+                    "total_tokens": getattr(chunk_usage, "total_tokens", None),
+                }
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            text = getattr(delta, "content", None)
+            if text:
+                content_parts.append(text)
+                # 旁路推送：失败被 emit 内部吞掉，绝不影响主链路
+                _stream_sink_module().emit({"kind": "delta", "text": text})
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+            for tc in (getattr(delta, "tool_calls", None) or []):
+                idx = int(getattr(tc, "index", 0) or 0)
+                slot = tool_calls_acc.setdefault(idx, {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": None, "arguments": ""},
+                })
+                if getattr(tc, "id", None):
+                    slot["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["function"]["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["function"]["arguments"] += fn.arguments
+    except Exception as exc:  # noqa: BLE001
+        # 方案 A（spec §10.1）：**首 chunk 之前**失败、且异常特征像"参数组合不被
+        # 厂商接受"时，同一次尝试内退回非流式重发，且不推任何 delta。
+        # 探测请求不计入"增加调用次数"（用户已认可）；厂商不支持流式时
+        # 用户看到的就是"这段没有逐字、直接出结果"。
+        if not received_any_chunk and _looks_like_params_rejected(exc):
+            logger.warning(
+                "流式参数不被接受，本次尝试退回非流式重发: provider=%s modelId=%s err=%s",
+                target.candidate.provider,
+                target.id,
+                exc,
+            )
+            resp = await client.chat.completions.create(**_strip_stream(params))
+            return _standardize_completion(resp, target)
+        # 其它异常（超时/连接/5xx/首 chunk 后断流）原样抛出，
+        # 交由现有 run_with_attempt_budget 重试与候选降级处理。
+        raise
+
+    content: str = "".join(content_parts)
+    if not content and reasoning_parts:
+        # 与非流式路径同口径：content 为空时回落 reasoning_content
+        content = "".join(reasoning_parts)
+
+    return AsyncOpenAICallResult(
+        content=content,
+        model_id=target.candidate.model or target.id,
+        usage=usage,
+        raw=None,
+        tool_calls=[tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None,
+        reasoning_content="".join(reasoning_parts) or None,
+    )
+
+
+def _looks_like_params_rejected(exc: BaseException) -> bool:
+    """异常是否像"参数组合不被厂商接受"（spec §10.1 第 2 条）。"""
+    return getattr(exc, "status_code", None) in (400, 422)
+
+
+def _strip_stream(params: Dict[str, Any]) -> Dict[str, Any]:
+    """剥掉流式相关参数，供"探测回落"复用同一份调用参数。
+
+    ⚠️ 必须是"除 stream 外完全相同"的 params —— 两条路径若参数有差异，
+    回落后的结果与原来就不一致了。
+    """
+    out = dict(params)
+    out.pop("stream", None)
+    out.pop("stream_options", None)
+    return out

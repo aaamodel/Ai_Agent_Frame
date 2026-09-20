@@ -164,8 +164,8 @@ class IntentTreeFactory:
         web 外部公开信息检索 [MCP]
         └─ web-live-info             → [web_search]
         data 业务数据操作 [MCP]
-        ├─ data-sales-report         → [local_excel_read_tool, local_excel_query_tool, feishu_bitable_tool, sales_report_export_tool]
-        ├─ data-excel-ops            → [local_excel_read_tool, local_excel_query_tool, local_excel_write_tool, sales_report_export_tool]
+        ├─ data-sales-report         → [sales_sql_query, sales_report_export_tool]
+        ├─ data-excel-ops            → [sales_sql_query, sales_sql_write, sales_report_export_tool]
         └─ data-bitable-ops          → [feishu_bitable_tool]
         files 本地文件操作 [MCP]
         ├─ files-locate              → [file_list_tool]
@@ -188,16 +188,12 @@ class IntentTreeFactory:
         "(OneDay/OneWeek/OneMonth/OneYear) 限定条数与时效；"
         "该工具是**唯一**的联网检索工具，内部自带重试与降级，无需（也无法）切换到其他搜索工具。"
     )
-    _HINT_EXCEL: str = (
-        "精确取数/统计/排名/占比/环比等'要算答案'的问题优先用 local_excel_query_tool："
-        "传 file_path + 一句中文 query（多 sheet 给 sheet_name），它在**全量数据**上跑 pandas，"
-        "目标数据不在前几行绝不代表不存在，不要因预览误判数据缺失。"
-        "只看表结构/列名用 local_excel_read_tool（不传 sheet_name 即返回全部 sheet 的"
-        "列名/行列数/前几行摘要）；看某条记录用 filter_column+filter_value（多 sheet 须配 sheet_name）。"
-        "若不知道文件路径，先用 file_list_tool（默认递归 3 层，可按 pattern 过滤）定位文件。"
-        "写入用 local_excel_write_tool：改某条记录传 filter_column+filter_value+target_column+new_value"
-        "（坐标工具内部算，禁止自己数 A1 坐标）；一次写多行传 rows（JSON 数组）。"
-        "写操作会触发人工审批，写入前必须先读定位并向用户确认旧值→新值。"
+    _HINT_SALES_SQL: str = (
+        "销售业务数据（线索 / 市场活动 / 竞品 / 竞品动态 / 输赢单 / 月度业绩 / 产品报价）"
+        "已经存在 SQLite 业务库里，取数**一律走 SQL**，"
+        "查询用 sales_sql_query：只传一句中文问题，工具会在库上生成并执行 SQL，"
+        "改某条记录用 sales_sql_write：传 table + filter_column/filter_value  "
+
     )
     _HINT_SALES_REPORT_EXPORT: str = (
         "用户明确要求导出/生成/下载/归档销售报表或分析报告文件时，"
@@ -212,7 +208,7 @@ class IntentTreeFactory:
     _HINT_FILE_LIST: str = (
         "调用 file_list_tool 浏览目录/定位文件：默认一次递归 3 层（depth 可调，最大 8），"
         "可用 pattern（如 '*.xlsx'）过滤文件名——**不要一层层反复调用去摸路径**；"
-        "找到目标文件后通常接 file_read_tool / local_excel_read_tool 深入内容。"
+        "找到目标文件后用 file_read_tool 深入内容（业务数据请直接查库，不要读 xlsx）。"
     )
     _HINT_FILE_CONTENT: str = (
         "先调用 file_grep_tool 按关键词/正则在文件内容中检索定位，"
@@ -367,10 +363,10 @@ class IntentTreeFactory:
             level=IntentLevel.CATEGORY,
             parent_id=data.id,
             kind=IntentKind.MCP,
-            description="销售总额、销售量、销售占比、销售趋势、排行榜等业务数据统计问题；这类数据存在表格/多维表格中，用表格工具读取统计大概率能拿到结果；明确要求导出/生成报表文件时用 sales_report_export_tool",
+            description="销售总额、销售量、销售占比、销售趋势、排行榜等业务数据统计问题；这类数据已入库（SQLite 销售业务库），直接用 sales_sql_query 查询即可；明确要求导出/生成报表文件时用 sales_report_export_tool",
             examples=["这个月的销售总额是多少？", "各区域销量占比怎么样？", "上季度销量 Top10 有哪些？", "把本月销售分析导出成报表"],
-            agent_tool_names=["local_excel_read_tool", "feishu_bitable_tool", "sales_report_export_tool"],
-            tool_usage_hint=IntentTreeFactory._HINT_EXCEL + IntentTreeFactory._HINT_SALES_REPORT_EXPORT,
+            agent_tool_names=["sales_sql_query", "sales_report_export_tool"],
+            tool_usage_hint=IntentTreeFactory._HINT_SALES_SQL + IntentTreeFactory._HINT_SALES_REPORT_EXPORT,
         )
 
         data_excel_ops = IntentNode(
@@ -379,10 +375,10 @@ class IntentTreeFactory:
             level=IntentLevel.CATEGORY,
             parent_id=data.id,
             kind=IntentKind.MCP,
-            description="对本地 Excel 文件的读取、筛选、汇总、透视、写入、格式处理等操作类请求",
-            examples=["帮我读一下 sales.xlsx 里的数据", "把这张表按月份汇总", "在表格里新增一行记录", "把分析结果导出成 Excel 报表"],
-            agent_tool_names=["local_excel_read_tool", "local_excel_query_tool", "local_excel_write_tool", "sales_report_export_tool"],
-            tool_usage_hint=IntentTreeFactory._HINT_EXCEL + IntentTreeFactory._HINT_SALES_REPORT_EXPORT,
+            description="对销售业务库的查询、筛选、汇总、透视与记录修改等操作类请求（数据已入库，不再按文件路径操作 Excel）",
+            examples=["查一下线索表里制造业的线索", "把赢单按月份汇总", "把某条线索的负责人改成李娜", "把分析结果导出成 Excel 报表"],
+            agent_tool_names=["sales_sql_query", "sales_sql_write", "sales_report_export_tool"],
+            tool_usage_hint=IntentTreeFactory._HINT_SALES_SQL + IntentTreeFactory._HINT_SALES_REPORT_EXPORT,
         )
 
         data_bitable_ops = IntentNode(

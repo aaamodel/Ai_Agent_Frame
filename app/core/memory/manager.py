@@ -27,6 +27,34 @@ class MemoryManager:
         self._stm = short_term
         self._ltm = long_term
 
+    async def forget_session(self, session_id: str) -> Dict[str, str]:
+        """删除某会话在后端的全部记忆（短期 Redis + 长期向量库）。
+
+        用途：用户在界面上删除会话时，必须把后端按 ``session_id`` 存的东西
+        一起清掉，否则就是"删了还在"——下一轮召回仍会命中旧记录。
+
+        ⚠️ 两个存储**分开 try**：一个失败不能阻止另一个被清。
+        返回逐项结果（``ok`` / ``failed: ...``）供接口如实回传，让"只清掉一半"
+        在界面上可见——谎报成功会让用户以为数据已经没了。
+        """
+        outcome: Dict[str, str] = {}
+
+        try:
+            await self._stm.clear(session_id)
+            outcome["short_term"] = "ok"
+        except Exception as stm_error:  # noqa: BLE001 - 单侧失败不阻断另一侧
+            logger.exception("删除会话短期记忆失败: session_id={}", session_id)
+            outcome["short_term"] = f"failed: {stm_error}"
+
+        try:
+            await self._ltm.forget_session(session_id)
+            outcome["long_term"] = "ok"
+        except Exception as ltm_error:  # noqa: BLE001 - 同上
+            logger.exception("删除会话长期记忆失败: session_id={}", session_id)
+            outcome["long_term"] = f"failed: {ltm_error}"
+
+        return outcome
+
     async def get_context(self, session_id: str, query: str, limit: int = 6) -> MemoryContext:
         """获取与当前查询相关的记忆上下文（短期历史 + 长期召回）。
 

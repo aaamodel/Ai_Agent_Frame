@@ -46,7 +46,6 @@ class DocumentUploadResponse(BaseModel):
     chunk_count: int = 0
     collection_name: str = ""
     description: str | None = None
-    retrieval_hint: str | None = None
     message: str = "ok"
 
 
@@ -63,8 +62,10 @@ class KbCollectionInfo(BaseModel):
     """向量库逻辑集合信息（Milvus 实际向量 + Postgres 描述合并）。"""
 
     name: str
-    description: str | None = Field(default=None, description="集合功能描述")
-    retrieval_hint: str | None = Field(default=None, description="检索时机描述（意图匹配用）")
+    description: str | None = Field(
+        default=None,
+        description="集合功能描述——**唯一**承载路由语义的字段（「是什么、什么时候选它」）",
+    )
     document_count: int = 0
     vector_chunk_count: int = 0
     files: list[CollectionFileInfo] = Field(default_factory=list)

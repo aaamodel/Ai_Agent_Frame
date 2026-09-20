@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any, AsyncIterator, List, Optional, Dict
+from typing import Any, AsyncIterator, Iterator, List, Optional, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -30,6 +30,11 @@ from app.core.agent.orchestrator import AgentOrchestrator, IntentContext
 from app.core.memory.manager import MemoryManager
 from app.core.skill.manager import SkillManager
 from app.core.tools.registry import ToolRegistry
+
+# ── 逐字流式：旁观通道 + 显示层分流 ──────────────────────────────────
+# 通道让模型的生成过程能被"旁听"；分流器把原始输出转成该显示给用户的文本。
+from app.core.agent.delta_extract import DisplayRouter
+from app.core.agent.stream_sink import use_sink
 
 # ── Agent 编排前置 Pipeline（改写 + 意图 + 模式决策）注入 ────────────
 from app.api.depends.dependencies import (
@@ -298,6 +303,85 @@ def _sse_payload(data: Dict[str, Any]) -> bytes:
     return b"data: " + json.dumps(data, ensure_ascii=False).encode() + b"\n\n"
 
 
+class _QueueSink:
+    """把事件从任意线程安全地投递到主事件循环的队列。
+
+    ⚠️ Pipeline 跑在 ``asyncio.to_thread`` 的工作线程里，而 SSE 生成器在主循环；
+    直接从线程写 ``asyncio.Queue`` 不是线程安全的，必须走
+    ``call_soon_threadsafe``。
+    """
+
+    def __init__(
+        self, *, loop: "asyncio.AbstractEventLoop", queue: "asyncio.Queue"
+    ) -> None:
+        self._loop = loop
+        self._queue = queue
+
+    def push(self, event: Dict[str, Any]) -> None:
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+
+
+async def _drain_queue(
+    queue: "asyncio.Queue",
+    *,
+    until: "Optional[asyncio.Task]" = None,
+) -> AsyncIterator[Dict[str, Any]]:
+    """产出队列里的所有事件。
+
+    给了 ``until`` 时：边等它完成边排空；它完成后再**补排空一次**——
+    否则任务结束前最后一刻投递的事件会丢（spec §4.3 / 风险 4）。
+    """
+    if until is None:
+        while not queue.empty():
+            yield queue.get_nowait()
+        return
+
+    while not until.done():
+        try:
+            yield await asyncio.wait_for(queue.get(), timeout=0.05)
+        except asyncio.TimeoutError:
+            continue
+    while not queue.empty():
+        yield queue.get_nowait()
+
+
+def _drain_nowait(queue: "asyncio.Queue") -> List[Dict[str, Any]]:
+    """同步排空队列（用于与图事件交错消费的场景）。"""
+    out: List[Dict[str, Any]] = []
+    while not queue.empty():
+        out.append(queue.get_nowait())
+    return out
+
+
+def _bump_attempt(count: int, event: Dict[str, Any]) -> int:
+    """统计"本请求内第几次尝试"（换候选/重试都会新起一次）。
+
+    调用器每次被调用即一次新尝试，它在开流前先发一条 ``attempt_start``。
+    """
+    return count + 1 if event.get("kind") == "attempt_start" else count
+
+
+def _render_answer_delta(
+    router: DisplayRouter, event: Dict[str, Any], attempt_count: int
+) -> Iterator[bytes]:
+    """把一个旁路事件渲染成 0..2 条 SSE 负载。
+
+    ⚠️ ``attempt_reset`` 的语义（spec §4.4）：**第 1 条 attempt_start 不插分隔**
+    ——它只是"新一轮生成开始"；从第 2 条起，且此前已有内容，才标注上段废弃
+    （用户选的是"保留并标注"，不清空）。
+    """
+    kind = event.get("kind")
+    if kind == "attempt_start":
+        if attempt_count >= 1 and router.visible_any():
+            yield _sse_payload({"delta": {"phase": "answer", "attempt_reset": True}})
+        return
+    if kind != "delta":
+        return
+    visible = router.feed(event.get("text") or "")
+    if visible:
+        yield _sse_payload({"delta": {"phase": "answer", "text": visible}})
+
+
 async def _stream_final_answer(
     text: str,
     trace_id: str,
@@ -412,14 +496,33 @@ async def _agent_stream_generator(
     _background_memory_prefetch_tasks.add(long_term_recall_task)
     long_term_recall_task.add_done_callback(_on_memory_prefetch_done)
 
-    pipeline_output = await asyncio.to_thread(
-        pipeline.run,
-        request.query,
-        registered_tool_snapshot,
-        active_session_id,
-        rewrite_history_messages,
-        available_skills_snapshot,
-    )
+    # ---- 改写 + 意图阶段：装通道，边跑边把 rewritten_question 逐字推出去 ----
+    #
+    # ⚠️ `use_sink` 必须在 `create_task` **之前**进入：`asyncio.to_thread` 是在
+    #    提交任务的那一刻复制上下文的，通道晚装一秒，工作线程里就读不到，
+    #    表现为"一个字都不流"且**不报任何错**。
+    delta_queue: "asyncio.Queue" = asyncio.Queue()
+    rewrite_sink = _QueueSink(loop=asyncio.get_running_loop(), queue=delta_queue)
+    rewrite_router = DisplayRouter("rewrite")
+
+    with use_sink(rewrite_sink):
+        pipeline_task = asyncio.create_task(
+            asyncio.to_thread(
+                pipeline.run,
+                request.query,
+                registered_tool_snapshot,
+                active_session_id,
+                rewrite_history_messages,
+                available_skills_snapshot,
+            )
+        )
+        async for sink_event in _drain_queue(delta_queue, until=pipeline_task):
+            if sink_event.get("kind") != "delta":
+                continue
+            visible = rewrite_router.feed(sink_event.get("text") or "")
+            if visible:
+                yield _sse_payload({"delta": {"phase": "rewrite", "text": visible}})
+        pipeline_output = await pipeline_task
 
     # ------------------------------------------------------------------
     # 2.5 【改进点 1 · sys 短路】系统意图命中 → 走标准聊天核心，不启动 Agent
@@ -527,13 +630,69 @@ async def _agent_stream_generator(
     # 2.2：注入进程级 GraphRunner（Redis checkpointer），供审批 interrupt/续跑
     agent_orchestrator.set_graph_runner(agent_graph_runner)
 
-    orchestrator_result = await agent_orchestrator.run(
-        user_input=effective_user_input,
-        session_id=active_session_id,
-        mode=final_mode,
-        intent=intent_context_for_orchestrator,
-        precomputed_memory=precomputed_memory_for_orchestrator,
-    )
+    # ⚠️ 边跑边推：Agent 还在执行时就把工具调用过程逐条推给前端。
+    #    改前这里是 `await ...run(...)` —— 整张图跑完才开始吐字节，用户看到的是
+    #    长时间空白 + 结尾整段答案（步骤数据本来就在 state.steps 里，只是没人往外送）。
+    answer_queue: "asyncio.Queue" = asyncio.Queue()
+    answer_sink = _QueueSink(loop=asyncio.get_running_loop(), queue=answer_queue)
+    answer_router = DisplayRouter("answer")
+    attempt_count = 0
+
+    orchestrator_result: Any = None
+    with use_sink(answer_sink):
+        graph_events = agent_orchestrator.run_stream(
+            user_input=effective_user_input,
+            session_id=active_session_id,
+            mode=final_mode,
+            intent=intent_context_for_orchestrator,
+            precomputed_memory=precomputed_memory_for_orchestrator,
+        ).__aiter__()
+
+        # ⚠️ 常驻 next_task，**不要**写成 wait_for(graph_events.__anext__(), timeout=…):
+        #    那会在超时时 cancel 掉正在执行的 __anext__，把异步生成器弄坏
+        #    （RuntimeError: already running，或静默丢失事件）。
+        #    这里只对"等待它"设超时，任务本身跨轮存活。
+        next_task: "asyncio.Task" = asyncio.ensure_future(graph_events.__anext__())
+        while True:
+            done, _ = await asyncio.wait({next_task}, timeout=0.05)
+
+            # 每轮先把旁路攒下的 delta 推完，再推图事件——保证"边生成边看"
+            for sink_event in _drain_nowait(answer_queue):
+                for sse_chunk in _render_answer_delta(
+                    answer_router, sink_event, attempt_count
+                ):
+                    yield sse_chunk
+                attempt_count = _bump_attempt(attempt_count, sink_event)
+
+            if not done:
+                continue
+            try:
+                event = next_task.result()
+            except StopAsyncIteration:
+                break
+            next_task = asyncio.ensure_future(graph_events.__anext__())
+
+            if event.get("type") == "step":
+                # 步骤事件：{"node", "tool", "title", "status", "detail"}
+                payload: Dict[str, Any] = {
+                    key: value for key, value in event.items() if key != "type"
+                }
+                yield _sse_payload({"step": payload})
+            elif event.get("type") == "final":
+                orchestrator_result = event["response"]
+
+        # 收尾补排空：最后一片 delta 可能在图结束的同一刻才投递到队列
+        for sink_event in _drain_nowait(answer_queue):
+            for sse_chunk in _render_answer_delta(
+                answer_router, sink_event, attempt_count
+            ):
+                yield sse_chunk
+            attempt_count = _bump_attempt(attempt_count, sink_event)
+
+    if orchestrator_result is None:  # 不应发生：run_stream 契约保证必有一个 final
+        logger.error("编排器未产出终局响应，提前结束流。session_id={}", active_session_id)
+        yield _sse_payload({"error": "编排器未返回终局结果"})
+        return
 
     # ------------------------------------------------------------------
     # 4. 状态检查与断言保护
@@ -659,6 +818,46 @@ async def chat(
         logger.exception("chat 失败: {}", exc)
         _tracer.end_span(span, error=str(exc))
         raise HTTPException(status_code=500, detail=f"对话失败: {exc!s}") from exc
+
+
+@router.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    memory_manager: MemoryManager = Depends(get_memory_manager),
+    agent_graph_runner: Any = Depends(get_agent_graph_runner),
+) -> Dict[str, Any]:
+    """删除一个会话：清掉后端按 ``session_id`` 存的全部数据。
+
+    ⚠️ 为什么必须两侧都删：后端**没有**会话列表接口，会话历史（消息正文）存在
+    前端 localStorage；而后端按 ``session_id`` 另存了三份东西——短期记忆（Redis）、
+    长期记忆（向量库）、Agent 检查点。只删前端就是"删了还在"：下一轮召回仍会命中
+    旧记录，挂起的审批也仍会出现在待审批列表里。
+
+    返回值逐项如实回传（``memory`` 里每项 ``ok`` / ``failed: ...``），
+    前端据此判断是否可以安全地把本地会话一并删掉——报成功但实际没清干净
+    比直接失败更糟。
+    """
+    sid: str = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=422, detail="session_id 不能为空")
+
+    memory_outcome: Dict[str, str] = await memory_manager.forget_session(sid)
+
+    try:
+        removed_runs: int = await agent_graph_runner.delete_session_runs(sid)
+    except Exception as runs_error:  # noqa: BLE001 - 检查点清理失败不该让整个删除失败
+        logger.warning("清理会话检查点失败（记忆已清）: session_id={}, error={}", sid, runs_error)
+        removed_runs = 0
+
+    logger.info(
+        "会话已删除: session_id={}, memory={}, removed_runs={}",
+        sid, memory_outcome, removed_runs,
+    )
+    return {
+        "session_id": sid,
+        "memory": memory_outcome,
+        "removed_runs": removed_runs,
+    }
 
 
 async def _stream_generator(request: ChatRequest, trace_id: str) -> AsyncIterator[bytes]:

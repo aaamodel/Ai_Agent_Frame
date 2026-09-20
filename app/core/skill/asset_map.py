@@ -26,7 +26,7 @@ _NAME_HINTS = ("资产", "名称", "文件", "表名", "数据集")
 _LOCATION_HINTS = ("位置", "路径", "目录", "存放")
 _USAGE_HINTS = ("用途", "工具", "调用", "说明")
 
-# 用途列里出现的工具名形态：local_excel_read_tool / rag_knowledge_search 等
+# 用途列里出现的工具名形态：sales_sql_query / rag_knowledge_search 等
 _TOOL_PATTERN = re.compile(r"[a-z][a-z0-9_]*(?:_tool|_search|_query|_export)")
 
 # 单元格里的反引号与空白
@@ -208,3 +208,40 @@ def render_facts_for_prompt(facts: Any, max_chars: int = 400) -> str:
     if not kept:
         return ""
     return header + "\n".join(kept)
+
+
+# ---------------------------------------------------------------------------
+# 手动检查接口：python -m app.core.skill.asset_map [SKILL.md ...]
+# 不传路径时扫描 skills/*/SKILL.md，逐个打印提取结果（解析失败打印 0 条，不报错）。
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    args = sys.argv[1:]
+    if args:
+        targets = [Path(p) for p in args]
+    else:
+        repo_root = Path(__file__).resolve().parents[3]
+        targets = sorted((repo_root / "skills").glob("*/SKILL.md"))
+
+    if not targets:
+        print("未找到任何 SKILL.md")
+        sys.exit(0)
+
+    for target in targets:
+        print(f"\n=== {target} ===")
+        try:
+            text = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"  读取失败: {exc}")
+            continue
+        facts = extract_asset_facts(text)
+        print(f"提取 {len(facts)} 条资产事实：")
+        for fact in facts:
+            tool_part = f"  [工具: {fact.tool}]" if fact.tool else ""
+            print(f"  - {fact.name} = {fact.location}{tool_part}")
+        rendered = render_facts_for_prompt([fact.as_dict() for fact in facts])
+        if rendered:
+            print("--- 注入子任务/重规划的文本 ---")
+            print(rendered)

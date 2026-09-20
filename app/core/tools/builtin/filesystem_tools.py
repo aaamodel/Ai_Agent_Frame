@@ -18,7 +18,7 @@ class FileReadTool(BaseTool):
     name: str = "file_read_tool"
     description: str = (
         "读取文本类文件（代码/配置/文档/日志等）。"
-        "不用于 Excel 等二进制文件（请用 local_excel_read_tool）。"
+        "不用于 Excel 等二进制文件（业务数据请直接用 sales_sql_query 查库）。"
     )
     """
     description: str = (
@@ -26,7 +26,7 @@ class FileReadTool(BaseTool):
         "或者你已经通过 file_list_tool / file_grep_tool 锁定了具体文件、现在需要查看它的完整内容或某段行范围时，调用本工具。"
         "典型场景：阅读某段源码、查看配置文件、读取文档正文、按行分页查看长文件。"
         "【能力】按行读取指定路径文件内容，支持 offset（起始行，0 基）和 limit（最大行数，默认 2000）分页，防止单次内容过长打爆上下文。"
-        "【不要用于】读取 Excel/二进制等非文本文件——这类请改用 local_excel_read_tool；本工具只面向可解码为文本的文件。"
+        "【不要用于】读取 Excel/二进制等非文本文件——这类请改用 sales_sql_query 查业务库；本工具只面向可解码为文本的文件。"
         "【前提】请先用 file_list_tool 或 file_grep_tool 确认目标路径真实存在，避免臆造路径。"
     )
     """

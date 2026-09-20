@@ -128,7 +128,6 @@ async def _build_collection_infos(
             KbCollectionInfo(
                 name=tag,
                 description=descriptor.description if descriptor else None,
-                retrieval_hint=descriptor.retrieval_hint if descriptor else None,
                 document_count=len(file_names),
                 vector_chunk_count=sum(milvus_files.values()),
                 files=files,
@@ -146,25 +145,21 @@ async def upload_document(
         collection_name: str = Form(default="", description="逻辑集合名；空串用默认知识库集合"),
         description: str = Form(
             default="",
-            description="集合功能描述：这个集合里是什么内容、覆盖什么主题",
-        ),
-        retrieval_hint: str = Form(
-            default="",
-            description="检索时机描述：用户出现什么样的问题/表达时应该检索这个集合",
+            description="集合描述：这个集合里是什么内容、覆盖什么主题，"
+                        "以及用户出现什么样的问题时应检索它",
         ),
 ) -> DocumentUploadResponse:
     """上传文档：LlamaIndex 解析 + SentenceSplitter 分块，写入 Milvus 与 BM25，
     并保留 Postgres 文档元数据记录以支撑列表接口。
 
-    可选的 ``description`` / ``retrieval_hint`` 会登记（upsert）到集合注册表，
-    供意图识别把后续问题路由到本集合。
+    可选的 ``description`` 会登记（upsert）到集合注册表，供意图识别把后续问题
+    路由到本集合。它是集合**唯一**的路由语义字段——不再有第二份"检索时机"文本。
     """
     settings = get_settings()
     kb_collection: str = _validate_collection_name(
         collection_name
     ) or settings.milvus_kb_collection_name
     description = (description or "").strip()
-    retrieval_hint = (retrieval_hint or "").strip()
     upload_root = Path("uploads")
     upload_root.mkdir(parents=True, exist_ok=True)
 
@@ -224,12 +219,11 @@ async def upload_document(
                     meta=None,
                 )
             )
-        if description or retrieval_hint:
+        if description:
             await upsert_vector_collection(
                 session,
                 kb_collection,
                 description=description or None,
-                retrieval_hint=retrieval_hint or None,
             )
         await session.commit()
     except Exception as exc:
@@ -253,7 +247,6 @@ async def upload_document(
         chunk_count=len(chunks),
         collection_name=kb_collection,
         description=description or None,
-        retrieval_hint=retrieval_hint or None,
         message="LlamaIndex 解析/分块/入库全链路成功",
     )
 

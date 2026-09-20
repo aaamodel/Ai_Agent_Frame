@@ -151,7 +151,7 @@ class VectorCollection(Base):
         String(16), nullable=False, server_default="rag", default="rag"
     )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    retrieval_hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=datetime.utcnow,
