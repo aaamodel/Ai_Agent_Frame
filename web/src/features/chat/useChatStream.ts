@@ -1,12 +1,12 @@
 import { useCallback, useRef, useState } from "react";
 
 import { apiResumeRun } from "@/api/approvals";
-import { streamAgentChat } from "@/api/chat";
+import { sendPlainChat, streamAgentChat } from "@/api/chat";
 import type { ApprovalDecision } from "@/api/types";
 import { parseSSEStream } from "@/lib/sse";
 
 import { toStreamEvent } from "./streamEvents";
-import type { ApprovalRequest, ChatMessage } from "./types";
+import type { ApprovalRequest, ChatMessage, ChatMode } from "./types";
 
 export type MessageUpdater = (updater: (m: ChatMessage) => ChatMessage) => void;
 
@@ -39,6 +39,21 @@ export function useChatStream(onMessage: MessageUpdater) {
 
         if (ev.kind === "content") {
           onMessage((m) => ({ ...m, text: m.text + ev.text }));
+        } else if (ev.kind === "step") {
+          // 执行过程：累积到当前助手消息上，用户能在答案出来之前就看到进展
+          onMessage((m) => ({
+            ...m,
+            steps: [
+              ...(m.steps ?? []),
+              {
+                node: ev.node,
+                tool: ev.tool,
+                title: ev.title,
+                status: ev.status,
+                detail: ev.detail,
+              },
+            ],
+          }));
         } else if (ev.kind === "awaiting_approval") {
           // 记录挂起，等用户决策；**不能**在这里当成结束
           sawApproval = { runId: ev.runId, approvals: ev.approvals };
@@ -90,12 +105,57 @@ export function useChatStream(onMessage: MessageUpdater) {
     [onMessage],
   );
 
+  /**
+   * 发送一轮对话。
+   *
+   * `mode = "agent"`（默认）走 `/chat/with_agent` 的 SSE 流；
+   * `mode = "chat"` 闲聊走 `/chat` 的一次性 JSON——没有审批、没有降级、
+   * 也没有步数（后端这个端点不产出这些字段）。
+   *
+   * ⚠️ 默认值 `agent` 是刻意的：既有的调用方与测试都只传两个参数，
+   *   不应因为新增模式而改变它们的行为。
+   */
   const send = useCallback(
-    async (query: string, sessionId: string) => {
+    async (query: string, sessionId: string, mode: ChatMode = "agent") => {
       setIsStreaming(true);
       setPendingApproval(null);
       const controller = new AbortController();
       abortRef.current = controller;
+
+      // 在占位消息上先记下模式，界面上才知道这条回答来自哪条链路
+      onMessage((m) => ({ ...m, mode }));
+
+      // ---------- 闲聊：一次性 JSON，没有流也没有审批 ----------
+      if (mode === "chat") {
+        try {
+          const resp = await sendPlainChat(query, sessionId, controller.signal);
+          onMessage((m) => ({
+            ...m,
+            text: resp.content,
+            meta: {
+              status: "success",
+              degraded: false,
+              stepsExecuted: 0,
+              traceId: resp.trace_id ?? "",
+              // 后端把 session_id 复用在 id 字段里返回
+              sessionId: resp.id || sessionId,
+            },
+          }));
+          setIsStreaming(false);
+        } catch (e) {
+          if (controller.signal.aborted) {
+            onMessage((m) => ({ ...m, interrupted: true }));
+            setIsStreaming(false);
+            return;
+          }
+          const message = e instanceof Error ? e.message : String(e);
+          onMessage((m) => ({ ...m, error: message }));
+          setIsStreaming(false);
+        }
+        return;
+      }
+
+      // ---------- 工作任务：SSE 流 ----------
       try {
         const stream = await streamAgentChat(
           query,

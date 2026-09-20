@@ -1,5 +1,16 @@
 export type ChatRole = "user" | "assistant";
 
+/**
+ * 对话模式。
+ *
+ * - `chat`  闲聊 → `POST /chat`（**非流式 JSON**，走意图识别 + 记忆召回，不碰工具）
+ * - `agent` 工作任务 → `POST /chat/with_agent`（**SSE 流式**，可触发审批/降级）
+ *
+ * ⚠️ 两者返回形态不同：闲聊一次拿到完整 JSON，工作任务逐段吐 SSE。
+ * 状态机在 useChatStream 里据此分叉。
+ */
+export type ChatMode = "chat" | "agent";
+
 export interface MessageMeta {
   status: string;
   degraded: boolean;
@@ -13,16 +24,29 @@ export interface ApprovalRequest {
   approvals: unknown[];
 }
 
+/** 执行过程中的一步（工具调用 / 子任务结论）。后端在跑图时逐条推送。 */
+export interface AgentStep {
+  node: string;
+  tool: string | null;
+  title: string;
+  status: string;
+  detail: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
   text: string;
+  /** 这条回答由哪种模式产生（旧数据没有该字段，按工作任务处理） */
+  mode?: ChatMode;
   meta?: MessageMeta;
   /** 流式被中断（用户切页/卸载），这一轮没有正常走完 */
   interrupted?: boolean;
   error?: string;
   /** 该助手消息上挂着一个待审批项 */
   approval?: ApprovalRequest;
+  /** 执行过程（Agent 跑图时逐条推送，用于让用户看见"它在干什么"） */
+  steps?: AgentStep[];
   /** 该消息对应的审批已失效 */
   approvalExpired?: boolean;
 }

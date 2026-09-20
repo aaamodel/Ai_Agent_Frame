@@ -15,6 +15,22 @@ export interface DoneEvent {
   runId?: string;
 }
 
+/**
+ * 步骤事件：Agent 执行过程中的一次工具调用 / 子任务结论。
+ *
+ * 由后端 `/chat/with_agent` 在图**还在跑**的时候逐条推送（改前这些步骤只存在
+ * 于 state.steps 里，整张图跑完才随 done 一起到达，前端全程无反馈）。
+ */
+export interface StepEvent {
+  kind: "step";
+  /** 产出该步骤的图节点名（execute / plan / summarize …） */
+  node: string;
+  tool: string | null;
+  title: string;
+  status: string;
+  detail: string;
+}
+
 export interface AwaitingApprovalEvent {
   kind: "awaiting_approval";
   runId: string;
@@ -30,7 +46,8 @@ export type StreamEvent =
   | ContentEvent
   | DoneEvent
   | AwaitingApprovalEvent
-  | ErrorEvent;
+  | ErrorEvent
+  | StepEvent;
 
 function str(v: unknown): string {
   return typeof v === "string" ? v : v == null ? "" : String(v);
@@ -48,6 +65,19 @@ export function toStreamEvent(
 ): StreamEvent | null {
   if (raw.error) {
     return { kind: "error", message: str(raw.error) };
+  }
+
+  // 步骤事件：载荷在 `step` 子对象里，与 done 互斥，顺序上先于 awaiting_approval 判定也无妨
+  if (raw.step && typeof raw.step === "object") {
+    const s = raw.step as Record<string, unknown>;
+    return {
+      kind: "step",
+      node: str(s.node),
+      tool: s.tool ? str(s.tool) : null,
+      title: str(s.title),
+      status: str(s.status) || "ok",
+      detail: str(s.detail),
+    };
   }
 
   if (raw.awaiting_approval) {

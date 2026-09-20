@@ -204,4 +204,94 @@ describe("useChatStream", () => {
     expect(messages[0]?.text).toBe("已经渲染的部分");
     expect(messages[0]?.error).toBe("模型超时");
   });
+
+  // ---------- 闲聊模式（/chat，非流式 JSON） ----------
+
+  it("闲聊模式走 /chat 一次写入正文，不碰 SSE 接口", async () => {
+    const plain = vi.spyOn(chatApi, "sendPlainChat").mockResolvedValue({
+      id: "s1",
+      model: "m1",
+      content: "闲聊回答",
+      trace_id: "t9",
+    });
+    const agent = vi.spyOn(chatApi, "streamAgentChat");
+
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("你好", "s1", "chat");
+    });
+
+    expect(plain).toHaveBeenCalledWith("你好", "s1", expect.anything());
+    expect(agent).not.toHaveBeenCalled();
+    expect(messages[0]?.text).toBe("闲聊回答");
+    expect(messages[0]?.mode).toBe("chat");
+    expect(messages[0]?.meta?.traceId).toBe("t9");
+    expect(result.current.isStreaming).toBe(false);
+  });
+
+  it("闲聊模式后端不产出步数，脚注不应写'执行 0 步'式的假数据", async () => {
+    vi.spyOn(chatApi, "sendPlainChat").mockResolvedValue({
+      id: "s1",
+      model: "m1",
+      content: "回答",
+    });
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1", "chat");
+    });
+    expect(messages[0]?.meta?.stepsExecuted).toBe(0);
+  });
+
+  it("闲聊模式出错时记录错误且不丢模式标记", async () => {
+    vi.spyOn(chatApi, "sendPlainChat").mockRejectedValue(
+      new Error("模型超时"),
+    );
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1", "chat");
+    });
+    expect(messages[0]?.error).toBe("模型超时");
+    expect(messages[0]?.mode).toBe("chat");
+    expect(result.current.isStreaming).toBe(false);
+  });
+
+  it("不传模式时默认走工作任务（既有调用方行为不变）", async () => {
+    const agent = vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
+      sseStream(['data: {"done":true,"status":"success"}\n\n']),
+    );
+    const plain = vi.spyOn(chatApi, "sendPlainChat");
+    const { onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1");
+    });
+    expect(agent).toHaveBeenCalled();
+    expect(plain).not.toHaveBeenCalled();
+  });
+
+  it("执行过程（step）逐条累积到当前助手消息上，且不影响正文", async () => {
+    vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
+      sseStream([
+        'data: {"step":{"node":"execute","tool":"sales_sql_query","title":"查销售额","status":"ok","detail":"12 行"}}\n\n',
+        'data: {"step":{"node":"execute","tool":"rag_knowledge_search","title":"查口径","status":"empty_data","detail":"无"}}\n\n',
+        'data: {"content":"答案正文"}\n\n',
+        'data: {"done":true,"status":"success","steps_executed":2}\n\n',
+      ]),
+    );
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1");
+    });
+
+    expect(messages[0]?.steps).toHaveLength(2);
+    expect(messages[0]?.steps?.[0]?.tool).toBe("sales_sql_query");
+    expect(messages[0]?.steps?.[1]?.status).toBe("empty_data");
+    // 步骤不能覆盖或污染正文
+    expect(messages[0]?.text).toBe("答案正文");
+    expect(messages[0]?.meta?.stepsExecuted).toBe(2);
+  });
 });

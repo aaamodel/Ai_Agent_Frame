@@ -61,4 +61,37 @@ describe("toStreamEvent", () => {
   it("认不出来的事件返回 null", () => {
     expect(toStreamEvent({ 无关字段: 1 })).toBeNull();
   });
+
+  it("step 事件（执行过程）带上工具名与状态", () => {
+    expect(
+      toStreamEvent({
+        step: {
+          node: "execute",
+          tool: "sales_sql_query",
+          title: "查销售额",
+          status: "ok",
+          detail: "返回 12 行",
+        },
+      }),
+    ).toEqual({
+      kind: "step",
+      node: "execute",
+      tool: "sales_sql_query",
+      title: "查销售额",
+      status: "ok",
+      detail: "返回 12 行",
+    });
+  });
+
+  it("step 事件缺 status 时默认 ok，tool 为空时归 null", () => {
+    const ev = toStreamEvent({ step: { node: "summarize", title: "汇总" } });
+    expect(ev).toEqual({
+      kind: "step",
+      node: "summarize",
+      tool: null,
+      title: "汇总",
+      status: "ok",
+      detail: "",
+    });
+  });
 });
