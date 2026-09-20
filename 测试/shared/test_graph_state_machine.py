@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / "app").is_dir())))
 
 from langgraph.checkpoint.memory import InMemorySaver
 
