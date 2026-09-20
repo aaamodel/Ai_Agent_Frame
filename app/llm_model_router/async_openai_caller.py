@@ -460,6 +460,16 @@ async def async_openai_chat_caller(
         raise
 
     # 3) 标准化结果
+    return _standardize_completion(resp, target)
+
+
+def _standardize_completion(resp: Any, target: ModelTarget) -> AsyncOpenAICallResult:
+    """把 OpenAI 的 ChatCompletion 响应标准化为 ``AsyncOpenAICallResult``。
+
+    ⚠️ 这是**非流式路径与"探测回落"共用**的标准化入口：两条路径必须给出完全
+    一致的字段，否则"厂商不支持流式"时用户拿到的结果与原来不同。
+    本函数是从原 ``async_openai_chat_caller`` 内联块**原样搬移**而来。
+    """
     choice = resp.choices[0] if getattr(resp, "choices", None) else None
     content: str = ""
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -547,30 +557,67 @@ async def _streaming_chat_call(
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     usage: Optional[Dict[str, Any]] = None
+    # tool_calls 在流里是按 index 分片下发的，必须按 index 聚合成完整调用
+    tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+    received_any_chunk: bool = False
 
-    stream = await client.chat.completions.create(**params)
-    async for chunk in stream:
-        chunk_usage = getattr(chunk, "usage", None)
-        if chunk_usage is not None:
-            usage = {
-                "prompt_tokens": getattr(chunk_usage, "prompt_tokens", None),
-                "completion_tokens": getattr(chunk_usage, "completion_tokens", None),
-                "total_tokens": getattr(chunk_usage, "total_tokens", None),
-            }
-        choices = getattr(chunk, "choices", None) or []
-        if not choices:
-            continue
-        delta = getattr(choices[0], "delta", None)
-        if delta is None:
-            continue
-        text = getattr(delta, "content", None)
-        if text:
-            content_parts.append(text)
-            # 旁路推送：失败被 emit 内部吞掉，绝不影响主链路
-            _emit_delta({"kind": "delta", "text": text})
-        reasoning = getattr(delta, "reasoning_content", None)
-        if reasoning:
-            reasoning_parts.append(reasoning)
+    try:
+        stream = await client.chat.completions.create(**params)
+        async for chunk in stream:
+            received_any_chunk = True
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = {
+                    "prompt_tokens": getattr(chunk_usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(chunk_usage, "completion_tokens", None),
+                    "total_tokens": getattr(chunk_usage, "total_tokens", None),
+                }
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            text = getattr(delta, "content", None)
+            if text:
+                content_parts.append(text)
+                # 旁路推送：失败被 emit 内部吞掉，绝不影响主链路
+                _emit_delta({"kind": "delta", "text": text})
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+            for tc in (getattr(delta, "tool_calls", None) or []):
+                idx = int(getattr(tc, "index", 0) or 0)
+                slot = tool_calls_acc.setdefault(idx, {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": None, "arguments": ""},
+                })
+                if getattr(tc, "id", None):
+                    slot["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["function"]["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["function"]["arguments"] += fn.arguments
+    except Exception as exc:  # noqa: BLE001
+        # 方案 A（spec §10.1）：**首 chunk 之前**失败、且异常特征像"参数组合不被
+        # 厂商接受"时，同一次尝试内退回非流式重发，且不推任何 delta。
+        # 探测请求不计入"增加调用次数"（用户已认可）；厂商不支持流式时
+        # 用户看到的就是"这段没有逐字、直接出结果"。
+        if not received_any_chunk and _looks_like_params_rejected(exc):
+            logger.warning(
+                "流式参数不被接受，本次尝试退回非流式重发: provider=%s modelId=%s err=%s",
+                target.candidate.provider,
+                target.id,
+                exc,
+            )
+            resp = await client.chat.completions.create(**_strip_stream(params))
+            return _standardize_completion(resp, target)
+        # 其它异常（超时/连接/5xx/首 chunk 后断流）原样抛出，
+        # 交由现有 run_with_attempt_budget 重试与候选降级处理。
+        raise
 
     content: str = "".join(content_parts)
     if not content and reasoning_parts:
@@ -582,6 +629,23 @@ async def _streaming_chat_call(
         model_id=target.candidate.model or target.id,
         usage=usage,
         raw=None,
-        tool_calls=None,
+        tool_calls=[tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None,
         reasoning_content="".join(reasoning_parts) or None,
     )
+
+
+def _looks_like_params_rejected(exc: BaseException) -> bool:
+    """异常是否像"参数组合不被厂商接受"（spec §10.1 第 2 条）。"""
+    return getattr(exc, "status_code", None) in (400, 422)
+
+
+def _strip_stream(params: Dict[str, Any]) -> Dict[str, Any]:
+    """剥掉流式相关参数，供"探测回落"复用同一份调用参数。
+
+    ⚠️ 必须是"除 stream 外完全相同"的 params —— 两条路径若参数有差异，
+    回落后的结果与原来就不一致了。
+    """
+    out = dict(params)
+    out.pop("stream", None)
+    out.pop("stream_options", None)
+    return out
