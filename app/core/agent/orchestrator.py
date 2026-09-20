@@ -14,7 +14,7 @@ Agent 编排器门面（2.2 状态图版）：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
 # 💡 项目统一日志
 from loguru import logger
@@ -147,29 +147,68 @@ class AgentOrchestrator:
         - 记忆/技能/工具预算/审批闸门等全部在图节点内完成；
         - 危险工具审批开启且命中时，返回 ``awaiting_approval=True`` 的挂起响应，
           调用方需凭 ``run_id`` 走审批恢复端点续跑。
+
+        ⚠️ 与改造前**完全等价**：真正的执行循环在 :meth:`run_stream` 里，
+        这里只把它抽干并返回终局。需要"过程可见"的调用方改用 :meth:`run_stream`。
+        """
+        async for event in self.run_stream(
+            user_input=user_input,
+            session_id=session_id,
+            mode=mode,
+            intent=intent,
+            precomputed_memory=precomputed_memory,
+        ):
+            if event.get("type") == "final":
+                return event["response"]
+        raise RuntimeError("run_stream 未产出终局响应（不应发生）")
+
+    async def run_stream(
+            self,
+            user_input: str,
+            session_id: str,
+            mode: str = "react",
+            intent: Optional[IntentContext] = None,
+            precomputed_memory: Optional[Any] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """执行 Agent 编排，**边跑边产出步骤事件**。
+
+        产出两类事件：
+
+        - ``{"type": "step", ...}``：工具调用 / 子任务结论（来自图节点的 steps 记录）
+        - ``{"type": "final", "response": AgentResponse}``：终局（必有且只有一个）
+
+        这样 SSE 层就能在 Agent 还在跑的时候把过程推给前端，而不是像以前那样
+        等整张图跑完才开始吐字节。
         """
         intent_context: IntentContext = intent or IntentContext()
         try:
-            outcome = await self._get_graph_runner().run(
+            async for event in self._get_graph_runner().run_stream(
                 deps=self._build_deps(),
                 user_input=user_input,
                 session_id=session_id,
                 mode=mode,
                 intent=intent_context,
                 precomputed_memory=precomputed_memory,
-            )
-            return outcome.response
+            ):
+                if event.get("type") == "step":
+                    yield event
+                elif event.get("type") == "outcome":
+                    outcome = event.get("outcome")
+                    yield {"type": "final", "response": outcome.response}
         except Exception as system_uncaught_exception:  # noqa: BLE001 - 门面兜底契约
             logger.exception("智能体编排器门面发生未捕获的严重异常")
-            return AgentResponse(
-                answer="",
-                mode_used="react",
-                success=False,
-                trace_id=getattr(self._tracer, "new_trace_id", lambda: "")(),
-                intent=intent_context,
-                steps=[],
-                error=str(system_uncaught_exception),
-            )
+            yield {
+                "type": "final",
+                "response": AgentResponse(
+                    answer="",
+                    mode_used="react",
+                    success=False,
+                    trace_id=getattr(self._tracer, "new_trace_id", lambda: "")(),
+                    intent=intent_context,
+                    steps=[],
+                    error=str(system_uncaught_exception),
+                ),
+            }
 
     # ------------------------------------------------------------------
     # HITL：审批恢复 / 运行状态查询（标准档新增，供 agent_runs 路由调用）

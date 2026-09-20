@@ -527,13 +527,30 @@ async def _agent_stream_generator(
     # 2.2：注入进程级 GraphRunner（Redis checkpointer），供审批 interrupt/续跑
     agent_orchestrator.set_graph_runner(agent_graph_runner)
 
-    orchestrator_result = await agent_orchestrator.run(
+    # ⚠️ 边跑边推：Agent 还在执行时就把工具调用过程逐条推给前端。
+    #    改前这里是 `await ...run(...)` —— 整张图跑完才开始吐字节，用户看到的是
+    #    长时间空白 + 结尾整段答案（步骤数据本来就在 state.steps 里，只是没人往外送）。
+    orchestrator_result: Any = None
+    async for event in agent_orchestrator.run_stream(
         user_input=effective_user_input,
         session_id=active_session_id,
         mode=final_mode,
         intent=intent_context_for_orchestrator,
         precomputed_memory=precomputed_memory_for_orchestrator,
-    )
+    ):
+        if event.get("type") == "step":
+            # 步骤事件：{"node", "tool", "title", "status", "detail"}
+            payload: Dict[str, Any] = {
+                key: value for key, value in event.items() if key != "type"
+            }
+            yield _sse_payload({"step": payload})
+        elif event.get("type") == "final":
+            orchestrator_result = event["response"]
+
+    if orchestrator_result is None:  # 不应发生：run_stream 契约保证必有一个 final
+        logger.error("编排器未产出终局响应，提前结束流。session_id={}", active_session_id)
+        yield _sse_payload({"error": "编排器未返回终局结果"})
+        return
 
     # ------------------------------------------------------------------
     # 4. 状态检查与断言保护
@@ -659,6 +676,46 @@ async def chat(
         logger.exception("chat 失败: {}", exc)
         _tracer.end_span(span, error=str(exc))
         raise HTTPException(status_code=500, detail=f"对话失败: {exc!s}") from exc
+
+
+@router.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    memory_manager: MemoryManager = Depends(get_memory_manager),
+    agent_graph_runner: Any = Depends(get_agent_graph_runner),
+) -> Dict[str, Any]:
+    """删除一个会话：清掉后端按 ``session_id`` 存的全部数据。
+
+    ⚠️ 为什么必须两侧都删：后端**没有**会话列表接口，会话历史（消息正文）存在
+    前端 localStorage；而后端按 ``session_id`` 另存了三份东西——短期记忆（Redis）、
+    长期记忆（向量库）、Agent 检查点。只删前端就是"删了还在"：下一轮召回仍会命中
+    旧记录，挂起的审批也仍会出现在待审批列表里。
+
+    返回值逐项如实回传（``memory`` 里每项 ``ok`` / ``failed: ...``），
+    前端据此判断是否可以安全地把本地会话一并删掉——报成功但实际没清干净
+    比直接失败更糟。
+    """
+    sid: str = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=422, detail="session_id 不能为空")
+
+    memory_outcome: Dict[str, str] = await memory_manager.forget_session(sid)
+
+    try:
+        removed_runs: int = await agent_graph_runner.delete_session_runs(sid)
+    except Exception as runs_error:  # noqa: BLE001 - 检查点清理失败不该让整个删除失败
+        logger.warning("清理会话检查点失败（记忆已清）: session_id={}, error={}", sid, runs_error)
+        removed_runs = 0
+
+    logger.info(
+        "会话已删除: session_id={}, memory={}, removed_runs={}",
+        sid, memory_outcome, removed_runs,
+    )
+    return {
+        "session_id": sid,
+        "memory": memory_outcome,
+        "removed_runs": removed_runs,
+    }
 
 
 async def _stream_generator(request: ChatRequest, trace_id: str) -> AsyncIterator[bytes]:
