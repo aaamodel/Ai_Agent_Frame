@@ -54,6 +54,21 @@ export function useChatStream(onMessage: MessageUpdater) {
               },
             ],
           }));
+        } else if (ev.kind === "delta") {
+          // 逐字增量：改写进 rewriteText，答案进正文 —— 两条缓冲互相独立
+          onMessage((m) => {
+            if (ev.phase === "rewrite") {
+              return { ...m, rewriteText: (m.rewriteText ?? "") + ev.text };
+            }
+            if (ev.attemptReset) {
+              // 换候选/重试：旧的半截答案作废。按"保留并标注"策略移到
+              // abandoned，正文从空重新开始——不静默丢弃。
+              return m.text
+                ? { ...m, abandoned: [...(m.abandoned ?? []), m.text], text: "" }
+                : m;
+            }
+            return { ...m, text: m.text + ev.text };
+          });
         } else if (ev.kind === "awaiting_approval") {
           // 记录挂起，等用户决策；**不能**在这里当成结束
           sawApproval = { runId: ev.runId, approvals: ev.approvals };

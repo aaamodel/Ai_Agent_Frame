@@ -47,6 +47,15 @@ export interface ChatMessage {
   approval?: ApprovalRequest;
   /** 执行过程（Agent 跑图时逐条推送，用于让用户看见"它在干什么"） */
   steps?: AgentStep[];
+  /** 改写阶段的逐字缓冲（后端在模型生成时推，不是生成完再切片） */
+  rewriteText?: string;
+  /**
+   * 因模型切换/重试被废弃的段落。
+   *
+   * ⚠️ 用户选的是"保留并标注"而不是清空：换候选时旧内容移到这里，
+   * 界面上划掉并标注"上段因模型切换已废弃"——静默丢弃会让用户以为答案变了。
+   */
+  abandoned?: string[];
   /** 该消息对应的审批已失效 */
   approvalExpired?: boolean;
 }

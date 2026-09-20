@@ -31,6 +31,24 @@ export interface StepEvent {
   detail: string;
 }
 
+/**
+ * 逐字增量事件。
+ *
+ * 后端在模型**正在生成**时推送（不是生成完再切片）：
+ *
+ * - `phase: "rewrite"` —— 问题改写的逐字（已从结构化 JSON 里抽出 `rewritten_question`）
+ * - `phase: "answer"`  —— 最终答案 / 汇总结论的逐字
+ *
+ * `attemptReset` 为真表示**换了模型候选或重试**：此前已渲染的内容作废。
+ * 按用户选定的策略是"保留并标注"——调用方应把旧内容移入 abandoned，而不是清空丢弃。
+ */
+export interface DeltaEvent {
+  kind: "delta";
+  phase: "rewrite" | "answer";
+  text: string;
+  attemptReset: boolean;
+}
+
 export interface AwaitingApprovalEvent {
   kind: "awaiting_approval";
   runId: string;
@@ -47,7 +65,8 @@ export type StreamEvent =
   | DoneEvent
   | AwaitingApprovalEvent
   | ErrorEvent
-  | StepEvent;
+  | StepEvent
+  | DeltaEvent;
 
 function str(v: unknown): string {
   return typeof v === "string" ? v : v == null ? "" : String(v);
@@ -77,6 +96,19 @@ export function toStreamEvent(
       title: str(s.title),
       status: str(s.status) || "ok",
       detail: str(s.detail),
+    };
+  }
+
+  // 逐字增量：判定要早于 done / content —— 它是"正在生成"的信号，
+  // 一旦落到后面就会被误判成整段正文。
+  if (raw.delta && typeof raw.delta === "object") {
+    const d = raw.delta as Record<string, unknown>;
+    return {
+      kind: "delta",
+      // ⚠️ 认不出 phase 时归到 answer：宁可把内容放在正文里，也不能丢
+      phase: d.phase === "rewrite" ? "rewrite" : "answer",
+      text: str(d.text),
+      attemptReset: d.attempt_reset === true,
     };
   }
 

@@ -94,4 +94,40 @@ describe("toStreamEvent", () => {
       detail: "",
     });
   });
+
+  // ---------- 逐字 delta（改写 / 答案） ----------
+
+  it("delta 事件（改写逐字）", () => {
+    expect(toStreamEvent({ delta: { phase: "rewrite", text: "政企" } })).toEqual({
+      kind: "delta",
+      phase: "rewrite",
+      text: "政企",
+      attemptReset: false,
+    });
+  });
+
+  it("delta 事件（答案逐字）", () => {
+    expect(toStreamEvent({ delta: { phase: "answer", text: "结论" } })).toEqual({
+      kind: "delta",
+      phase: "answer",
+      text: "结论",
+      attemptReset: false,
+    });
+  });
+
+  it("delta 事件（换候选标注：无 text，只有 attempt_reset）", () => {
+    expect(
+      toStreamEvent({ delta: { phase: "answer", attempt_reset: true } }),
+    ).toEqual({ kind: "delta", phase: "answer", text: "", attemptReset: true });
+  });
+
+  it("delta 的 phase 不认识时归为 answer（不能丢内容）", () => {
+    const ev = toStreamEvent({ delta: { phase: "whatever", text: "x" } });
+    expect(ev).toEqual({
+      kind: "delta",
+      phase: "answer",
+      text: "x",
+      attemptReset: false,
+    });
+  });
 });

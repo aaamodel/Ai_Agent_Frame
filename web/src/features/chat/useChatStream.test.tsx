@@ -272,6 +272,63 @@ describe("useChatStream", () => {
     expect(plain).not.toHaveBeenCalled();
   });
 
+  // ---------- 逐字 delta 分流（改写 / 答案 / 换候选） ----------
+
+  it("改写逐字进 rewriteText，答案逐字进正文，两者不互相污染", async () => {
+    vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
+      sseStream([
+        'data: {"delta":{"phase":"rewrite","text":"政企"}}\n\n',
+        'data: {"delta":{"phase":"rewrite","text":"优先"}}\n\n',
+        'data: {"delta":{"phase":"answer","text":"最终"}}\n\n',
+        'data: {"delta":{"phase":"answer","text":"答案"}}\n\n',
+        'data: {"done":true,"status":"success"}\n\n',
+      ]),
+    );
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1");
+    });
+    expect(messages[0]?.rewriteText).toBe("政企优先");
+    expect(messages[0]?.text).toBe("最终答案");
+  });
+
+  it("换候选时把已渲染内容移入 abandoned，不静默丢弃", async () => {
+    vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
+      sseStream([
+        'data: {"delta":{"phase":"answer","text":"第一候选的"}}\n\n',
+        'data: {"delta":{"phase":"answer","text":"开头"}}\n\n',
+        'data: {"delta":{"phase":"answer","attempt_reset":true}}\n\n',
+        'data: {"delta":{"phase":"answer","text":"第二候选"}}\n\n',
+        'data: {"done":true,"status":"success"}\n\n',
+      ]),
+    );
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1");
+    });
+    expect(messages[0]?.abandoned).toEqual(["第一候选的开头"]);
+    expect(messages[0]?.text).toBe("第二候选");
+  });
+
+  it("还没输出过内容时收到 attempt_reset，不产生空的废弃段落", async () => {
+    vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
+      sseStream([
+        'data: {"delta":{"phase":"answer","attempt_reset":true}}\n\n',
+        'data: {"delta":{"phase":"answer","text":"正文"}}\n\n',
+        'data: {"done":true,"status":"success"}\n\n',
+      ]),
+    );
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1");
+    });
+    expect(messages[0]?.abandoned).toBeUndefined();
+    expect(messages[0]?.text).toBe("正文");
+  });
+
   it("执行过程（step）逐条累积到当前助手消息上，且不影响正文", async () => {
     vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
       sseStream([
