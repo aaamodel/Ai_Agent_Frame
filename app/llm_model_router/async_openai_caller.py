@@ -24,6 +24,11 @@ from app.llm_model_router.model_router_config import (
 )
 from app.llm_model_router.model_router_enums import ModelProvider, ModelTarget
 
+# 旁观通道：调用器在被观测时改用流式收流，边收边把增量推给通道，
+# **但对外仍返回完整结果**（见 specs/2026-09-20-llm-token-streaming-design.md §4.2）。
+from app.core.agent.stream_sink import emit as _emit_delta
+from app.core.agent.stream_sink import has_sink as _has_sink
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -381,8 +386,16 @@ async def async_openai_chat_caller(
       - 所有 Provider 异常（APIError/RateLimitError）都向上抛出，由 Executor 统一
         做熔断计数 + 降级。
     """
-    if stream:  # 兼容上层偶发 stream=True，但本调用器是非流式的
-        stream = False
+    # 只有"有旁观观测者"时才开流；否则保持本调用器的历史契约（非流式）。
+    #
+    # ⚠️ 判定**不参考传入的 stream 参数**：该参数在本调用器里一直被强制关闭
+    #    （原实现 `if stream: stream = False`），没有任何上游真的传它。
+    #    以它为门禁会让流式永远不触发。真正的门禁是"此刻有没有人在听"。
+    #
+    # ⚠️ 即便开了流，对外仍返回完整结果 —— 上游的重试/熔断/候选降级/业务解析
+    #    全部不受影响，因为它们的调用方式一个字都没变。
+    stream_enabled: bool = _has_sink()
+    stream = False
 
     # 1) 组装参数
     params: Dict[str, Any] = {
@@ -423,6 +436,12 @@ async def async_openai_chat_caller(
             params.update(sanitized)
 
     # 2) 发起调用（带 Langfuse generation 观测；未启用或观测层异常时原样调用）
+    if stream_enabled:
+        # 旁路观测模式：改走流式收流 + 增量推送，返回值仍是完整结果。
+        return await _streaming_chat_call(
+            client=client, params={**params, "stream": True}, target=target,
+        )
+
     try:
         resp = await _chat_completion_with_langfuse(
             client,
@@ -506,4 +525,63 @@ async def async_openai_chat_caller(
         raw=raw,
         tool_calls=tool_calls,
         reasoning_content=reasoning_content,
+    )
+
+
+async def _streaming_chat_call(
+    *,
+    client: AsyncOpenAI,
+    params: Dict[str, Any],
+    target: ModelTarget,
+) -> AsyncOpenAICallResult:
+    """流式收流 + 旁路推送，**返回与 ``async_openai_chat_caller`` 相同的完整结果**。
+
+    为什么必须返回完整结果：上游（``run_with_attempt_budget`` 的重试、
+    ``execute_with_candidate_fallback`` 的候选降级与熔断回写、以及节点里的
+    结构化解析与全部闸门）都依赖"一次调用一个完整结果"这个契约。
+    只要契约不变，它们一行都不用改。
+
+    ⚠️ 这里刻意不经过 ``_chat_completion_with_langfuse``：那个包装不感知流式。
+    代价是流式调用在 langfuse 里不可见（spec 风险 3，已知并记录）。
+    """
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    usage: Optional[Dict[str, Any]] = None
+
+    stream = await client.chat.completions.create(**params)
+    async for chunk in stream:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = {
+                "prompt_tokens": getattr(chunk_usage, "prompt_tokens", None),
+                "completion_tokens": getattr(chunk_usage, "completion_tokens", None),
+                "total_tokens": getattr(chunk_usage, "total_tokens", None),
+            }
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+        text = getattr(delta, "content", None)
+        if text:
+            content_parts.append(text)
+            # 旁路推送：失败被 emit 内部吞掉，绝不影响主链路
+            _emit_delta({"kind": "delta", "text": text})
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning:
+            reasoning_parts.append(reasoning)
+
+    content: str = "".join(content_parts)
+    if not content and reasoning_parts:
+        # 与非流式路径同口径：content 为空时回落 reasoning_content
+        content = "".join(reasoning_parts)
+
+    return AsyncOpenAICallResult(
+        content=content,
+        model_id=target.candidate.model or target.id,
+        usage=usage,
+        raw=None,
+        tool_calls=None,
+        reasoning_content="".join(reasoning_parts) or None,
     )
