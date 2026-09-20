@@ -24,10 +24,19 @@ from app.llm_model_router.model_router_config import (
 )
 from app.llm_model_router.model_router_enums import ModelProvider, ModelTarget
 
-# 旁观通道：调用器在被观测时改用流式收流，边收边把增量推给通道，
-# **但对外仍返回完整结果**（见 specs/2026-09-20-llm-token-streaming-design.md §4.2）。
-from app.core.agent.stream_sink import emit as _emit_delta
-from app.core.agent.stream_sink import has_sink as _has_sink
+
+def _stream_sink_module():
+    """惰性取旁观通道模块。
+
+    ⚠️ **不能**在模块顶层 import：``app.core.agent`` 包在导入期会反向依赖
+    ``app.llm_model_router.model_router``，顶层导入会把整个 model_router
+    变成 partially initialized（实测：`ImportError: cannot import name
+    'ModelRouter' from partially initialized module`）。
+    这里只在真正调用时查一次 sys.modules，开销可忽略。
+    """
+    from app.core.agent import stream_sink
+
+    return stream_sink
 
 logger = logging.getLogger(__name__)
 
@@ -394,7 +403,7 @@ async def async_openai_chat_caller(
     #
     # ⚠️ 即便开了流，对外仍返回完整结果 —— 上游的重试/熔断/候选降级/业务解析
     #    全部不受影响，因为它们的调用方式一个字都没变。
-    stream_enabled: bool = _has_sink()
+    stream_enabled: bool = _stream_sink_module().has_sink()
     stream = False
 
     # 1) 组装参数
@@ -582,7 +591,7 @@ async def _streaming_chat_call(
             if text:
                 content_parts.append(text)
                 # 旁路推送：失败被 emit 内部吞掉，绝不影响主链路
-                _emit_delta({"kind": "delta", "text": text})
+                _stream_sink_module().emit({"kind": "delta", "text": text})
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
                 reasoning_parts.append(reasoning)

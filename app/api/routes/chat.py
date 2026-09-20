@@ -31,6 +31,11 @@ from app.core.memory.manager import MemoryManager
 from app.core.skill.manager import SkillManager
 from app.core.tools.registry import ToolRegistry
 
+# ── 逐字流式：旁观通道 + 显示层分流 ──────────────────────────────────
+# 通道让模型的生成过程能被"旁听"；分流器把原始输出转成该显示给用户的文本。
+from app.core.agent.delta_extract import DisplayRouter
+from app.core.agent.stream_sink import use_sink
+
 # ── Agent 编排前置 Pipeline（改写 + 意图 + 模式决策）注入 ────────────
 from app.api.depends.dependencies import (
     get_agent_config,
@@ -298,6 +303,56 @@ def _sse_payload(data: Dict[str, Any]) -> bytes:
     return b"data: " + json.dumps(data, ensure_ascii=False).encode() + b"\n\n"
 
 
+class _QueueSink:
+    """把事件从任意线程安全地投递到主事件循环的队列。
+
+    ⚠️ Pipeline 跑在 ``asyncio.to_thread`` 的工作线程里，而 SSE 生成器在主循环；
+    直接从线程写 ``asyncio.Queue`` 不是线程安全的，必须走
+    ``call_soon_threadsafe``。
+    """
+
+    def __init__(
+        self, *, loop: "asyncio.AbstractEventLoop", queue: "asyncio.Queue"
+    ) -> None:
+        self._loop = loop
+        self._queue = queue
+
+    def push(self, event: Dict[str, Any]) -> None:
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+
+
+async def _drain_queue(
+    queue: "asyncio.Queue",
+    *,
+    until: "Optional[asyncio.Task]" = None,
+) -> AsyncIterator[Dict[str, Any]]:
+    """产出队列里的所有事件。
+
+    给了 ``until`` 时：边等它完成边排空；它完成后再**补排空一次**——
+    否则任务结束前最后一刻投递的事件会丢（spec §4.3 / 风险 4）。
+    """
+    if until is None:
+        while not queue.empty():
+            yield queue.get_nowait()
+        return
+
+    while not until.done():
+        try:
+            yield await asyncio.wait_for(queue.get(), timeout=0.05)
+        except asyncio.TimeoutError:
+            continue
+    while not queue.empty():
+        yield queue.get_nowait()
+
+
+def _drain_nowait(queue: "asyncio.Queue") -> List[Dict[str, Any]]:
+    """同步排空队列（用于与图事件交错消费的场景）。"""
+    out: List[Dict[str, Any]] = []
+    while not queue.empty():
+        out.append(queue.get_nowait())
+    return out
+
+
 async def _stream_final_answer(
     text: str,
     trace_id: str,
@@ -412,14 +467,33 @@ async def _agent_stream_generator(
     _background_memory_prefetch_tasks.add(long_term_recall_task)
     long_term_recall_task.add_done_callback(_on_memory_prefetch_done)
 
-    pipeline_output = await asyncio.to_thread(
-        pipeline.run,
-        request.query,
-        registered_tool_snapshot,
-        active_session_id,
-        rewrite_history_messages,
-        available_skills_snapshot,
-    )
+    # ---- 改写 + 意图阶段：装通道，边跑边把 rewritten_question 逐字推出去 ----
+    #
+    # ⚠️ `use_sink` 必须在 `create_task` **之前**进入：`asyncio.to_thread` 是在
+    #    提交任务的那一刻复制上下文的，通道晚装一秒，工作线程里就读不到，
+    #    表现为"一个字都不流"且**不报任何错**。
+    delta_queue: "asyncio.Queue" = asyncio.Queue()
+    rewrite_sink = _QueueSink(loop=asyncio.get_running_loop(), queue=delta_queue)
+    rewrite_router = DisplayRouter("rewrite")
+
+    with use_sink(rewrite_sink):
+        pipeline_task = asyncio.create_task(
+            asyncio.to_thread(
+                pipeline.run,
+                request.query,
+                registered_tool_snapshot,
+                active_session_id,
+                rewrite_history_messages,
+                available_skills_snapshot,
+            )
+        )
+        async for sink_event in _drain_queue(delta_queue, until=pipeline_task):
+            if sink_event.get("kind") != "delta":
+                continue
+            visible = rewrite_router.feed(sink_event.get("text") or "")
+            if visible:
+                yield _sse_payload({"delta": {"phase": "rewrite", "text": visible}})
+        pipeline_output = await pipeline_task
 
     # ------------------------------------------------------------------
     # 2.5 【改进点 1 · sys 短路】系统意图命中 → 走标准聊天核心，不启动 Agent
