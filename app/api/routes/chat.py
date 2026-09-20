@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any, AsyncIterator, List, Optional, Dict
+from typing import Any, AsyncIterator, Iterator, List, Optional, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -353,6 +353,35 @@ def _drain_nowait(queue: "asyncio.Queue") -> List[Dict[str, Any]]:
     return out
 
 
+def _bump_attempt(count: int, event: Dict[str, Any]) -> int:
+    """统计"本请求内第几次尝试"（换候选/重试都会新起一次）。
+
+    调用器每次被调用即一次新尝试，它在开流前先发一条 ``attempt_start``。
+    """
+    return count + 1 if event.get("kind") == "attempt_start" else count
+
+
+def _render_answer_delta(
+    router: DisplayRouter, event: Dict[str, Any], attempt_count: int
+) -> Iterator[bytes]:
+    """把一个旁路事件渲染成 0..2 条 SSE 负载。
+
+    ⚠️ ``attempt_reset`` 的语义（spec §4.4）：**第 1 条 attempt_start 不插分隔**
+    ——它只是"新一轮生成开始"；从第 2 条起，且此前已有内容，才标注上段废弃
+    （用户选的是"保留并标注"，不清空）。
+    """
+    kind = event.get("kind")
+    if kind == "attempt_start":
+        if attempt_count >= 1 and router.visible_any():
+            yield _sse_payload({"delta": {"phase": "answer", "attempt_reset": True}})
+        return
+    if kind != "delta":
+        return
+    visible = router.feed(event.get("text") or "")
+    if visible:
+        yield _sse_payload({"delta": {"phase": "answer", "text": visible}})
+
+
 async def _stream_final_answer(
     text: str,
     trace_id: str,
@@ -604,22 +633,61 @@ async def _agent_stream_generator(
     # ⚠️ 边跑边推：Agent 还在执行时就把工具调用过程逐条推给前端。
     #    改前这里是 `await ...run(...)` —— 整张图跑完才开始吐字节，用户看到的是
     #    长时间空白 + 结尾整段答案（步骤数据本来就在 state.steps 里，只是没人往外送）。
+    answer_queue: "asyncio.Queue" = asyncio.Queue()
+    answer_sink = _QueueSink(loop=asyncio.get_running_loop(), queue=answer_queue)
+    answer_router = DisplayRouter("answer")
+    attempt_count = 0
+
     orchestrator_result: Any = None
-    async for event in agent_orchestrator.run_stream(
-        user_input=effective_user_input,
-        session_id=active_session_id,
-        mode=final_mode,
-        intent=intent_context_for_orchestrator,
-        precomputed_memory=precomputed_memory_for_orchestrator,
-    ):
-        if event.get("type") == "step":
-            # 步骤事件：{"node", "tool", "title", "status", "detail"}
-            payload: Dict[str, Any] = {
-                key: value for key, value in event.items() if key != "type"
-            }
-            yield _sse_payload({"step": payload})
-        elif event.get("type") == "final":
-            orchestrator_result = event["response"]
+    with use_sink(answer_sink):
+        graph_events = agent_orchestrator.run_stream(
+            user_input=effective_user_input,
+            session_id=active_session_id,
+            mode=final_mode,
+            intent=intent_context_for_orchestrator,
+            precomputed_memory=precomputed_memory_for_orchestrator,
+        ).__aiter__()
+
+        # ⚠️ 常驻 next_task，**不要**写成 wait_for(graph_events.__anext__(), timeout=…):
+        #    那会在超时时 cancel 掉正在执行的 __anext__，把异步生成器弄坏
+        #    （RuntimeError: already running，或静默丢失事件）。
+        #    这里只对"等待它"设超时，任务本身跨轮存活。
+        next_task: "asyncio.Task" = asyncio.ensure_future(graph_events.__anext__())
+        while True:
+            done, _ = await asyncio.wait({next_task}, timeout=0.05)
+
+            # 每轮先把旁路攒下的 delta 推完，再推图事件——保证"边生成边看"
+            for sink_event in _drain_nowait(answer_queue):
+                for sse_chunk in _render_answer_delta(
+                    answer_router, sink_event, attempt_count
+                ):
+                    yield sse_chunk
+                attempt_count = _bump_attempt(attempt_count, sink_event)
+
+            if not done:
+                continue
+            try:
+                event = next_task.result()
+            except StopAsyncIteration:
+                break
+            next_task = asyncio.ensure_future(graph_events.__anext__())
+
+            if event.get("type") == "step":
+                # 步骤事件：{"node", "tool", "title", "status", "detail"}
+                payload: Dict[str, Any] = {
+                    key: value for key, value in event.items() if key != "type"
+                }
+                yield _sse_payload({"step": payload})
+            elif event.get("type") == "final":
+                orchestrator_result = event["response"]
+
+        # 收尾补排空：最后一片 delta 可能在图结束的同一刻才投递到队列
+        for sink_event in _drain_nowait(answer_queue):
+            for sse_chunk in _render_answer_delta(
+                answer_router, sink_event, attempt_count
+            ):
+                yield sse_chunk
+            attempt_count = _bump_attempt(attempt_count, sink_event)
 
     if orchestrator_result is None:  # 不应发生：run_stream 契约保证必有一个 final
         logger.error("编排器未产出终局响应，提前结束流。session_id={}", active_session_id)
