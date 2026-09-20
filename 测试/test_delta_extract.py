@@ -4,7 +4,10 @@
 对应 specs Review Focus #4：UTF-8 多字节 / JSON 转义在 chunk 边界被切开。
 """
 
-from app.core.agent.delta_extract import IncrementalJsonFieldExtractor
+from app.core.agent.delta_extract import (
+    DisplayRouter,
+    IncrementalJsonFieldExtractor,
+)
 
 
 def feed_all(extractor, text, chunk_size):
@@ -72,3 +75,89 @@ def test_stops_at_closing_quote():
     ex = IncrementalJsonFieldExtractor("answer")
     got = feed_all(ex, '{"answer":"abc","other":"xyz"}', 5)
     assert got == "abc"  # 不能把 other 的值也带出来
+
+
+# ---------------- 改写阶段：一定是 JSON ----------------
+
+
+def test_rewrite_phase_extracts_field():
+    r = DisplayRouter("rewrite")
+    text = '{"rewritten_question":"政企优先","sub_questions":[]}'
+    assert "".join(r.feed(text[i:i + 4]) for i in range(0, len(text), 4)) == "政企优先"
+
+
+# ---------------- 答案阶段：四条判定分支 ----------------
+
+
+def test_answer_plain_text_streams_directly():
+    """FC 协议的普通答案：纯文本直出。"""
+    r = DisplayRouter("answer")
+    assert r.feed("政企合作") == "政企合作"
+    assert r.feed("优先") == "优先"
+
+
+def test_answer_json_looking_but_not_summary_schema_is_plain():
+    """Review Focus #2：用户要 JSON 输出时，这是正常答案，不能整段不显示。
+
+    ⚠️ 文本必须长于 200 字符：spec §4.5 规定看到 `{` 后要满 200 字符窗口
+    才能排除汇总 schema（`SummaryVerdictSchema`）。
+    """
+    r = DisplayRouter("answer")
+    text = '{"industries":["政企","医疗"],"priority":"high","note":"' + "说明" * 120 + '"}'
+    assert len(text) > 200
+    got = "".join(r.feed(text[i:i + 5]) for i in range(0, len(text), 5))
+    assert got == text, "以 { 开头但不是汇总 schema 的答案必须原样显示"
+    assert r.mode == "plain"
+
+
+def test_answer_summary_schema_is_extracted_not_shown_raw():
+    """汇总的结构化输出：只显示 answer 字段，JSON 结构不能漏出来。"""
+    r = DisplayRouter("answer")
+    text = '{"sufficient":true,"answer":"最终答案在这里","missing_info":""}'
+    got = "".join(r.feed(text[i:i + 6]) for i in range(0, len(text), 6))
+    assert got == "最终答案在这里"
+    assert "sufficient" not in got
+
+
+def test_answer_react_draft_is_suppressed():
+    """Review Focus #3：Thought/Action 是内部草稿，绝不能出现在界面上。"""
+    r = DisplayRouter("answer")
+    draft = "Thought: 我需要先查一下\nAction: sales_sql_query\nAction Input: {}"
+    got = "".join(r.feed(draft[i:i + 8]) for i in range(0, len(draft), 8))
+    assert got == ""
+    assert r.mode == "suppress"
+
+
+def test_answer_final_answer_marker_shows_only_tail():
+    r = DisplayRouter("answer")
+    text = "Thought: 想好了\nFinal Answer: 政企优先，其次医疗"
+    got = "".join(r.feed(text[i:i + 7]) for i in range(0, len(text), 7))
+    assert got == "政企优先，其次医疗"
+    assert "Thought" not in got
+
+
+def test_answer_typing_before_decision_emits_nothing_but_does_not_lose_text():
+    """判定未定时不输出；判定为 plain 后，之前的文本必须补出来，不能丢。"""
+    r = DisplayRouter("answer")
+    head = '{"industries":["政企","医疗"],"priority":"high"'
+    assert r.feed(head) == ""  # 200 字符窗口未满 → 判定未定，不输出
+    assert r.feed("}") == ""  # 仍未满
+    filler = "x" * 200
+    out = r.feed(filler)  # 满 200 → 判定 plain，之前攒下的全部补出
+    assert out == head + "}" + filler
+    assert r.mode == "plain"
+
+
+def test_visible_any_reflects_emitted_output():
+    """供 SSE 层判断"换候选要不要插废弃标注"。"""
+    r = DisplayRouter("answer")
+    assert r.visible_any() is False
+    r.feed("政企")
+    assert r.visible_any() is True
+
+
+def test_unknown_phase_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        DisplayRouter("thinking")

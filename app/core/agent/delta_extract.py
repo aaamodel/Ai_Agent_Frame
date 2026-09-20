@@ -7,9 +7,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple
 
-__all__ = ["IncrementalJsonFieldExtractor"]
+__all__ = ["IncrementalJsonFieldExtractor", "DisplayRouter"]
 
 
 # JSON 字符串里的简单转义
@@ -166,3 +167,150 @@ class IncrementalJsonFieldExtractor:
             except ValueError:
                 return "u", 1
         return _SIMPLE_ESCAPES.get(nxt, nxt), 1
+
+
+# ---------------------------------------------------------------------------
+# 文本分流
+# ---------------------------------------------------------------------------
+
+# ReAct 文本协议的草稿标记（行首）
+_REACT_DRAFT_RE = re.compile(r"(?m)^\s*(Thought|Action|Action Input)\s*:")
+_FINAL_ANSWER_RE = re.compile(r"Final Answer:\s*", re.IGNORECASE)
+
+# 草稿标记的关键词：用于"前缀歧义"等待（"Tho" 还不能断定是不是 "Thought:"）
+_DRAFT_KEYWORDS = ("Thought", "Action", "Action Input")
+
+# `answer` 阶段判定为"汇总结构化输出"的探针：SummaryVerdictSchema 的首个字段
+# （summarize_node.py:46-72）。用它把"用户自己要的 JSON 答案"排除掉。
+_SUMMARY_PROBE = '"sufficient"'
+_SUMMARY_PROBE_WINDOW = 200
+
+
+class DisplayRouter:
+    """把某一阶段的模型原始输出，转成"该追加显示的文本"。
+
+    判定规则**严格按此顺序**（spec §4.5），命中即锁定：
+
+    1. `phase == "rewrite"`：缓冲以 `{` 开头 → json 模式（抽 `rewritten_question`）
+    2. `phase == "answer"`：以 `{` 开头**且**前 200 字符含 `"sufficient"`
+       → json 模式（抽 `answer`）
+    3. 含行首 `Thought:` / `Action:` / `Action Input:` → suppress（内部草稿）
+    4. 含 `Final Answer:` → final（只显示其后的内容）
+    5. 其余 → plain（原样显示）
+
+    ⚠️ 两处相对朴素实现必须加固的点（否则会漏草稿或吞文本）：
+
+    - **suppress 不是终态**：文本协议的同一轮里可能是
+      `Thought: …\\nFinal Answer: xxx`，所以处于 suppress 时仍要持续找
+      `Final Answer:`，一旦出现就切到 final 并输出其后内容。
+    - **前缀歧义要等待**：`"Tho"` 还看不出是不是 `"Thought:"`，
+      此时若草率判成 plain，就会把草稿开头的几个字推给用户。
+
+    ⚠️ 判定未定期间**不输出但不丢文本**：一旦判定为 plain，
+    之前攒下的文本会在同一次 feed 里补出来。
+    """
+
+    def __init__(self, phase: str) -> None:
+        if phase not in ("rewrite", "answer"):
+            raise ValueError(f"未知 phase: {phase!r}（只支持 rewrite / answer）")
+        self._phase = phase
+        self._raw: str = ""
+        self._mode: str = "undecided"
+        self._emitted_len: int = 0  # plain/final 模式已输出到 _raw 的哪个位置
+        self._emitted_any: bool = False  # 是否已经向外输出过任何可见文本
+        self._extractor: Optional[IncrementalJsonFieldExtractor] = None
+        self._extractor_primed: bool = False
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def visible_any(self) -> bool:
+        """是否已输出过可见文本。
+
+        供 SSE 层判断"换候选时要不要插入上段废弃标注"——从没输出过就别插。
+        """
+        return self._emitted_any
+
+    def feed(self, chunk: str) -> str:
+        """喂入一段新增文本，返回本次应追加显示的文本。"""
+        self._raw += chunk
+        visible = self._compute_visible(chunk)
+        if visible:
+            self._emitted_any = True
+        return visible
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+    def _compute_visible(self, chunk: str) -> str:
+        if self._mode == "undecided":
+            self._decide()
+
+        if self._mode == "json":
+            assert self._extractor is not None
+            if not self._extractor_primed:
+                # ⚠️ json 模式可能是"读到一半才判定"的（例如 answer 阶段要等
+                #    200 字符窗口），判定前累积的文本必须补喂一次，
+                #    否则目标字段若已在那段里，就永远抽不出来（静默吞字）。
+                self._extractor_primed = True
+                return self._extractor.feed(self._raw)
+            return self._extractor.feed(chunk)
+
+        # ⚠️ 无条件优先检查 Final Answer：它在 suppress 之后才出现，
+        #    所以不能等到"判定完成"才看——那样草稿轮永远切不到输出态。
+        marker = _FINAL_ANSWER_RE.search(self._raw)
+        if marker is not None:
+            self._mode = "final"
+            if self._emitted_len < marker.end():
+                self._emitted_len = marker.end()
+            return self._take_tail(marker.end())
+
+        # ⚠️ "undecided" 也必须拦在这里：判定未定时若落到 _take_tail，
+        #    缓冲内容会被直接吐给用户（实测：汇总 JSON 漏出 `{"sufficient`、
+        #    草稿轮漏出 `Thought`）。
+        if self._mode in ("undecided", "suppress"):
+            return ""
+        return self._take_tail(0)
+
+    def _take_tail(self, start: int) -> str:
+        """取出 `_raw` 中从 `_emitted_len` 起的新增部分。"""
+        if self._emitted_len >= len(self._raw):
+            return ""
+        out = self._raw[self._emitted_len:]
+        self._emitted_len = len(self._raw)
+        return out
+
+    def _decide(self) -> None:
+        stripped = self._raw.lstrip()
+        if self._phase == "rewrite":
+            if stripped.startswith("{"):
+                self._mode = "json"
+                self._extractor = IncrementalJsonFieldExtractor("rewritten_question")
+            return
+
+        # ---- answer 阶段 ----
+        if stripped.startswith("{"):
+            if _SUMMARY_PROBE in self._raw[:_SUMMARY_PROBE_WINDOW]:
+                self._mode = "json"
+                self._extractor = IncrementalJsonFieldExtractor("answer")
+            elif len(self._raw) >= _SUMMARY_PROBE_WINDOW:
+                # 以 { 开头但排除了汇总 schema → 用户自己要的 JSON，当普通文本
+                self._mode = "plain"
+            return
+
+        if not stripped:
+            return
+
+        if _REACT_DRAFT_RE.search(self._raw):
+            self._mode = "suppress"
+            return
+
+        # 前缀歧义：当前头还可能是草稿标记的开头，先等更多字再判
+        head = stripped.split("\n", 1)[0]
+        for keyword in _DRAFT_KEYWORDS:
+            if keyword.startswith(head):
+                return  # 如 "Tho" —— 可能正在打 "Thought:"
+            if head.startswith(keyword) and ":" not in head:
+                return  # 如 "Action" —— 打完词还没到冒号
+        self._mode = "plain"
