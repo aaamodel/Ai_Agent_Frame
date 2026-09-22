@@ -312,7 +312,40 @@ describe("useChatStream", () => {
     expect(messages[0]?.text).toBe("第二候选");
   });
 
-  it("还没输出过内容时收到 attempt_reset，不产生空的废弃段落", async () => {
+  it("改写重试时 attempt_reset 清空半截 rewriteText，新内容重新累积", async () => {
+    vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
+      sseStream([
+        'data: {"delta":{"phase":"rewrite","text":"半截改写"}}\n\n',
+        'data: {"delta":{"phase":"rewrite","attempt_reset":true}}\n\n',
+        'data: {"delta":{"phase":"rewrite","text":"完整改写"}}\n\n',
+        'data: {"done":true,"status":"success"}\n\n',
+      ]),
+    );
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1");
+    });
+    expect(messages[0]?.rewriteText).toBe("完整改写");
+  });
+
+  it("还没输出过改写内容时收到 rewrite attempt_reset，保持空串", async () => {
+    vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
+      sseStream([
+        'data: {"delta":{"phase":"rewrite","attempt_reset":true}}\n\n',
+        'data: {"delta":{"phase":"rewrite","text":"改写"}}\n\n',
+        'data: {"done":true,"status":"success"}\n\n',
+      ]),
+    );
+    const { messages, onMessage } = collect();
+    const { result } = renderHook(() => useChatStream(onMessage));
+    await act(async () => {
+      await result.current.send("q", "s1");
+    });
+    expect(messages[0]?.rewriteText).toBe("改写");
+  });
+
+  it("还没输出过内容时收到 answer attempt_reset，不产生空的废弃段落", async () => {
     vi.spyOn(chatApi, "streamAgentChat").mockResolvedValue(
       sseStream([
         'data: {"delta":{"phase":"answer","attempt_reset":true}}\n\n',

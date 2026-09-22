@@ -36,6 +36,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from loguru import logger
 
 from app.core.agent.planner import result_is_ineffective
+from app.core.trace_to_markdown import trace_to_markdown
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 常量
@@ -113,7 +114,7 @@ def _is_meaningful(token: str) -> bool:
         return False
     return bool(_MEANINGFUL_RE.match(text))
 
-
+@trace_to_markdown(output_file="./app/core/agent/extract_keywords.md")
 def extract_keywords(text: Any) -> Set[str]:
     """把一段文本切成核心词集合（本地分词 + 停用词过滤，零外部调用）。"""
     raw = str(text or "").strip()
@@ -126,7 +127,7 @@ def extract_keywords(text: Any) -> Set[str]:
         return set()
     return {token.strip() for token in tokens if _is_meaningful(token)}
 
-
+@trace_to_markdown(output_file="build_question_keywords.md")
 def build_question_keywords(state: Dict[str, Any]) -> Set[str]:
     """按优先级汇总"问题侧核心词"（数据集 A）。
 
@@ -170,7 +171,7 @@ def build_question_keywords(state: Dict[str, Any]) -> Set[str]:
         keywords |= extract_keywords(source)
     return keywords
 
-
+@trace_to_markdown(output_file="./app/core/agent/detect_evidence_gap.md")
 def detect_evidence_gap(
     question_keywords: Iterable[str],
     observation: Any,
@@ -249,7 +250,7 @@ def _attempted_blobs(results: Any) -> List[str]:
             blobs.append(args)
     return [_normalize_path(blob) for blob in blobs]
 
-
+@trace_to_markdown(output_file="./app/core/agent/attempted_asset_locations.md")
 def attempted_asset_locations(facts: Any, results: Any) -> Set[str]:
     """本轮已尝试过的资产位置集合。
 
@@ -279,13 +280,21 @@ def attempted_asset_locations(facts: Any, results: Any) -> Set[str]:
             hit.add(location)
     return hit
 
-
-def build_candidates(state: Dict[str, Any]) -> CandidateSet:
+@trace_to_markdown(output_file="./app/core/agent/build_candidates.md")
+def build_candidates(
+    state: Dict[str, Any],
+    current_result: Optional[Dict[str, Any]] = None,
+) -> CandidateSet:
     """确定性组装候选方向列表。
 
     两个差集：
       ① 工具侧 ＝ ``state["active_tool_names"]`` − 本轮已调用工具；
       ② 资产侧 ＝ 已提取的结构化事实 − 本轮已尝试过的资产。
+
+    ``current_result`` 是**当前正在 distill 的这一步**的执行记录：它要到节点收尾
+    才写进 ``state["subtask_results"]``，但它调用的工具 / 尝试的资产此刻已经
+    "在飞"——若不计入差集，当前工具会被当成"尚未尝试的候选"重新注入，模型再选
+    一次就会对同一方向连锁插入纠偏步。
 
     资产侧还会与白名单求交：需要白名单外工具才能消费的资产不进候选，并记入
     ``excluded``（这同时是"白名单过窄"的观测点——本 trace 的白名单就不含任何
@@ -296,7 +305,9 @@ def build_candidates(state: Dict[str, Any]) -> CandidateSet:
         for name in (state.get("active_tool_names") or [])
         if str(name).strip()
     }
-    results = state.get("subtask_results") or []
+    results: List[Any] = list(state.get("subtask_results") or [])
+    if isinstance(current_result, dict):
+        results.append(current_result)
     facts = [
         fact for fact in (state.get("extracted_facts") or []) if isinstance(fact, dict)
     ]
@@ -339,7 +350,7 @@ def build_candidates(state: Dict[str, Any]) -> CandidateSet:
 
     return CandidateSet(candidates=candidates, excluded=excluded)
 
-
+@trace_to_markdown(output_file="./app/core/agent/render_candidates.md")
 def render_candidates(
     candidates: Sequence[Candidate],
     max_chars: int = CANDIDATE_MAX_CHARS,
@@ -384,7 +395,7 @@ def _last_result(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return record
     return None
 
-
+@trace_to_markdown(output_file="./app/core/agent/injection_reason.md")
 def injection_reason(
     state: Dict[str, Any],
     *,
@@ -415,7 +426,7 @@ def injection_reason(
 # ─────────────────────────────────────────────────────────────────────────────
 # §4 模型只选不造：标识 → 具体动作
 # ─────────────────────────────────────────────────────────────────────────────
-
+@trace_to_markdown(output_file="./app/core/agent/parse_candidate_id.md")
 def parse_candidate_id(raw: Any) -> Optional[str]:
     """从模型的输出里取出候选项标识；取不到或不合法时返回 None。
 
@@ -430,7 +441,7 @@ def parse_candidate_id(raw: Any) -> Optional[str]:
         return None
     return f"{matched.group(1).strip().lower()}:{matched.group(2).strip()}"
 
-
+@trace_to_markdown(output_file="./app/core/agent/translate_candidate.md")
 def translate_candidate(
     candidate_id: Any,
     *,

@@ -571,6 +571,12 @@ async def _streaming_chat_call(
     received_any_chunk: bool = False
 
     try:
+        # 每进入一次调用器就是一次新尝试（预算内重试 / 候选降级 / 探测回落
+        # 都会重新走到这里）。显示层据此插入"上段废弃"分隔并复位分流器；
+        # 无通道时 emit 静默返回 False，不影响主链路。
+        # ⚠️ 必须在开流**之前**发：首 chunk 前就 400 走探测回落时，这次尝试
+        #    也应被计数（回落仍是同一次尝试，不再补发）。
+        _stream_sink_module().emit({"kind": "attempt_start"})
         stream = await client.chat.completions.create(**params)
         async for chunk in stream:
             received_any_chunk = True

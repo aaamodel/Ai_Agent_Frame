@@ -30,7 +30,7 @@ class IncrementalJsonFieldExtractor:
     """在累积的 JSON 文本里，增量抽取某个字符串字段当前已确定可见的值。
 
     用法：
-        ex = IncrementalJsonFieldExtractor("rewritten_question")
+        ex = IncrementalJsonFieldExtractor("rewrite")
         for chunk in stream:
             display = ex.feed(chunk)      # 只返回"本次新增"的可见文本
             if display:
@@ -185,15 +185,46 @@ _DRAFT_KEYWORDS = ("Thought", "Action", "Action Input")
 _SUMMARY_PROBE = '"sufficient"'
 _SUMMARY_PROBE_WINDOW = 200
 
+# markdown 代码围栏语言标记：```json / ```JSON 等（模型即便带 response_format
+# 也常把 JSON 包在围栏里流式吐出——业务解析侧一直靠 strip fence 兜底，
+# 显示层若只认裸 `{` 开头，会把整段输出永久卡在 undecided 静默吞光）。
+_FENCE_TOKEN = "```"
+
+
+def _json_body_start(raw: str) -> Optional[int]:
+    """返回 JSON 体起始位置（跳过空白与可选的 ```lang 围栏行）。
+
+    形态：``[空白]```{语言标记}\\n[空白]{...}``。围栏行尚未打完
+    （还没见到换行）时返回 None —— 等下一片再判，避免把代码类答案误锁成 json。
+    """
+    stripped = raw.lstrip()
+    lead = len(raw) - len(stripped)
+    if stripped.startswith("{"):
+        return lead
+    if stripped.startswith(_FENCE_TOKEN):
+        newline_at = stripped.find("\n")
+        if newline_at == -1:
+            return None
+        body = stripped[newline_at + 1:].lstrip()
+        if body.startswith("{"):
+            return len(raw) - len(body)
+    return None
+
 
 class DisplayRouter:
     """把某一阶段的模型原始输出，转成"该追加显示的文本"。
 
     判定规则**严格按此顺序**（spec §4.5），命中即锁定：
 
-    1. `phase == "rewrite"`：缓冲以 `{` 开头 → json 模式（抽 `rewritten_question`）
-    2. `phase == "answer"`：以 `{` 开头**且**前 200 字符含 `"sufficient"`
-       → json 模式（抽 `answer`）
+    1. `phase == "rewrite"`：跳过空白/可选的 ```` ```json ```` 围栏后以 `{`
+       开头 → json 模式（抽 `rewrite`；这是
+       ``AgentRewriteIntentCombinedSchema`` 线上 JSON 的真实字段名，
+       DTO 层才映射成 ``rewritten_question``——抽错字段名会静默吞掉整段。
+       ⚠️ 智谱等厂商即便给了 response_format，流式时仍常把 JSON 包在
+       markdown 围栏里（业务解析侧一直靠 strip fence 兜底），不剥围栏
+       会被永久卡在 undecided，整段一个字都不显示。
+    2. `phase == "answer"`：同上跳过围栏后以 `{` 开头**且**前 200 字符
+       含 `"sufficient"` → json 模式（抽 `answer`）
     3. 含行首 `Thought:` / `Action:` / `Action Input:` → suppress（内部草稿）
     4. 含 `Final Answer:` → final（只显示其后的内容）
     5. 其余 → plain（原样显示）
@@ -220,6 +251,7 @@ class DisplayRouter:
         self._emitted_any: bool = False  # 是否已经向外输出过任何可见文本
         self._extractor: Optional[IncrementalJsonFieldExtractor] = None
         self._extractor_primed: bool = False
+        self._json_offset: int = 0  # 围栏/空白前缀长度，json 模式补喂时从 JSON 体开始
 
     @property
     def mode(self) -> str:
@@ -231,6 +263,21 @@ class DisplayRouter:
         供 SSE 层判断"换候选时要不要插入上段废弃标注"——从没输出过就别插。
         """
         return self._emitted_any
+
+    def reset(self) -> None:
+        """回到"尚未见过任何输出"的初态——收到 attempt_start（重试/换候选）时调用。
+
+        ⚠️ 新尝试产出的是一份**全新**的模型输出：旧尝试残留的 ``_raw`` 会污染
+        模式判定（例如旧内容以 ``{`` 开头会把新尝试永久锁在 json 模式，
+        或抽取器停在 done/in_value 态直接吐字面量），必须整体清空。
+        """
+        self._raw = ""
+        self._mode = "undecided"
+        self._emitted_len = 0
+        self._emitted_any = False
+        self._extractor = None
+        self._extractor_primed = False
+        self._json_offset = 0
 
     def feed(self, chunk: str) -> str:
         """喂入一段新增文本，返回本次应追加显示的文本。"""
@@ -253,8 +300,9 @@ class DisplayRouter:
                 # ⚠️ json 模式可能是"读到一半才判定"的（例如 answer 阶段要等
                 #    200 字符窗口），判定前累积的文本必须补喂一次，
                 #    否则目标字段若已在那段里，就永远抽不出来（静默吞字）。
+                #    围栏前缀（```json\n）要跳过，抽取器只应看到裸 JSON 体。
                 self._extractor_primed = True
-                return self._extractor.feed(self._raw)
+                return self._extractor.feed(self._raw[self._json_offset:])
             return self._extractor.feed(chunk)
 
         # ⚠️ 无条件优先检查 Final Answer：它在 suppress 之后才出现，
@@ -282,24 +330,32 @@ class DisplayRouter:
         return out
 
     def _decide(self) -> None:
-        stripped = self._raw.lstrip()
+        json_start = _json_body_start(self._raw)
         if self._phase == "rewrite":
-            if stripped.startswith("{"):
+            if json_start is not None:
+                self._json_offset = json_start
                 self._mode = "json"
-                self._extractor = IncrementalJsonFieldExtractor("rewritten_question")
+                self._extractor = IncrementalJsonFieldExtractor("rewrite")
             return
 
         # ---- answer 阶段 ----
-        if stripped.startswith("{"):
-            if _SUMMARY_PROBE in self._raw[:_SUMMARY_PROBE_WINDOW]:
+        if json_start is not None:
+            window = self._raw[json_start:json_start + _SUMMARY_PROBE_WINDOW]
+            if _SUMMARY_PROBE in window:
+                self._json_offset = json_start
                 self._mode = "json"
                 self._extractor = IncrementalJsonFieldExtractor("answer")
-            elif len(self._raw) >= _SUMMARY_PROBE_WINDOW:
+            elif len(self._raw) - json_start >= _SUMMARY_PROBE_WINDOW:
                 # 以 { 开头但排除了汇总 schema → 用户自己要的 JSON，当普通文本
                 self._mode = "plain"
             return
 
+        stripped = self._raw.lstrip()
         if not stripped:
+            return
+        # 围栏行只打了开头（``` 后还没有换行）：无法判断里面是不是 JSON，
+        # 必须等下一片——否则 head="```" 会被立刻误判成 plain 锁死。
+        if stripped.startswith(_FENCE_TOKEN) and "\n" not in stripped:
             return
 
         if _REACT_DRAFT_RE.search(self._raw):

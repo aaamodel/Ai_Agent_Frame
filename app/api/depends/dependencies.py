@@ -297,7 +297,19 @@ async def get_tool_registry(
     """🌟 统一的工具箱工厂依赖注入中心。
 
     在请求到达路由前，动态调配系统中的核心单例，组装出一套具备完整原子能力的底层工具链。
+
+    ⚠️ 进程级单例：工具本身无请求级状态，依赖（fs_backend / rag_service /
+    model_router）也都是 app.state 单例，**绝不能每请求重建**——
+    KnowledgeGraphSearchTool 首次导入会拉起 lightrag / torch /
+    sentence-transformers 重依赖栈（内存吃紧时实测首请求被卡住 30~40s）。
+    lifespan 启动后会在后台预热本单例；预热未完成时此处兜底构建并缓存。
     """
+    existing_registry: Optional[ToolRegistry] = getattr(
+        request.app.state, "tool_registry", None
+    )
+    if existing_registry is not None:
+        return existing_registry
+
     # 完美实现多组件在工具链中的完全闭环与高内聚
     dynamic_registry = bootstrap_tools(
         db_session_factory=None,  # 根据你实际情况传入
@@ -307,7 +319,7 @@ async def get_tool_registry(
         # （多厂商 tier/熔断/追踪），不另起 LLM 客户端。
         model_router=getattr(request.app.state, "model_router", None),
     )
-
+    request.app.state.tool_registry = dynamic_registry
     return dynamic_registry
 
 

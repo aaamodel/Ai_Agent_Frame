@@ -58,6 +58,11 @@ export function useChatStream(onMessage: MessageUpdater) {
           // 逐字增量：改写进 rewriteText，答案进正文 —— 两条缓冲互相独立
           onMessage((m) => {
             if (ev.phase === "rewrite") {
+              if (ev.attemptReset) {
+                // 改写 LLM 重试/换候选：旧尝试已逐字显示的半截改写作废，
+                // 直接清空（rewriteText 只是过程性回显，无需像正文那样保留划线）
+                return m.rewriteText ? { ...m, rewriteText: "" } : m;
+              }
               return { ...m, rewriteText: (m.rewriteText ?? "") + ev.text };
             }
             if (ev.attemptReset) {

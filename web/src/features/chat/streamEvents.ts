@@ -36,7 +36,7 @@ export interface StepEvent {
  *
  * 后端在模型**正在生成**时推送（不是生成完再切片）：
  *
- * - `phase: "rewrite"` —— 问题改写的逐字（已从结构化 JSON 里抽出 `rewritten_question`）
+ * - `phase: "rewrite"` —— 问题改写的逐字（已从组合 schema JSON 里抽出 `rewrite` 字段）
  * - `phase: "answer"`  —— 最终答案 / 汇总结论的逐字
  *
  * `attemptReset` 为真表示**换了模型候选或重试**：此前已渲染的内容作废。

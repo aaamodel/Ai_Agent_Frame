@@ -458,6 +458,63 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(asyncio.to_thread(_preheat_intent_vector_index))
 
+    # ==========================================
+    # 3.6 【启动后台预热】工具箱注册中心 + Agent GraphRunner
+    # ---------------------------------------------------------------
+    # 原先两者都在首个请求的 FastAPI 依赖里懒构建：工具注册中心首次构建会
+    # 拉起 lightrag/torch/sentence-transformers 重依赖栈（内存吃紧时实测
+    # 把首请求卡住 30~40s），GraphRunner 首次编译也要 1~2s。
+    # 这里全部挪到启动后台：构建完成后缓存为 app.state 单例，get_tool_registry
+    # / get_agent_graph_runner 直接复用；预热未完成时依赖侧仍有懒构建兜底。
+    # ==========================================
+    app.state.tool_registry = None
+
+    def _preheat_tool_registry() -> None:
+        try:
+            from app.core.tools.builtin.init_tools import bootstrap_tools
+
+            t_pre = time.perf_counter()
+            registry = bootstrap_tools(
+                db_session_factory=None,
+                fs_backend=app.state.fs_backend,
+                rag_service=app.state.rag_service,
+                model_router=global_model_router,
+            )
+            app.state.tool_registry = registry
+            logger.info(
+                f"🔆 工具箱注册中心后台预热完成"
+                f"（{len(registry.list_tool_names())} 个工具），"
+                f"耗时: {time.perf_counter() - t_pre:.1f}s（首请求不再承担导入成本）"
+            )
+        except Exception as tool_preheat_error:  # noqa: BLE001 - 不阻塞启动
+            logger.warning(
+                "工具箱注册中心后台预热失败（不影响启动，首次请求懒构建兜底）: {}",
+                tool_preheat_error,
+            )
+
+    async def _preheat_graph_runner() -> None:
+        try:
+            from types import SimpleNamespace
+
+            from app.api.depends.dependencies import get_agent_graph_runner
+
+            t_pre = time.perf_counter()
+            # 依赖只用到 request.app.state，SimpleNamespace 即可复用同一套
+            # 懒初始化+双检逻辑，避免在 lifespan 里复制一份构建代码。
+            await get_agent_graph_runner(SimpleNamespace(app=app))
+            logger.info(
+                f"🔆 Agent GraphRunner 后台预热完成，"
+                f"耗时: {time.perf_counter() - t_pre:.1f}s（首请求不再编译图）"
+            )
+        except Exception as graph_preheat_error:  # noqa: BLE001 - 不阻塞启动
+            logger.warning(
+                "Agent GraphRunner 后台预热失败（不影响启动，首次请求懒初始化兜底）: {}",
+                graph_preheat_error,
+            )
+
+    asyncio.create_task(asyncio.to_thread(_preheat_tool_registry))
+    asyncio.create_task(_preheat_graph_runner())
+
     yield
 
     # ==========================================
