@@ -81,9 +81,79 @@ def test_stops_at_closing_quote():
 
 
 def test_rewrite_phase_extracts_field():
+    # ⚠️ 线上 AgentRewriteIntentCombinedSchema 的 JSON 字段名是 `rewrite`
+    #    （DTO 层才映射成 rewritten_question）。用真实字段名钉住，
+    #    抽错成不存在的字段会静默吞掉整个改写阶段的逐字输出。
     r = DisplayRouter("rewrite")
-    text = '{"rewritten_question":"政企优先","sub_questions":[]}'
+    text = (
+        '{"rewrite":"政企优先","agent_goal":"给结论","should_split":false,'
+        '"sub_questions":[],"intent_classifications":[]}'
+    )
     assert "".join(r.feed(text[i:i + 4]) for i in range(0, len(text), 4)) == "政企优先"
+
+
+def test_rewrite_router_reset_between_attempts():
+    """重试/换候选后：旧尝试的半截 JSON 不能与新尝试拼成脏文本。"""
+    r = DisplayRouter("rewrite")
+    out1 = "".join(r.feed(c) for c in '{"rewrite":"政企')
+    assert out1 == "政企"
+    r.reset()
+    text2 = '{"rewrite":"医疗优先","should_split":false}'
+    out2 = "".join(r.feed(text2[i:i + 3]) for i in range(0, len(text2), 3))
+    assert out2 == "医疗优先", "复位后应只显示新尝试的字段值"
+
+
+def test_rewrite_fenced_json_extracts_field_across_chunks():
+    """智谱 glm-4.7 实测流式形态：JSON 外包 ```json 围栏，且围栏三片分开到。
+
+    不剥围栏时首字符不是 `{`，分流器永久 undecided → 整段静默（线上事故根因）。
+    """
+    r = DisplayRouter("rewrite")
+    chunks = [
+        "```", "json", '\n{\n  "rewrite": "采购',
+        "审批系统", "支持手机端", "提单吗？",
+        '",\n  "intent_classifications": []\n}\n', "```",
+    ]
+    assert "".join(r.feed(c) for c in chunks) == "采购审批系统支持手机端提单吗？"
+    assert r.mode == "json"
+
+
+def test_rewrite_fence_token_alone_stays_undecided():
+    """只到 ``` 、换行还没来：不能急着判 plain 或 json（围栏里可能是代码）。"""
+    r = DisplayRouter("rewrite")
+    assert r.feed("```") == ""
+    assert r.mode == "undecided"
+
+
+def test_answer_fenced_summary_schema_extracts_answer():
+    """answer 阶段汇总 JSON 同样可能裹围栏（含 sufficient 探针 → json 抽 answer）。"""
+    r = DisplayRouter("answer")
+    chunks = [
+        "```", "JSON", '\n{"sufficient":true,"answer":"最终',
+        "结论", '"}', "\n```",
+    ]
+    assert "".join(r.feed(c) for c in chunks) == "最终结论"
+    assert r.mode == "json"
+
+
+def test_answer_fenced_non_json_code_falls_back_to_plain():
+    """围栏里是普通代码而非 JSON 对象：不得误锁 json，代码文本照常可见。"""
+    r = DisplayRouter("answer")
+    out = "".join(r.feed(c) for c in ["```py", "thon\n", "print(1)"])
+    assert r.mode == "plain"
+    assert out.startswith("```python")
+    assert "print(1)" in out
+
+
+def test_answer_router_reset_clears_mode_lock():
+    """旧尝试以 { 开头把分流器锁进 json 模式；复位后新尝试的纯文本必须能直出。"""
+    r = DisplayRouter("answer")
+    r.feed('{"sufficient":true,"answer":"半截')
+    assert r.mode == "json"
+    r.reset()
+    assert r.mode == "undecided"
+    assert r.visible_any() is False
+    assert r.feed("纯文本新尝试") == "纯文本新尝试"
 
 
 # ---------------- 答案阶段：四条判定分支 ----------------

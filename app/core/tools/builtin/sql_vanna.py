@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sqlite3
@@ -42,6 +43,22 @@ load_dotenv()
 #    `qwen-plus` 会直接 403（Free quota exhausted），`qwen3.8-flash` 在额度内。
 _SQL_LLM_MODEL: str = (
     os.getenv("SALES_SQL_MODEL") or os.getenv("OPENAI_LLM_MODEL") or "qwen3.8-flash"
+)
+# ⚠️ 必须显式给超时/重试：openai SDK 默认 timeout=600s、max_retries=2，
+#    即单次取数最惨可以干等 600s×3 ≈ 30 分钟（用户观感=无限卡死）。
+#    默认 90s 作为挂死兜底：关思考后正常只要 3~16s，真正异常时快速失败，
+#    Agent 可换问法或直接作答，不再整页冻住。
+_SQL_LLM_TIMEOUT: float = float(os.getenv("SALES_SQL_LLM_TIMEOUT", "90"))
+_SQL_LLM_MAX_RETRIES: int = int(os.getenv("SALES_SQL_LLM_MAX_RETRIES", "1"))
+# ⚠️ 头号性能参数：qwen3 系模型在 DashScope 上**默认开启思考模式**，
+#    而 Vanna 0.7.3 的 submit_prompt 只透传 model/messages/temperature，
+#    不会关思考。2026-09-21 同一份 SQL prompt 实测：
+#      开思考 153s/40s（先吐 3 万/8 千字 reasoning_content，再给 SQL）
+#      关思考  16s/3.4s（无 reasoning_content）
+#    生成 SQL 是确定性任务，不需要思考链。默认关闭；需要排查 SQL 质量时
+#    可设 SALES_SQL_ENABLE_THINKING=true 临时打开。
+_SQL_LLM_ENABLE_THINKING: bool = (
+    os.getenv("SALES_SQL_ENABLE_THINKING", "false").strip().lower() in ("1", "true", "yes", "on")
 )
 _DEFAULT_DB_PATH: str = os.path.join("data", "sales.db")
 _DEFAULT_CHROMA_PATH: str = os.path.join("data", "chroma_sales_sql")
@@ -94,10 +111,33 @@ class SalesVanna:
 
             def __init__(self, cfg: Dict[str, Any]) -> None:
                 client = cfg.get("client") or OpenAI(
-                    api_key=cfg.get("api_key"), base_url=cfg.get("base_url")
+                    api_key=cfg.get("api_key"),
+                    base_url=cfg.get("base_url"),
+                    timeout=cfg.get("timeout", _SQL_LLM_TIMEOUT),
+                    max_retries=cfg.get("max_retries", _SQL_LLM_MAX_RETRIES),
                 )
                 ChromaDB_VectorStore.__init__(self, config=cfg)
                 OpenAI_Chat.__init__(self, client=client, config=cfg)
+
+            def submit_prompt(self, prompt, **kwargs) -> str:
+                """覆盖 Vanna 0.7.3 原版：原版只透传 model/messages/temperature，
+                qwen3 默认思考会让一次 SQL 生成耗 40~153s（实测）。
+                这里显式注入 DashScope 方言 ``enable_thinking=False``，
+                其余参数与原版保持一致；不改第三方库源码。
+                """
+                if prompt is None or len(prompt) == 0:
+                    raise Exception("Prompt is None or empty")
+                model = kwargs.get("model") or self.config.get("model")
+                request_kwargs: Dict[str, Any] = {
+                    "model": model,
+                    "messages": prompt,
+                    "stop": None,
+                    "temperature": self.temperature,
+                }
+                if not _SQL_LLM_ENABLE_THINKING:
+                    request_kwargs["extra_body"] = {"enable_thinking": False}
+                response = self.client.chat.completions.create(**request_kwargs)
+                return response.choices[0].message.content
 
         self._vn = _Vanna(config)
         self._conn = sqlite3.connect(db_path or os.getenv("SALES_DB_PATH", _DEFAULT_DB_PATH),
@@ -241,21 +281,30 @@ class SalesSqlQueryTool(BaseTool):
         if not question:
             return "错误：未提供查询问题"
 
+        # ⚠️ Vanna 全链路（ChromaDB 检索 + 同步 OpenAI 客户端 HTTP + sqlite）
+        #    都是**阻塞调用**，直接跑在事件循环线程上会把 SSE 心跳/drain 一起冻死
+        #    （慢的时候单次 90~167s，前端观感就是整页卡死）。一律丢工作线程。
         try:
-            vanna = get_vanna()
+            vanna = await asyncio.to_thread(get_vanna)
         except Exception as exc:  # noqa: BLE001 - 初始化失败必须可见，不能静默不可用
             return f"错误：销售 SQL 工具初始化失败（{type(exc).__name__}）：{exc}"
 
-        try:
+        def _generate_and_run() -> tuple:
             sql = vanna.generate_sql(question)
             if not sql:
-                return "错误：未能生成有效的 SQL。请换一种问法（明确表名/条件/时间范围）。"
+                return None, None
             _assert_readonly(sql)
-            frame = vanna.run_readonly(sql)
+            return sql, vanna.run_readonly(sql)
+
+        try:
+            sql, frame = await asyncio.to_thread(_generate_and_run)
         except ValueError as exc:
             return f"错误：{exc}"
         except Exception as exc:  # noqa: BLE001
             return f"错误：SQL 生成或执行失败（{type(exc).__name__}）：{exc}"
+
+        if not sql:
+            return "错误：未能生成有效的 SQL。请换一种问法（明确表名/条件/时间范围）。"
 
         if frame is None or getattr(frame, "empty", True):
             return f"## 查询：{question}\n\n生成 SQL：\n```sql\n{sql}\n```\n\n查询成功，但没有匹配的数据。"

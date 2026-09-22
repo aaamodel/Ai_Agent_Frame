@@ -374,12 +374,39 @@ def _render_answer_delta(
     if kind == "attempt_start":
         if attempt_count >= 1 and router.visible_any():
             yield _sse_payload({"delta": {"phase": "answer", "attempt_reset": True}})
+        # 分隔标记依据的是复位**前**的 visible_any()；标记发完再清空分流器，
+        # 让新尝试从干净状态重新判定模式，避免旧 _raw 污染（旧内容若以 { 开头
+        # 会把新尝试锁死在 json 模式）。
+        router.reset()
         return
     if kind != "delta":
         return
     visible = router.feed(event.get("text") or "")
     if visible:
         yield _sse_payload({"delta": {"phase": "answer", "text": visible}})
+
+
+def _render_rewrite_delta(
+    router: DisplayRouter, event: Dict[str, Any], attempt_count: int
+) -> Iterator[bytes]:
+    """改写阶段旁路事件 → 0..1 条 SSE 负载（与答案阶段同口径）。
+
+    换尝试时先复位分流器；第 2 次尝试起且此前已有逐字内容，通知前端清空
+    rewriteText——已推给前端的半截文本后端无法收回，只能靠标记让前端丢弃。
+    （答案阶段是"移入 abandoned 并划线"，改写只是过程性回显，直接清空。）
+    """
+    kind = event.get("kind")
+    if kind == "attempt_start":
+        had_visible = router.visible_any()
+        router.reset()
+        if attempt_count >= 1 and had_visible:
+            yield _sse_payload({"delta": {"phase": "rewrite", "attempt_reset": True}})
+        return
+    if kind != "delta":
+        return
+    visible = router.feed(event.get("text") or "")
+    if visible:
+        yield _sse_payload({"delta": {"phase": "rewrite", "text": visible}})
 
 
 async def _stream_final_answer(
@@ -496,7 +523,8 @@ async def _agent_stream_generator(
     _background_memory_prefetch_tasks.add(long_term_recall_task)
     long_term_recall_task.add_done_callback(_on_memory_prefetch_done)
 
-    # ---- 改写 + 意图阶段：装通道，边跑边把 rewritten_question 逐字推出去 ----
+    # ---- 改写 + 意图阶段：装通道，边跑边把改写问题（schema 的 rewrite 字段）
+    #      逐字推出去 ----
     #
     # ⚠️ `use_sink` 必须在 `create_task` **之前**进入：`asyncio.to_thread` 是在
     #    提交任务的那一刻复制上下文的，通道晚装一秒，工作线程里就读不到，
@@ -516,12 +544,13 @@ async def _agent_stream_generator(
                 available_skills_snapshot,
             )
         )
+        rewrite_attempt_count = 0
         async for sink_event in _drain_queue(delta_queue, until=pipeline_task):
-            if sink_event.get("kind") != "delta":
-                continue
-            visible = rewrite_router.feed(sink_event.get("text") or "")
-            if visible:
-                yield _sse_payload({"delta": {"phase": "rewrite", "text": visible}})
+            for sse_chunk in _render_rewrite_delta(
+                rewrite_router, sink_event, rewrite_attempt_count
+            ):
+                yield sse_chunk
+            rewrite_attempt_count = _bump_attempt(rewrite_attempt_count, sink_event)
         pipeline_output = await pipeline_task
 
     # ------------------------------------------------------------------

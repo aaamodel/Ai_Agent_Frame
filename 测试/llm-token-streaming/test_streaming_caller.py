@@ -97,6 +97,30 @@ async def test_streaming_path_returns_same_content_as_pushed():
 
 
 @pytest.mark.asyncio
+async def test_emits_attempt_start_before_first_delta():
+    """每次流式尝试开流前先发一条 attempt_start（且恰好一条、排在首个 delta 前）。
+
+    没有它，SSE 层的 attempt_count 恒为 0，换候选/重试时"上段废弃"分隔永不出现，
+    DisplayRouter 也不会复位（旧尝试的半截文本污染新尝试）。
+    """
+    completions = FakeCompletions(
+        stream_chunks=[_delta("政企"), _delta("优先"), _final_chunk()],
+    )
+    sink = RecordingSink()
+    with use_sink(sink):
+        await async_openai_chat_caller(
+            _client(completions),
+            _target(),
+            messages=[{"role": "user", "content": "q"}],
+            purpose_hint="react",
+        )
+    kinds = [e.get("kind") for e in sink.events]
+    assert kinds[0] == "attempt_start", kinds
+    assert kinds.count("attempt_start") == 1
+    assert "".join(e.get("text", "") for e in sink.events if e.get("kind") == "delta") == "政企优先"
+
+
+@pytest.mark.asyncio
 async def test_no_sink_uses_non_streaming_path_unchanged():
     plain = SimpleNamespace(
         choices=[

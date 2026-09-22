@@ -147,8 +147,9 @@ def _apply_step_correction(
     白名单复核。标识不在本次候选列表中、翻译失败、或配额耗尽时，一律忽略该指令并
     按既有口径降级为「继续执行下一个子任务」——**本步已产出的结论绝不因此丢弃**。
 
-    作用域闸门：只改 cursor 之后的计划项；cursor 本身、已跳过记录、提前收尾标记
-    一律不动（对比重规划的"整体替换计划 + cursor 归零 + 清空跳过记录"）。
+    作用域闸门：只在 cursor 之后**插入**一条新的纠偏子任务；当前步、已有计划项
+    （含其 id）、已跳过记录、提前收尾标记一律不动（对比重规划的"整体替换计划 +
+    cursor 归零 + 清空跳过记录"）。
     """
     if not selected or not candidates:
         return {}
@@ -179,29 +180,39 @@ def _apply_step_correction(
     if action is None:
         return _skip("标识不在本次候选列表中，或未通过白名单复核")
 
-    # ⚠️ 起点是 ``cursor + 1``：`next_pending_cursor` 是**从 cursor 起（含）**找，
-    # 直接传 cursor 会把正在执行的那一步本身改掉——"只改 cursor 之后"就破了。
-    target_index = next_pending_cursor(plan, cursor + 1, skipped_ids)
-    if target_index is None:
-        return _skip("cursor 之后无待执行子任务，无可替换的目标")
+    # 在 ``cursor + 1`` 处**插入**一条新的 tool 子任务（不再替换下一待执行项）：
+    # 本节点收尾时 cursor 恰好推进到 cursor+1 → 插入的纠偏步下一步立即执行，
+    # 原下一任务顺延一位、内容不动。cursor 在计划末尾时即追加，因此不再需要
+    # "cursor 之后存在待执行子任务"这一前置条件。
+    tool_name: Any = action.get("tool_name")
+    existing_ids = {str(entry.get("id")) for entry in plan}
+    base_id: str = f"correction_{subtask_id}"
+    new_id: str = base_id
+    suffix: int = 2
+    while new_id in existing_ids:
+        new_id = f"{base_id}_{suffix}"
+        suffix += 1
 
-    new_plan: List[Dict[str, Any]] = [dict(entry) for entry in plan]
-    original: Dict[str, Any] = new_plan[target_index]
-    new_plan[target_index] = {
-        **original,
-        "title": str(action.get("title") or original.get("title") or ""),
+    new_task: Dict[str, Any] = {
+        "id": new_id,
+        "title": str(action.get("title") or f"调用 {tool_name}"),
         "action_type": "tool",
-        "tool_name": action.get("tool_name"),
+        "tool_name": tool_name,
         "tool_args_hint": dict(action.get("action_input") or {}),
         "description": (
-            f"{original.get('description') or ''}\n"
-            f"（执行期就地纠偏：改用 {action.get('tool_name')}）"
-        ).strip(),
+            f"执行期就地纠偏：改用 {tool_name}"
+            + (f"（触发：{trigger}）" if trigger else "")
+        ),
     }
+
+    new_plan: List[Dict[str, Any]] = [dict(entry) for entry in plan]
+    new_plan.insert(cursor + 1, new_task)
 
     record.update({
         "applied": True,
-        "target_subtask_id": original.get("id"),
+        "inserted": True,
+        "insert_at": cursor + 1,
+        "target_subtask_id": new_id,
         "target_tool": action.get("tool_name"),
         "target_args": action.get("action_input"),
     })
@@ -331,7 +342,7 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
 
     update: Dict[str, Any] = {}
     budget = budget_from_ledger(state.get("budget") or {})
-
+    print(f"解析到了哪些事实：{state.get("extracted_facts",None)}")
     # ── 游标快进：跳过被模型决定跳过的子任务 ──────────────────────────────
     # 与 builder.route_after_execute **共用** next_pending_cursor，避免两处各写一份
     # "怎么算下一个待执行" 的逻辑（历史上工具白名单就因三处同口径而漂移过）。
@@ -538,7 +549,9 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
             question_keywords = build_question_keywords(state)
             evidence_gap, coverage = detect_evidence_gap(question_keywords, obs_str)
             correction_reason = injection_reason(state, evidence_gap=evidence_gap)
-            correction_set = build_candidates(state)
+            # rec 此刻尚未入账，但它调用的工具/尝试的资产已"在飞"：必须计入差集，
+            # 否则当前工具会作为"尚未尝试的候选"被重新选中，导致同方向连锁插步。
+            correction_set = build_candidates(state, current_result=rec)
 
             correction_candidates: List[Candidate] = []
             candidates_text: str = ""
@@ -704,6 +717,8 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
         )
     else:
         update["insufficiency_signal"] = None
+    print(f"更新了哪些事实：{update.get("extracted_facts",None)}")
+
     return update
 
 

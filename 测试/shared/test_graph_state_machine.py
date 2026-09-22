@@ -743,6 +743,9 @@ async def test_evidence_gap_lets_model_switch_data_source_midflight() -> None:
         subtask_outcomes=[
             {"conclusion": "本步返回与问题无关", "solved": "no",
              "next_action": "continue", "selected_alternative_id": "tool:alt_tool"},
+            # 纠偏插入的 alt 步与顺延的 t2 步：中性产出，不再选择替代方向
+            {"conclusion": "替代方向已取到行业优先级数据", "solved": "yes",
+             "next_action": "continue", "selected_alternative_id": None},
         ],
         summary_verdicts=[
             {"sufficient": True, "answer": "已完成", "missing_info": "", "suggestion": ""}
@@ -766,9 +769,9 @@ async def test_evidence_gap_lets_model_switch_data_source_midflight() -> None:
     assert outcome.paused is False
     names = [inv["name"] for inv in registry.invocations]
     assert names[0] == "t1_tool"
-    # 第二步被就地纠偏成 alt_tool（原计划是 t2_tool）
+    # 纠偏在 t1 之后**插入** alt_tool 步：下一步立即执行；原 t2 不被替换，顺延执行
     assert names[1] == "alt_tool", f"就地纠偏未生效，实际调用序列={names}"
-    assert "t2_tool" not in names
+    assert names[2] == "t2_tool", f"原计划子任务应顺延保留，实际调用序列={names}"
 
 
 @pytest.mark.asyncio
@@ -783,6 +786,9 @@ async def test_no_injection_when_step_is_healthy_so_plan_is_untouched() -> None:
         subtask_outcomes=[
             {"conclusion": "行业优先级已给出", "solved": "yes",
              "next_action": "continue", "selected_alternative_id": "tool:alt_tool"},
+            # t2 步：即使证据缺口置位、候选可见，模型不选 → 计划不得被延长
+            {"conclusion": "第二步完成", "solved": "yes",
+             "next_action": "continue", "selected_alternative_id": None},
         ],
         summary_verdicts=[
             {"sufficient": True, "answer": "已完成", "missing_info": "", "suggestion": ""}

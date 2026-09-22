@@ -163,6 +163,23 @@ def test_used_tools_are_removed_from_tool_side_diff():
     assert "tool:web_search" in ids
 
 
+def test_inflight_current_result_is_removed_from_candidates():
+    """当前步尚未入账，但它调用的工具/尝试的资产已"在飞"，MUST 从候选剔除。
+
+    否则纠偏步自身的工具会被当成"尚未尝试的候选"重新注入，模型再选即连锁插步。
+    """
+    state = _state(subtask_results=[_rec(tool_name="rag_knowledge_search")])
+    inflight = _rec(
+        tool_name="web_search",
+        action_input={"file_path": "raw_data/sales_intel/客户线索台账.xlsx"},
+    )
+    ids = [item.id for item in build_candidates(state, current_result=inflight).candidates]
+    assert "tool:web_search" not in ids
+    assert "tool:sales_sql_query" in ids  # 其它未用工具仍在
+    # 当前步刚尝试过的资产同样剔除（按位置/文件名反查）
+    assert "asset:客户线索台账.xlsx" not in ids
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 7.1 ⑤ 两个差集均为空 → 不注入且不中断
 # ═══════════════════════════════════════════════════════════════════════════
@@ -331,8 +348,18 @@ def test_correction_applied_within_quota():
 
     assert update, "配额内应当生效"
     new_plan = update["plan"]
-    assert new_plan[1]["tool_name"] == "web_search"
-    assert "执行期就地纠偏" in new_plan[1]["description"]
+    assert len(new_plan) == 3, "纠偏是插入新任务，原计划项全部保留"
+    # 插入位置 = cursor + 1：下一步立即执行纠偏步
+    inserted = new_plan[1]
+    assert inserted["id"] == "correction_t1"
+    assert inserted["tool_name"] == "web_search"
+    assert inserted["action_type"] == "tool"
+    assert "执行期就地纠偏" in inserted["description"]
+    # 原任务原样保留、顺延一位，不被改写
+    assert new_plan[0]["id"] == "t1"
+    assert new_plan[2]["id"] == "t2"
+    assert new_plan[2]["tool_name"] == "rag_knowledge_search"
+    assert new_plan[2]["description"] == "原描述"
     assert update["step_corrections"][0]["applied"] is True
     assert update["step_corrections"][0]["remaining_quota"] > 0
 
@@ -378,9 +405,42 @@ def test_correction_records_all_required_fields():
     assert isinstance(record["remaining_quota"], int)
 
 
-def test_correction_skipped_when_no_pending_target():
-    """cursor 已在末尾 → 无可替换目标 → 忽略，且不抛异常。"""
+def test_correction_inserts_when_cursor_at_tail():
+    """cursor 已在末尾 → 不再有"无可替换目标"闸门：直接在末尾追加纠偏步。"""
     state = _state(subtask_results=[_rec()])
     plan = [{"id": "t1", "title": "唯一一步", "action_type": "tool", "tool_name": "file_read_tool"}]
-    assert _apply(state, "tool:web_search", build_candidates(state).candidates,
-                  cursor=0, plan=plan) == {}
+    update = _apply(
+        state, "tool:web_search", build_candidates(state).candidates,
+        cursor=0, plan=plan,
+    )
+    assert update, "末尾追加也应当生效"
+    new_plan = update["plan"]
+    assert len(new_plan) == 2
+    assert new_plan[0] == plan[0], "已执行/已有计划项 MUST NOT 被改写"
+    assert new_plan[1]["id"] == "correction_t1"
+    assert new_plan[1]["tool_name"] == "web_search"
+    record = update["step_corrections"][0]
+    assert record["applied"] is True
+    assert record["inserted"] is True
+    assert record["insert_at"] == 1
+    assert record["target_subtask_id"] == "correction_t1"
+
+
+def test_repeated_correction_for_same_subtask_generates_unique_id():
+    """同一 subtask_id 触发第二次纠偏（顺延到后续步时）→ id 自动去重。"""
+    state = _state(subtask_results=[_rec()])
+    candidates = build_candidates(state).candidates
+
+    first = _apply(state, "tool:web_search", candidates)
+    assert first["plan"][1]["id"] == "correction_t1"
+
+    # 模拟第一次纠偏已写回 state / plan 后再次触发
+    state["plan"] = first["plan"]
+    state["step_corrections"] = first["step_corrections"]
+    second = _apply(
+        state, "tool:web_search", candidates,
+        cursor=1, plan=first["plan"],
+    )
+    assert second, "默认配额 2 次，第二次仍应生效"
+    assert second["plan"][2]["id"] == "correction_t1_2"
+    assert len(second["plan"]) == 4
