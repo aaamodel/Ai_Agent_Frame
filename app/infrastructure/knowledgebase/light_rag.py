@@ -4,6 +4,12 @@ import asyncio
 import threading
 from typing import Any, Dict, List, Optional
 
+# 咽喉保险：确保 langfuse.openai 全局 openai 补丁阻断器已安装（非 main.py 入口
+# 直接使用 LightRAG 时也不会漏装）。详见 app.infrastructure.trace.langfuse 注释。
+from app.infrastructure.trace.langfuse import disable_langfuse_openai_autopatch
+
+disable_langfuse_openai_autopatch()
+
 from lightrag.utils import EmbeddingFunc
 from pypdf import PdfReader
 from lightrag import LightRAG, QueryParam
@@ -12,6 +18,7 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from app.config import get_settings
+from app.infrastructure.trace.langfuse import embedding_span, generation_span
 from app.llm_model_router.async_model_executor import run_with_attempt_budget
 from app.llm_model_router.async_openai_caller import apply_thinking_dialect
 from app.llm_model_router.tier_params import read_tier_params
@@ -114,22 +121,41 @@ async def qwen_llm_complete(
             **call_kwargs,
         )
 
-    result, error = await run_with_attempt_budget(
-        _one_attempt,
-        timeout_s=_tier_params.timeout_s,
-        retries=_tier_params.retries,
-        budget_label=(
-            f"{int(_tier_params.timeout_s * 1000)}ms(tier={_tier_params.tier})"
-            if _tier_params.timeout_s
-            else f"<no-timeout>(tier={_tier_params.tier})"
-        ),
-        subject=f"lightrag:{_tier_params.model}",
-    )
-    if result is None:
-        if isinstance(error, BaseException):
-            raise error
-        raise RuntimeError("LightRAG 模型调用失败")
-    return result
+    # Langfuse：LightRAG 不经 llm_model_router，这里在框架调用边界补一个
+    # generation。会话内（knowledge_graph_search 工具执行中）挂在
+    # tool_invoke 下；文档批量抽取发生在会话外 → 门控 no-op，不产生游离根。
+    # 输入只放截断摘要（抽取 prompt 可达数万字），框架只回传文本故无 usage。
+    with generation_span(
+        name="llm.lightrag",
+        model=llm_model,
+        input={
+            "keyword_extraction": bool(keyword_extraction),
+            "system_prompt": (system_prompt or "")[:500],
+            "prompt": (prompt or "")[:1500],
+            "history_messages_count": len(history_messages),
+        },
+    ) as span:
+        result, error = await run_with_attempt_budget(
+            _one_attempt,
+            timeout_s=_tier_params.timeout_s,
+            retries=_tier_params.retries,
+            budget_label=(
+                f"{int(_tier_params.timeout_s * 1000)}ms(tier={_tier_params.tier})"
+                if _tier_params.timeout_s
+                else f"<no-timeout>(tier={_tier_params.tier})"
+            ),
+            subject=f"lightrag:{_tier_params.model}",
+        )
+        if result is None:
+            if isinstance(error, BaseException):
+                raise error
+            raise RuntimeError("LightRAG 模型调用失败")
+        if span is not None:
+            try:
+                span.update(output={"content": str(result)[:2000]})
+            except Exception:  # pragma: no cover
+                logger.debug("lightrag Langfuse generation 富化失败，忽略。", exc_info=False)
+        return result
 
 async def qwen_embedding(texts: list[str]) -> list[list[float]]:
     # ⚠️ 关键：必须调用 openai_embed.func（未装饰原函数），不能直接调 openai_embed。
@@ -140,13 +166,19 @@ async def qwen_embedding(texts: list[str]) -> list[list[float]]:
     # 「Embedding dimension mismatch ... 10240 / 1536」故障的根因。
     # .func 是官方文档指定的未装饰入口（见 lightrag/utils.py 装饰器 docstring），
     # 显式传 embedding_dim 后原函数会向百炼发送 dimensions=1024。
-    return await openai_embed.func(
-        texts,
+    # 会话内（图谱检索）挂 embedding observation；会话外批量建库 → no-op。
+    with embedding_span(
+        name="embedding.lightrag",
         model=EMBEDDING_MODEL,
-        api_key=DASHSCOPE_API_KEY,
-        base_url=DASHSCOPE_BASE_URL,
-        embedding_dim=EMBEDDING_DIM,
-    )
+        input={"input_count": len(texts)},
+    ):
+        return await openai_embed.func(
+            texts,
+            model=EMBEDDING_MODEL,
+            api_key=DASHSCOPE_API_KEY,
+            base_url=DASHSCOPE_BASE_URL,
+            embedding_dim=EMBEDDING_DIM,
+        )
 
 # 1. 包装百炼的向量函数
 wrapped_embedding = EmbeddingFunc(

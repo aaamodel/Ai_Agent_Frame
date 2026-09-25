@@ -12,7 +12,10 @@
     SQL 仍随结果返回，可审计性不降（D3）。
   - **只支持 SQLite**：参照实现的 PostgreSQL 分支与跨库路由**不引入**（D5）。
   - **模型不走 ModelRouter**：按需求硬编码 DashScope OpenAI 兼容端点（D6）。
-    代价是这一路不受熔断降级 / 调用预算 / Langfuse 追踪覆盖，属于已知盲区。
+    代价是这一路不受熔断降级 / 调用预算覆盖，属于已知盲区。Langfuse 观测仍在：
+    ``submit_prompt`` 内包了一层 ``llm.sales_sql`` generation；该方法运行在
+    ``asyncio.to_thread`` 工作线程中，OTel context 随线程拷贝，generation
+    自动挂到本次会话的根 trace（tool_invoke 之下），不会另起一条 trace。
 
 依赖版本：项目锁定 Vanna **0.7.3**，因此沿用参照实现的原始导入路径
 ``vanna.chromadb.chromadb_vector`` / ``vanna.openai.openai_chat``。
@@ -78,6 +81,53 @@ def _load_sqlite_conn() -> sqlite3.Connection:
     return sqlite3.connect(path, check_same_thread=False)
 
 
+def _vanna_chat_completion(client: Any, request_kwargs: Dict[str, Any], model: str) -> str:
+    """Vanna 专用同步 OpenAI 调用 + Langfuse generation（在工作线程内执行）。
+
+    与 ``async_openai_caller`` 同一套门控工厂（``generation_span``）：
+      - 仅在 tool_invoke（会话 trace）内产生挂在工具下的 ``llm.sales_sql``；
+      - 会话外/观测层异常 → no-op，绝不产生游离根 trace；
+      - 真实 API 异常原样上抛，只调用一次，不做兜底重发（旧实现的外层
+        except 会在 APIError 时重复打一次真实接口，已移除）。
+    """
+    from app.infrastructure.trace.langfuse import generation_span  # noqa: PLC0415
+
+    def _content_of(resp: Any) -> str:
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        return getattr(message, "content", None) or "" if message is not None else ""
+
+    with generation_span(
+        name="llm.sales_sql",
+        model=request_kwargs.get("model") or model,
+        input={
+            "model": request_kwargs.get("model") or model,
+            "messages": request_kwargs.get("messages") or [],
+            "temperature": request_kwargs.get("temperature"),
+        },
+    ) as generation:
+        response = client.chat.completions.create(**request_kwargs)
+        if generation is not None:
+            try:
+                resp_usage = getattr(response, "usage", None)
+                update_kwargs: Dict[str, Any] = {
+                    "output": {"content": _content_of(response)},
+                    "model": model,
+                }
+                if resp_usage is not None:
+                    update_kwargs["usage_details"] = {
+                        "input": int(getattr(resp_usage, "prompt_tokens", 0) or 0),
+                        "output": int(getattr(resp_usage, "completion_tokens", 0) or 0),
+                        "total": int(getattr(resp_usage, "total_tokens", 0) or 0),
+                    }
+                generation.update(**update_kwargs)
+            except Exception:  # pragma: no cover - 富化失败忽略
+                logger.debug("sales_sql Langfuse generation 富化失败，忽略。", exc_info=False)
+        return response.choices[0].message.content
+
+
 class SalesVanna:
     """Vanna 实例 + 一个 SQLite 连接。
 
@@ -124,6 +174,11 @@ class SalesVanna:
                 qwen3 默认思考会让一次 SQL 生成耗 40~153s（实测）。
                 这里显式注入 DashScope 方言 ``enable_thinking=False``，
                 其余参数与原版保持一致；不改第三方库源码。
+
+                Langfuse：本方法在 asyncio.to_thread 工作线程内执行，OTel
+                context 已随线程拷贝，``llm.sales_sql`` generation 自动挂在
+                会话根 trace 的 tool_invoke span 之下；观测层任何异常只降级
+                为 debug 日志，绝不影响 SQL 生成主链路。
                 """
                 if prompt is None or len(prompt) == 0:
                     raise Exception("Prompt is None or empty")
@@ -136,8 +191,7 @@ class SalesVanna:
                 }
                 if not _SQL_LLM_ENABLE_THINKING:
                     request_kwargs["extra_body"] = {"enable_thinking": False}
-                response = self.client.chat.completions.create(**request_kwargs)
-                return response.choices[0].message.content
+                return _vanna_chat_completion(self.client, request_kwargs, str(model))
 
         self._vn = _Vanna(config)
         self._conn = sqlite3.connect(db_path or os.getenv("SALES_DB_PATH", _DEFAULT_DB_PATH),

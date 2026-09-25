@@ -43,6 +43,91 @@ from trace_to_markdown import  trace_to_markdown
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 改写"历史污染"确定性兜底
+# ─────────────────────────────────────────────────────────────────────────────
+# 2026-09 实测：glm-4.7 在自足新问题（无任何指代/省略）场景下，会把上一轮的
+# 独立旧问题整句拼进 rewrite（Q1+Q2），并因此多拆子问题、误触发 plan_execute。
+# Prompt 约束之外再加一层纯字符判定：改写文本里若大段覆盖了某条历史问题、
+# 而当前问题本身并不包含该内容，即判为污染，回退归一化原问题。
+
+#: 归一化时剔除的标点/空白（仅用于比对，不改写真实文本）
+_GUARD_STRIP_RE = re.compile(r"[\s，。！？；：、,.!?;:\"'“”‘’（）()【】\[\]~·…\-—_/\\]+")
+
+#: 当前问题出现这些指代/省略信号时不做污染判定——那是历史介入的**合法**场景
+_COREFERENCE_MARKERS = (
+    "它", "她们", "他们", "它们", "她", "这个", "那个", "这些", "那些",
+    "上面", "上文", "前文", "前述", "刚才", "之前说", "上面说",
+    "继续", "接着", "然后呢", "上一条", "上一轮", "上一个问题",
+    "该数据", "该公司", "该文件", "该客户",
+)
+
+#: 参与比对的历史问题最短归一化长度（短到"你好"之类没有污染判定价值）
+_GUARD_MIN_PRIOR_LEN = 8
+
+#: 历史问题的 bigram 出现在改写文本中的比例达到该值 → 视为"大段并入"
+_GUARD_COVER_RATIO = 0.6
+
+#: 历史问题的 bigram 出现在当前问题中的比例低于该值 → 证明当前问题并不依赖它
+_GUARD_CURRENT_RATIO = 0.3
+
+
+def _rewrite_guard_norm(text: Any) -> str:
+    return _GUARD_STRIP_RE.sub("", str(text or ""))
+
+
+def _bigrams(text: str) -> set:
+    return {text[i:i + 2] for i in range(len(text) - 1)} if len(text) >= 2 else set()
+
+
+def _bigram_coverage(needle: str, haystack: str) -> float:
+    """needle 的字符 bigram 有多少比例出现在 haystack 中。"""
+    needle_bigrams = _bigrams(needle)
+    if not needle_bigrams:
+        return 0.0
+    haystack_bigrams = _bigrams(haystack)
+    hits = sum(1 for bg in needle_bigrams if bg in haystack_bigrams)
+    return hits / len(needle_bigrams)
+
+
+def _has_coreference_marker(current_question: str) -> bool:
+    return any(marker in current_question for marker in _COREFERENCE_MARKERS)
+
+
+def is_history_contaminated(
+    candidate_text: Any,
+    current_question: Any,
+    prior_user_questions: Optional[List[str]],
+) -> bool:
+    """判定一段改写文本是否把历史旧问题大段并入（且当前问题自足、不依赖历史）。
+
+    纯确定性 bigram 覆盖判定，不产生模型调用：
+
+    - 当前问题含指代/省略信号 → 一律不判污染（历史介入合法）；
+    - 某条历史问题 ≥ 8 个归一化字符、与当前问题不同题；
+    - 该历史问题 ≥60% 的 bigram 出现在候选文本里，而在当前问题里 <30%
+      → 候选文本是"旧问题拼接物"。
+    """
+    current_norm = _rewrite_guard_norm(current_question)
+    candidate_norm = _rewrite_guard_norm(candidate_text)
+    if not current_norm or not candidate_norm:
+        return False
+    if _has_coreference_marker(str(current_question or "")):
+        return False
+    for prior in prior_user_questions or []:
+        prior_norm = _rewrite_guard_norm(prior)
+        if len(prior_norm) < _GUARD_MIN_PRIOR_LEN:
+            continue
+        if prior_norm == current_norm:
+            continue
+        if (
+            _bigram_coverage(prior_norm, candidate_norm) >= _GUARD_COVER_RATIO
+            and _bigram_coverage(prior_norm, current_norm) < _GUARD_CURRENT_RATIO
+        ):
+            return True
+    return False
+
+
 
 
 @dataclass
@@ -315,6 +400,9 @@ class AgentMultiQuestionRewriteService(
                     )
                     if isinstance(skill_name, str) and skill_name.strip()
                 ],
+                prior_user_questions=self._prior_user_questions(
+                    agent_chat_context.conversation_history
+                ),
             )
         except Exception as llm_error:
             logger.warning(
@@ -343,6 +431,22 @@ class AgentMultiQuestionRewriteService(
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _prior_user_questions(
+        conversation_history: Optional[List[IntentChatMessage]],
+        limit: int = 8,
+    ) -> List[str]:
+        """历史 role=user 消息文本（最近 limit 条），供改写"历史污染"兜底比对。
+
+        与 _build_*_request 注入给 LLM 的历史口径保持一致。
+        """
+        user_messages = [
+            str(msg.content).strip()
+            for msg in (conversation_history or [])
+            if str(msg.role).lower() == "user" and str(msg.content).strip()
+        ]
+        return user_messages[-limit:] if len(user_messages) > limit else user_messages
+
     def _build_agent_rewrite_request(
         self,
         system_prompt: str,
@@ -592,6 +696,7 @@ class AgentMultiQuestionRewriteService(
         available_tool_ids: List[str],
         pre_rule_plan_hint: Optional[str],
         available_skill_names: Optional[List[str]] = None,
+        prior_user_questions: Optional[List[str]] = None,
     ) -> Optional[AgentRewriteResult]:
         """S1 Agent 改写解析：response_format 已保证合法 AgentRewriteSchema。
 
@@ -650,6 +755,45 @@ class AgentMultiQuestionRewriteService(
         if not sub_questions_value:
             should_split_value = False
             sub_questions_value = [final_rewritten_question]
+
+        # ── 历史污染确定性兜底 ─────────────────────────────────────────────
+        # 自足新问题被拼成"旧问题+新问题"时：主改写回退归一化原问题；
+        # 子问题逐条剔除污染项，存活不足 2 条则取消拆分（避免误触发 plan_execute）。
+        # sub_question_source_indexes 记录存活项在模型输出中的 1 基序号，
+        # 供组合链路的意图打分（question_index）正确对位。
+        sub_question_source_indexes: Optional[List[int]] = None
+        priors: List[str] = [str(q).strip() for q in (prior_user_questions or []) if str(q).strip()]
+        if priors:
+            if is_history_contaminated(
+                final_rewritten_question, fallback_question, priors
+            ):
+                logger.warning(
+                    "改写主问题疑似拼接历史旧问题，已回退归一化原问题。"
+                    "rewrite=%r，fallback=%r",
+                    final_rewritten_question, fallback_question,
+                )
+                final_rewritten_question = fallback_question
+
+            if should_split_value and len(sub_questions_value) >= 2:
+                kept_pairs: List[tuple] = [
+                    (idx + 1, text)
+                    for idx, text in enumerate(sub_questions_value)
+                    if not is_history_contaminated(text, fallback_question, priors)
+                ]
+                if len(kept_pairs) != len(sub_questions_value):
+                    logger.warning(
+                        "拆分子问题中检测到历史污染，已剔除 %d/%d 条：%s",
+                        len(sub_questions_value) - len(kept_pairs),
+                        len(sub_questions_value),
+                        sub_questions_value,
+                    )
+                if len(kept_pairs) >= 2:
+                    sub_question_source_indexes = [src for src, _ in kept_pairs]
+                    sub_questions_value = [text for _, text in kept_pairs]
+                else:
+                    # 污染项剔除后只剩 0~1 条独立问题 → 不再拆分
+                    should_split_value = False
+                    sub_questions_value = [final_rewritten_question]
 
         # 复杂度分析：Pydantic schema 已强制 1<=steps<=10 / 0<=tools<=10，
         # 再做一遍 clamp 保持防御风格。
@@ -736,4 +880,5 @@ class AgentMultiQuestionRewriteService(
             suggested_tools=suggested_tools_value,
             explicit_plan_hint=explicit_plan_hint_value,
             suggested_skills=suggested_skills_value,
+            sub_question_source_indexes=sub_question_source_indexes,
         )

@@ -40,6 +40,12 @@ INSUFFICIENT_MARKERS: tuple = (
 _MIN_SUBSTANTIVE_NUMBERS: int = 3
 _NUMBER_PATTERN = re.compile(r"\d+(?:\.\d+)?")
 
+# "标题党正文"收尾词：正文只有一行、没有任何结构标点，且以这些抽象名词收尾，
+# 基本可断定是 planner 看不到前序结果时写的占位语（实测："2026年7月销售及
+# 负责人产品销量排名数据"→ 导出只有一行占位语的空报表，还白烧一次人工审批）。
+_ECHO_TAIL_PATTERN = re.compile(r"(数据|结果|情况|内容|信息|报表|报告)$")
+_STRUCTURE_PUNCT_PATTERN = re.compile(r"[：:；;，,。\n]")
+
 
 class SalesReportExportTool(BaseTool):
     """将销售分析结论导出为格式化 .xlsx 报表（写操作，需人工审批）。"""
@@ -90,10 +96,33 @@ class SalesReportExportTool(BaseTool):
             return True
         return len(_NUMBER_PATTERN.findall(content)) >= _MIN_SUBSTANTIVE_NUMBERS
 
+    @staticmethod
+    def _content_is_title_echo(content: str) -> bool:
+        """判断正文是否只是"标题党"占位语（单行 + 无结构标点 + 抽象名词收尾）。
+
+        真报表正文至少会有分行/冒号/逗号组织的指标行；planner 凭空写的占位语
+        形态固定为"××年×月××排名数据"这类单行短语。宁可误拦一次让执行层
+        重新用前序结论组参，也不能让空报表通过人工审批落盘。
+        """
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if len(lines) != 1:
+            return False
+        only_line = lines[0]
+        if _STRUCTURE_PUNCT_PATTERN.search(only_line):
+            return False
+        return bool(_ECHO_TAIL_PATTERN.search(only_line))
+
     async def execute(self, **kwargs: Any) -> str:
         title = str(kwargs.get("report_title") or "").strip()
         content = str(kwargs.get("content") or "").strip()
         file_name = str(kwargs.get("file_name") or "").strip()
+
+        # FC 模型常把换行双重转义成字面量 "\n"（实测 GLM-4.7 的 tool arguments
+        # 即如此），不归一化会导致整篇报表挤在一个单元格、splitlines 失效。
+        content = (
+            content.replace("\r\n", "\n").replace("\r", "\n")
+            .replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+        )
 
         if not title:
             return "错误：缺少必填参数 report_title（报表标题）"
@@ -106,6 +135,15 @@ class SalesReportExportTool(BaseTool):
                 "请先完成取数再导出：用 sales_sql_query 查询，"
                 "并按 filter_column+filter_value 精确定位目标期间（例如 月份=2026-08），"
                 "拿到具体指标数值后再汇总成报表正文。"
+            )
+        # "标题党正文"闸门：拦住 planner 凭标题写的单行占位语（取不到前序结果时
+        # 的典型故障），要求把前序查询的真实结论/指标组织成正文后再导出。
+        if self._content_is_title_echo(content):
+            return (
+                "错误：报表正文只是标题性占位语（单行、无具体指标与结论），"
+                "已拒绝导出（未落盘、未消耗审批）。请把 sales_sql_query 查到的"
+                "真实排名/指标按行整理进 content（包含人员、产品、数值等），"
+                "不要只写“××数据/××结果”这类短语。"
             )
 
         try:

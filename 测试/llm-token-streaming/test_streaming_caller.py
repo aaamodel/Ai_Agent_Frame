@@ -72,7 +72,14 @@ def _client(completions):
 def _target(model="m1"):
     return SimpleNamespace(
         id=model,
-        candidate=SimpleNamespace(model=model, provider="p1", api_style="openai"),
+        candidate=SimpleNamespace(
+            id=model,
+            model=model,
+            provider="p1",
+            api_style="openai",
+            json_schema_supported=lambda: True,
+            json_object_supported=lambda: True,
+        ),
     )
 
 
@@ -232,6 +239,85 @@ async def test_probe_fallback_on_400_before_first_chunk():
     assert result.content == "非流式拿到的答案"
     assert [e for e in sink.events if e.get("kind") == "delta"] == []  # 不推 delta
     assert completions.calls[-1].get("stream") is not True  # 第二次没开流
+
+
+# ---------------------------------------------------------------------------
+# show_structural 策略：答案阶段内部结构化（response_format）调用不进通道
+# ---------------------------------------------------------------------------
+def _plain(content="结构化JSON"):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=content, tool_calls=None, reasoning_content=None
+                )
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
+        model_dump=lambda: {},
+    )
+
+
+@pytest.mark.asyncio
+async def test_structural_call_non_streaming_when_policy_hides_it():
+    """答案阶段（show_structural=False）：planner/distill 的 JSON 调用既不推
+    delta 也不发 attempt_start——这是"成功计划被误划废弃 + 原始 JSON 上屏"
+    事故（2026-09-23）的回归钉。"""
+    completions = FakeCompletions(
+        stream_chunks=[_delta('{"subtasks": []}'), _final_chunk()],
+        plain_response=_plain(),
+    )
+    sink = RecordingSink()
+    with use_sink(sink, show_structural=False):
+        result = await async_openai_chat_caller(
+            _client(completions),
+            _target(),
+            messages=[{"role": "user", "content": "q"}],
+            response_format={"type": "json_object"},
+        )
+
+    assert sink.events == []  # 一个事件都没有：不流、不计数尝试
+    assert completions.calls[0].get("stream") is not True  # 走的非流式
+    assert result.content == "结构化JSON"  # 对外契约不变
+
+
+@pytest.mark.asyncio
+async def test_structural_call_still_streams_with_default_policy():
+    """改写阶段默认策略：结构化 JSON 照常流（增量抽取 rewrite 字段依赖它）。"""
+    completions = FakeCompletions(
+        stream_chunks=[_delta('{"rewrite":'), _delta('"改写后"}'), _final_chunk()],
+    )
+    sink = RecordingSink()
+    with use_sink(sink):  # 默认 show_structural=True
+        await async_openai_chat_caller(
+            _client(completions),
+            _target(),
+            messages=[{"role": "user", "content": "q"}],
+            response_format={"type": "json_object"},
+        )
+    kinds = [e.get("kind") for e in sink.events]
+    assert kinds[0] == "attempt_start"
+    assert "".join(e.get("text", "") for e in sink.events if e["kind"] == "delta") == (
+        '{"rewrite":"改写后"}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_free_text_call_still_streams_under_hide_structural_policy():
+    """策略只屏蔽结构化调用：自由文本（react 推理/最终答复）在答案阶段照常流。"""
+    completions = FakeCompletions(
+        stream_chunks=[_delta("政企"), _delta("优先"), _final_chunk()],
+    )
+    sink = RecordingSink()
+    with use_sink(sink, show_structural=False):
+        result = await async_openai_chat_caller(
+            _client(completions),
+            _target(),
+            messages=[{"role": "user", "content": "q"}],
+        )
+    assert "".join(e.get("text", "") for e in sink.events if e["kind"] == "delta") == "政企优先"
+    assert result.content == "政企优先"
+    assert completions.calls[0]["stream"] is True
 
 
 @pytest.mark.asyncio

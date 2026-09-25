@@ -153,11 +153,20 @@ def async_build_openai_client(
 
 
 # ---------------------------------------------------------------------------
-# Langfuse 观测：为底层 LLM 调用补充 generation 富化（可开关、永不阻断真实调用）
+# Langfuse 观测：为底层 LLM 调用补充 generation 富化（会话内门控、永不阻断真实调用）
 # ---------------------------------------------------------------------------
-from langfuse import get_client as langfuse_get_client
+from app.infrastructure.trace.langfuse import generation_span
 
-from app.infrastructure.trace.langfuse import is_langfuse_enabled
+
+def _generation_input(params: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "model": params.get("model"),
+        "messages": params.get("messages") or [],
+        "temperature": params.get("temperature"),
+        "max_tokens": params.get("max_tokens"),
+        "tools": params.get("tools"),
+        "stream": bool(params.get("stream")),
+    }
 
 
 def _enrich_langfuse_generation(generation: Any, resp: Any, model: str) -> None:
@@ -195,46 +204,23 @@ async def _chat_completion_with_langfuse(
     model: str,
     provider: str,
 ) -> Any:
-    """带 Langfuse generation 观测的底层 LLM 调用。
+    """带 Langfuse generation 观测的底层非流式 LLM 调用。
 
-    设计原则：
-      - 未启用 Langfuse 或观测层任何异常 → 直接原样发起真实 LLM 调用，零副作用。
-      - 真实 LLM 调用只发生一次；观测层异常使用一次性兜底重发，但绝不吞掉
-        APIError / RateLimitError（交由上层 Executor 做熔断降级）。
+    统一门控（generation_span）：
+      - 会话外（预热/索引/记忆等无根 span 场景）→ no-op，不产生游离根 trace；
+      - 会话内 → generation 挂在当前 span 下（plan/react/replan/summary 等
+        所有经过 llm_model_router 的调用在此一处全覆盖）；
+      - 观测层任何异常都不影响真实调用，APIError/RateLimitError 原样上抛。
     """
-    if not is_langfuse_enabled():
-        return await client.chat.completions.create(**params)
-
-    try:
-        langfuse = langfuse_get_client()
-        context_manager = langfuse.start_as_current_observation(
-            name=f"llm.{provider}",
-            as_type="generation",
-            input={
-                "model": params.get("model") or model,
-                "messages": params.get("messages") or [],
-                "temperature": params.get("temperature"),
-                "max_tokens": params.get("max_tokens"),
-                "tools": params.get("tools"),
-            },
-            model=params.get("model") or model,
-            end_on_exit=False,
-        )
-    except Exception:  # pragma: no cover - 观测层初始化失败不阻断调用
-        return await client.chat.completions.create(**params)
-
-    if context_manager is None:
-        return await client.chat.completions.create(**params)
-
-    try:
-        with context_manager as generation:
-            resp = await client.chat.completions.create(**params)
+    with generation_span(
+        name=f"llm.{provider}",
+        model=params.get("model") or model,
+        input=_generation_input(params),
+    ) as generation:
+        resp = await client.chat.completions.create(**params)
+        if generation is not None:
             _enrich_langfuse_generation(generation, resp, model)
         return resp
-    except (APIError, RateLimitError):
-        raise
-    except Exception:  # pragma: no cover - langfuse with 块自身异常，兜底重发
-        return await client.chat.completions.create(**params)
 
 
 # ---------------------------------------------------------------------------
@@ -401,9 +387,19 @@ async def async_openai_chat_caller(
     #    （原实现 `if stream: stream = False`），没有任何上游真的传它。
     #    以它为门禁会让流式永远不触发。真正的门禁是"此刻有没有人在听"。
     #
+    # ⚠️ 结构化调用（带 response_format 的 JSON 输出）还要再过一道通道策略：
+    #    答案阶段 show_structural=False（planner 计划 / distill 控制协议 /
+    #    summarize 判定都不是给用户看的正文），改走非流式——既不把原始 JSON
+    #    推进 answer 通道，也不发 attempt_start 误划"上段废弃"。
+    #    改写阶段默认放行（要从流式 JSON 增量抽 rewrite 字段）。
+    #
     # ⚠️ 即便开了流，对外仍返回完整结果 —— 上游的重试/熔断/候选降级/业务解析
     #    全部不受影响，因为它们的调用方式一个字都没变。
-    stream_enabled: bool = _stream_sink_module().has_sink()
+    sink_module = _stream_sink_module()
+    structural_call: bool = response_format is not None
+    stream_enabled: bool = sink_module.has_sink() and (
+        not structural_call or sink_module.structural_visible()
+    )
     stream = False
 
     # 1) 组装参数
@@ -560,8 +556,9 @@ async def _streaming_chat_call(
     结构化解析与全部闸门）都依赖"一次调用一个完整结果"这个契约。
     只要契约不变，它们一行都不用改。
 
-    ⚠️ 这里刻意不经过 ``_chat_completion_with_langfuse``：那个包装不感知流式。
-    代价是流式调用在 langfuse 里不可见（spec 风险 3，已知并记录）。
+    Langfuse：整段流式收流包在一个会话内门控的 generation span 内，
+    收流结束后回写聚合 output/usage；探测回落的非流式重发也在同一 span 内，
+    不会重复计数。会话外（无根 span）时为 no-op，不产生游离 trace。
     """
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
@@ -570,83 +567,108 @@ async def _streaming_chat_call(
     tool_calls_acc: Dict[int, Dict[str, Any]] = {}
     received_any_chunk: bool = False
 
-    try:
-        # 每进入一次调用器就是一次新尝试（预算内重试 / 候选降级 / 探测回落
-        # 都会重新走到这里）。显示层据此插入"上段废弃"分隔并复位分流器；
-        # 无通道时 emit 静默返回 False，不影响主链路。
-        # ⚠️ 必须在开流**之前**发：首 chunk 前就 400 走探测回落时，这次尝试
-        #    也应被计数（回落仍是同一次尝试，不再补发）。
-        _stream_sink_module().emit({"kind": "attempt_start"})
-        stream = await client.chat.completions.create(**params)
-        async for chunk in stream:
-            received_any_chunk = True
-            chunk_usage = getattr(chunk, "usage", None)
-            if chunk_usage is not None:
-                usage = {
-                    "prompt_tokens": getattr(chunk_usage, "prompt_tokens", None),
-                    "completion_tokens": getattr(chunk_usage, "completion_tokens", None),
-                    "total_tokens": getattr(chunk_usage, "total_tokens", None),
+    with generation_span(
+        name=f"llm.{target.candidate.provider}",
+        model=target.candidate.model or target.id,
+        input=_generation_input(params),
+    ) as generation:
+        try:
+            # 每进入一次调用器就是一次新尝试（预算内重试 / 候选降级 / 探测回落
+            # 都会重新走到这里）。显示层据此插入"上段废弃"分隔并复位分流器；
+            # 无通道时 emit 静默返回 False，不影响主链路。
+            # ⚠️ 必须在开流**之前**发：首 chunk 前就 400 走探测回落时，这次尝试
+            #    也应被计数（回落仍是同一次尝试，不再补发）。
+            _stream_sink_module().emit({"kind": "attempt_start"})
+            stream = await client.chat.completions.create(**params)
+            async for chunk in stream:
+                received_any_chunk = True
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = {
+                        "prompt_tokens": getattr(chunk_usage, "prompt_tokens", None),
+                        "completion_tokens": getattr(chunk_usage, "completion_tokens", None),
+                        "total_tokens": getattr(chunk_usage, "total_tokens", None),
+                    }
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
+                text = getattr(delta, "content", None)
+                if text:
+                    content_parts.append(text)
+                    # 旁路推送：失败被 emit 内部吞掉，绝不影响主链路
+                    _stream_sink_module().emit({"kind": "delta", "text": text})
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                for tc in (getattr(delta, "tool_calls", None) or []):
+                    idx = int(getattr(tc, "index", 0) or 0)
+                    slot = tool_calls_acc.setdefault(idx, {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": None, "arguments": ""},
+                    })
+                    if getattr(tc, "id", None):
+                        slot["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            slot["function"]["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            slot["function"]["arguments"] += fn.arguments
+        except Exception as exc:  # noqa: BLE001
+            # 方案 A（spec §10.1）：**首 chunk 之前**失败、且异常特征像"参数组合不被
+            # 厂商接受"时，同一次尝试内退回非流式重发，且不推任何 delta。
+            # 探测请求不计入"增加调用次数"（用户已认可）；厂商不支持流式时
+            # 用户看到的就是"这段没有逐字、直接出结果"。
+            if not received_any_chunk and _looks_like_params_rejected(exc):
+                logger.warning(
+                    "流式参数不被接受，本次尝试退回非流式重发: provider=%s modelId=%s err=%s",
+                    target.candidate.provider,
+                    target.id,
+                    exc,
+                )
+                resp = await client.chat.completions.create(**_strip_stream(params))
+                result = _standardize_completion(resp, target)
+                if generation is not None:
+                    _enrich_langfuse_generation(generation, resp, target.id)
+                return result
+            # 其它异常（超时/连接/5xx/首 chunk 后断流）原样抛出，
+            # 交由现有 run_with_attempt_budget 重试与候选降级处理。
+            raise
+
+        content: str = "".join(content_parts)
+        if not content and reasoning_parts:
+            # 与非流式路径同口径：content 为空时回落 reasoning_content
+            content = "".join(reasoning_parts)
+
+        # 回写流式聚合结果（富化失败由 update 内部吞掉，不影响返回）
+        if generation is not None:
+            try:
+                update_kwargs: Dict[str, Any] = {
+                    "output": {"content": content},
+                    "model": target.candidate.model or target.id,
                 }
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            delta = getattr(choices[0], "delta", None)
-            if delta is None:
-                continue
-            text = getattr(delta, "content", None)
-            if text:
-                content_parts.append(text)
-                # 旁路推送：失败被 emit 内部吞掉，绝不影响主链路
-                _stream_sink_module().emit({"kind": "delta", "text": text})
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                reasoning_parts.append(reasoning)
-            for tc in (getattr(delta, "tool_calls", None) or []):
-                idx = int(getattr(tc, "index", 0) or 0)
-                slot = tool_calls_acc.setdefault(idx, {
-                    "id": None,
-                    "type": "function",
-                    "function": {"name": None, "arguments": ""},
-                })
-                if getattr(tc, "id", None):
-                    slot["id"] = tc.id
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        slot["function"]["name"] = fn.name
-                    if getattr(fn, "arguments", None):
-                        slot["function"]["arguments"] += fn.arguments
-    except Exception as exc:  # noqa: BLE001
-        # 方案 A（spec §10.1）：**首 chunk 之前**失败、且异常特征像"参数组合不被
-        # 厂商接受"时，同一次尝试内退回非流式重发，且不推任何 delta。
-        # 探测请求不计入"增加调用次数"（用户已认可）；厂商不支持流式时
-        # 用户看到的就是"这段没有逐字、直接出结果"。
-        if not received_any_chunk and _looks_like_params_rejected(exc):
-            logger.warning(
-                "流式参数不被接受，本次尝试退回非流式重发: provider=%s modelId=%s err=%s",
-                target.candidate.provider,
-                target.id,
-                exc,
-            )
-            resp = await client.chat.completions.create(**_strip_stream(params))
-            return _standardize_completion(resp, target)
-        # 其它异常（超时/连接/5xx/首 chunk 后断流）原样抛出，
-        # 交由现有 run_with_attempt_budget 重试与候选降级处理。
-        raise
+                if usage:
+                    update_kwargs["usage_details"] = {
+                        "input": int(usage.get("prompt_tokens") or 0),
+                        "output": int(usage.get("completion_tokens") or 0),
+                        "total": int(usage.get("total_tokens") or 0),
+                    }
+                generation.update(**update_kwargs)
+            except Exception:  # pragma: no cover
+                logger.debug("流式 Langfuse generation 富化失败，忽略。", exc_info=False)
 
-    content: str = "".join(content_parts)
-    if not content and reasoning_parts:
-        # 与非流式路径同口径：content 为空时回落 reasoning_content
-        content = "".join(reasoning_parts)
-
-    return AsyncOpenAICallResult(
-        content=content,
-        model_id=target.candidate.model or target.id,
-        usage=usage,
-        raw=None,
-        tool_calls=[tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None,
-        reasoning_content="".join(reasoning_parts) or None,
-    )
+        return AsyncOpenAICallResult(
+            content=content,
+            model_id=target.candidate.model or target.id,
+            usage=usage,
+            raw=None,
+            tool_calls=[tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None,
+            reasoning_content="".join(reasoning_parts) or None,
+        )
 
 
 def _looks_like_params_rejected(exc: BaseException) -> bool:

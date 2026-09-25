@@ -194,6 +194,9 @@ class AgentCombinedRewriteIntentService(AgentMultiQuestionRewriteService):
                 )
                 if isinstance(skill_name, str) and skill_name.strip()
             ],
+            prior_user_questions=self._prior_user_questions(
+                agent_chat_context.conversation_history
+            ),
         )
         if final_result is None:
             return None
@@ -205,6 +208,7 @@ class AgentCombinedRewriteIntentService(AgentMultiQuestionRewriteService):
                 primary_question=final_result.rewritten_question,
                 sub_questions=list(final_result.sub_questions or []),
                 id_to_node=id_to_node,
+                source_indexes=final_result.sub_question_source_indexes,
             )
         )
         final_result.precomputed_intent_scores = precomputed_scores or None
@@ -315,6 +319,7 @@ class AgentCombinedRewriteIntentService(AgentMultiQuestionRewriteService):
         primary_question: str,
         sub_questions: List[str],
         id_to_node: Dict[str, Any],
+        source_indexes: Optional[List[int]] = None,
     ) -> Dict[str, List[NodeScore]]:
         """解析组合输出的 intent_classifications → 预计算打分映射。
 
@@ -369,7 +374,13 @@ class AgentCombinedRewriteIntentService(AgentMultiQuestionRewriteService):
 
         index_to_text: Dict[int, str] = {0: primary_question}
         for offset, sub_text in enumerate(sub_questions):
-            index_to_text[offset + 1] = sub_text
+            # 历史污染剔除后，子问题序号要回到模型原始 question_index 对位
+            model_index = (
+                source_indexes[offset]
+                if source_indexes and offset < len(source_indexes)
+                else offset + 1
+            )
+            index_to_text[model_index] = sub_text
 
         collected: Dict[str, Dict[str, NodeScore]] = {}
         for batch in combined_struct.intent_classifications or []:

@@ -18,13 +18,18 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    # 必须用 redis-stack-server（内置 RediSearch/RedisJSON 模块）：
+    # LangGraph 的 AsyncRedisSaver.asetup() 依赖 FT.INFO/FT.CREATE，
+    # 纯 redis:7-alpine 无此命令会导致 checkpointer 初始化失败、降级内存模式。
+    image: redis/redis-stack-server:7.4.0-v2
     container_name: Enterprise-aiagent-redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    # 镜像 Cmd=/entrypoint.sh（负责 loadmodule），额外参数走 REDIS_ARGS 环境变量
+    environment:
+      REDIS_ARGS: "--appendonly yes"
     restart: unless-stopped
 
   etcd:
@@ -96,7 +101,11 @@ services:
 
 volumes:
   postgres_data:
+  # 历史容器（旧 compose 项目 project-python）一直在用该卷，标记 external
+  # 以保留 db0 短期记忆数据；勿让 compose 另建新空卷。
   redis_data:
+    external: true
+    name: project-python_redis_data
   etcd_data:
   minio_data:
   milvus_data:

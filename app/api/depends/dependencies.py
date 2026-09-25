@@ -459,8 +459,9 @@ def get_agent_config(request: Request) -> Dict[str, Any]:
 async def get_agent_graph_runner(request: Request) -> Any:
     """FastAPI 依赖：获取进程级 GraphRunner 单例（懒初始化，带并发锁）。
 
-    - checkpointer 优先 Redis（复用 settings.redis_url，独立连接避免与业务
-      Redis 的 decode_responses=True 冲突），失败自动降级 InMemorySaver；
+    - checkpointer 优先 Redis（专用 ``settings.checkpoint_redis_url``，db1，
+      与短期记忆/缓存的 db0 隔离；独立连接避免与业务 Redis 的
+      decode_responses=True 冲突），失败自动降级 InMemorySaver；
     - 图只编译一次；审批/断点续跑依赖该单例持有的同一个 saver。
     """
     existing_runner: Optional[Any] = getattr(request.app.state, "agent_graph_runner", None)
@@ -485,7 +486,7 @@ async def get_agent_graph_runner(request: Request) -> Any:
         settings = get_settings()
         saver, actual_backend = await build_checkpointer(
             backend=settings.agent_checkpoint_backend,
-            redis_url=settings.redis_url,
+            redis_url=settings.checkpoint_redis_url,
             ttl_seconds=settings.agent_checkpoint_ttl_seconds,
             checkpoint_prefix=settings.agent_checkpoint_prefix,
         )

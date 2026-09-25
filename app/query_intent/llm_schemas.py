@@ -810,7 +810,18 @@ class SubTaskOutcomeSchema(BaseModel):
         default=None,
         description="就地纠偏：从提示词「可选的替代方向」里**原样照抄**一个标识"
                     "（形如 asset:xxx 或 tool:xxx）。没有该列表、或不需要换方向时为 null。"
-                    "⚠️ 严禁自行编造标识、工具名、参数或路径——只能从给定列表里选。",
+                    "⚠️ 严禁自行编造标识、工具名、参数或路径——只能从给定列表里选。"
+                    "注意：本字段只用于换数据源/换工具方向；想查看本步被省略工具结果的全文，"
+                    "请改用 requested_evidence_uids。",
+    )
+    requested_evidence_uids: Optional[List[str]] = Field(
+        default=None,
+        max_length=3,
+        description="本步某条被省略的工具结果需要看全文时，填其证据编号"
+                    "（如 [\"e7\"]，最多 3 条）；不需要时为 null。"
+                    "系统会插入一个不调用外部工具的内部恢复步回填原文。"
+                    "只能填写本步「已省略」清单里出现过的编号，严禁编造。"
+                    "与 selected_alternative_id 互不影响，可同时填写。",
     )
     reason: str = Field(
         default="", description="选择 finish 或 skip_task_ids 的简短理由（用于留痕审计）。"

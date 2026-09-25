@@ -232,7 +232,11 @@ async def resolve_tool_args_via_function_call(
         f"当前子任务：{title}\n"
         f"子任务详细要求：{description}\n"
         f"规划器备注（仅供参考，可能为空）：{tool_args_hint or '（无）'}\n"
-        f"可参考的前序子任务上下文：\n{(prior_context_str or '')[:3000]}"
+        f"可参考的前序子任务上下文：\n{(prior_context_str or '')[:3000]}\n"
+        "硬性要求：正文/内容类参数（如 content、text、body、summary 等承载业务"
+        "数据的字段）必须基于上文中【前序子任务的真实结论/数据】组织成完整内容；"
+        "前序上下文非空时，严禁只写标题或“××数据/××结果”之类的占位短语"
+        "（规划器看不到执行结果，其备注里的这类文字不是数据本身）。"
     )
     messages: Sequence[Dict[str, str]] = [
         {"role": "system", "content": arg_fill_system_prompt},

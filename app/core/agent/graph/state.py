@@ -94,6 +94,14 @@ class AgentGraphState(TypedDict, total=False):
     react_step: int                      # 已完成的 react 单轮数（自环保护）
     react_empty_turns: int               # FC 链路连续空转（无 tool_call 无答案）轮数
 
+    # ── 证据板（请求级；见 app/core/agent/evidence/）────────────────────
+    evidence_units: List[Dict[str, Any]]
+    # 归一化后的证据单元（块原文 ≤600 字；完整观测仍在 react_messages/
+    # subtask_results 中，ref 坐标指向它们，不另建存储）。
+    # 每轮证据板要从全量单元重选/重打分/去重，故由节点**整体替换**返回全量。
+    evidence_meta: Dict[str, Any]
+    # 整体替换：{next_seq: 下一个单元序号, queries: 累计查询词, rounds: [每轮计数]}
+
     # ── 共用执行控制 ───────────────────────────────────────────────────
     steps: Annotated[List[Dict[str, Any]], operator.add]  # trace 记录（等价旧 steps 列表）
     retry_counts: Dict[str, int]         # key: subtask_id 或 "react:{step}" -> 节点级重试次数
@@ -162,6 +170,8 @@ def make_initial_state(
         "react_protocol": "",
         "react_step": 0,
         "react_empty_turns": 0,
+        "evidence_units": [],
+        "evidence_meta": {"next_seq": 1, "rounds": []},
         "steps": [],
         "retry_counts": {},
         "replan_attempts": 0,

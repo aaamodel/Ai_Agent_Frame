@@ -21,6 +21,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 BACKEND_REDIS = "redis"
 BACKEND_MEMORY = "memory"
 
+# 与 langgraph.checkpoint.redis.util 的空 id 哨兵保持一致（函数内 import 可选包，
+# 这里直接内联常量，避免对 redis 扩展包产生硬导入依赖）。
+_EMPTY_ID_SENTINEL = "00000000-0000-0000-0000-000000000000"
+
 
 def configurable_for(run_id: str) -> Dict[str, Any]:
     """构造 RunnableConfig["configurable"] 的基础部分（thread_id = run_id）。"""
@@ -164,12 +168,51 @@ def snapshot_exists(snapshot: Any) -> bool:
 # ---------------------------------------------------------------------------
 # 线程枚举（待审批列表）
 # ---------------------------------------------------------------------------
+async def _alist_thread_ids_via_scan(
+    redis_client: Any, prefix: str, max_threads: int
+) -> List[str]:
+    """用 SCAN 从 checkpoint 主键解析全部 thread_id。
+
+    RedisSaver 主键格式（见 langgraph-checkpoint-redis base.py）::
+
+        {prefix}:{thread_id}:{checkpoint_ns}:{checkpoint_id}
+
+    本项目 thread_id=run_id 本身含 ``:``（``session_id:uuidhex``），因此用
+    ``rsplit(":", 2)`` 只剥掉末尾的 checkpoint_id / checkpoint_ns 两段，
+    中间整段归 thread_id。``{prefix}_write:`` / ``{prefix}_latest:`` 等派生
+    键的首段分隔符是下划线，不会匹配 ``"{prefix}:"`` 前缀，天然排除。
+    """
+    marker = f"{prefix}:"
+    thread_ids: List[str] = []
+    seen: set = set()
+    async for raw_key in redis_client.scan_iter(match=f"{marker}*", count=500):
+        key = raw_key if isinstance(raw_key, str) else bytes(raw_key).decode(
+            "utf-8", "ignore"
+        )
+        if not key.startswith(marker):
+            continue
+        parts = key.rsplit(":", 2)
+        if len(parts) < 3:
+            continue
+        thread_encoded = parts[0][len(marker):]
+        if not thread_encoded or thread_encoded in seen:
+            continue
+        seen.add(thread_encoded)
+        thread_ids.append(
+            "" if thread_encoded == _EMPTY_ID_SENTINEL else thread_encoded
+        )
+        if len(thread_ids) >= max_threads:
+            break
+    return thread_ids
+
+
 async def alist_thread_ids(checkpointer: Any, *, max_threads: int = 500) -> List[str]:
     """枚举 checkpointer 中全部 run（thread）id，最新检查点所属线程在前、去重。
 
     - InMemorySaver：直接读其 ``storage``（thread_id -> {checkpoint_id: tuple}）；
-    - 其它后端（AsyncRedisSaver 等）：走标准 ``alist(None)``，按返回顺序去重
-      （标准实现按 checkpoint 时间倒序产出，因此每线程第一次出现即为最新）。
+    - AsyncRedisSaver：SCAN checkpoint 主键解析 thread_id（库自带 ``alist`` 与
+      当前 redis-py 不兼容，见 ``_alist_thread_ids_via_scan``）；
+    - 其它未知后端：退回标准 ``alist(None)``。
 
     后端不支持全量列举时返回空列表并告警——调用方据此诚实返回，不抛 500。
     """
@@ -177,6 +220,22 @@ async def alist_thread_ids(checkpointer: Any, *, max_threads: int = 500) -> List
     storage = getattr(checkpointer, "storage", None)
     if isinstance(storage, dict):
         return list(storage.keys())[:max_threads]
+
+    # AsyncRedisSaver：不走它的 alist()——langgraph-checkpoint-redis 0.5.2 与
+    # 当前 redis-py 存在兼容问题：FT.SEARCH 返回的 Document 不物化 return_fields，
+    # 库内 `doc["thread_id"]` 直接 AttributeError（2026-09-23 实测，待审批列表
+    # 因此恒空）。thread_id 本就编码在 checkpoint 主键里，SCAN 解析即可。
+    redis_client = getattr(checkpointer, "_redis", None)
+    checkpoint_prefix = getattr(checkpointer, "_checkpoint_prefix", None)
+    if redis_client is not None and checkpoint_prefix:
+        try:
+            return await _alist_thread_ids_via_scan(
+                redis_client, str(checkpoint_prefix), max_threads
+            )
+        except Exception as scan_error:  # noqa: BLE001 — 扫描失败再降级通用 alist
+            logger.warning(
+                "SCAN 枚举 checkpointer 线程失败，回退通用 alist: {}", scan_error
+            )
 
     thread_ids: List[str] = []
     seen: set = set()

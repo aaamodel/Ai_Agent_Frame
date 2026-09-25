@@ -20,6 +20,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from app.core.agent.graph.nodes.plan_node import _build_planner_skills_block  # noqa: E402
+from app.core.agent.planner import PLAN_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT  # noqa: E402
 
 QUESTION = "我们优先做哪些行业？哪些行业算次优先？"
 
@@ -148,3 +149,27 @@ def test_header_is_immediately_followed_by_the_list():
 
 def test_no_header_when_no_skills():
     assert "## 可用技能" not in _build_planner_skills_block(_state(), 0.5)
+
+
+# ---------------------------------------------------------------------------
+# 3. 规划器系统提示词必须内嵌 JSON 输出契约
+#    （GLM-4.7 实测会静默忽略 response_format=json_schema：服务端返回 200
+#      但自由发挥键名 plan/sub_tasks，解析器 subtasks=[] → 两次 parse 失败
+#      → fallback 单任务。提示词必须自带结构契约作为第二道约束。）
+# ---------------------------------------------------------------------------
+_CONTRACT_FIELDS = ("subtasks", "action_type", "tool_name", "tool_args_hint", "covers_sub_questions")
+
+
+@pytest.mark.parametrize("prompt", [PLAN_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT])
+def test_planner_prompt_declares_subtasks_contract(prompt):
+    assert '"subtasks"' in prompt
+    for field in _CONTRACT_FIELDS:
+        assert f'"{field}"' in prompt, f"契约缺少字段 {field}"
+
+
+@pytest.mark.parametrize("prompt", [PLAN_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT])
+def test_planner_prompt_forbids_alias_top_level_keys(prompt):
+    """必须明确禁止模型实测自造的 plan / tasks / sub_tasks 顶层键。"""
+    assert "sub_tasks" in prompt
+    assert "plan" in prompt
+    assert "tasks" in prompt

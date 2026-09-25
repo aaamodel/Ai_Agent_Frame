@@ -27,6 +27,7 @@ __all__ = [
     "has_sink",
     "use_sink",
     "emit",
+    "structural_visible",
 ]
 
 
@@ -41,6 +42,18 @@ _current_sink: ContextVar[Optional[StreamSink]] = ContextVar(
     "agent_stream_sink", default=None
 )
 
+# 结构化调用（带 response_format 的 JSON 调用）在当前通道上是否可见。
+# 默认 True：改写阶段要从流式 JSON 里增量抽取 rewrite 字段，依赖结构化流。
+# 答案阶段（chat.py 包裹整张图运行时）置 False：planner 计划 / distill 控制协议 /
+# summarize 判定都是内部 JSON，不是给用户看的答案——它们流进 answer 通道会：
+#   1. 把原始 JSON 当正文显示（前端排版事故，2026-09-23）；
+#   2. 每次内部调用都发 attempt_start，把上一段【成功的】内部输出划成
+#      "上段因模型切换已废弃"（GLM 已是最末候选，根本没发生降级）。
+# 真正给用户的答案由图结束后的 _stream_final_answer 统一逐字推送。
+_show_structural: ContextVar[bool] = ContextVar(
+    "agent_stream_show_structural", default=True
+)
+
 
 def current_sink() -> Optional[StreamSink]:
     """取当前上下文里的通道；没有则 None。"""
@@ -52,17 +65,29 @@ def has_sink() -> bool:
     return _current_sink.get() is not None
 
 
+def structural_visible() -> bool:
+    """当前通道是否放行结构化（response_format）调用的流式输出。"""
+    return _show_structural.get()
+
+
 @contextmanager
-def use_sink(sink: Optional[StreamSink]) -> Iterator[None]:
+def use_sink(
+    sink: Optional[StreamSink], *, show_structural: bool = True
+) -> Iterator[None]:
     """在 with 块内装上下线通道；退出时恢复外层（支持嵌套）。
 
     传 None 等价于"本块内明确没有观测者"，用于临时屏蔽外层通道。
+
+    ``show_structural=False`` 时，带 response_format 的结构化调用改走非流式，
+    其 JSON 不进入通道（也不发 attempt_start）；自由文本 / FC 调用不受影响。
     """
-    token = _current_sink.set(sink)
+    sink_token = _current_sink.set(sink)
+    policy_token = _show_structural.set(show_structural)
     try:
         yield
     finally:
-        _current_sink.reset(token)
+        _show_structural.reset(policy_token)
+        _current_sink.reset(sink_token)
 
 
 def emit(event: Dict[str, Any]) -> bool:

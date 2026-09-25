@@ -174,6 +174,10 @@ class AgentRewriteResult:
     # 【新增 · 技能感知】改写阶段 LLM 依据注入的技能清单（名称+描述）挑选出的
     # 与当前问题最相关的技能名。编排层据此号令可用工具（与 Pipeline 注入并集）。
     suggested_skills: List[str] = field(default_factory=list)
+    #: 历史污染兜底后，存活子问题在模型原始 sub_questions 中的 1 基序号
+    #: （组合链路的 intent_classifications.question_index 需按此对位）；
+    #: 未发生剔除时为 None。
+    sub_question_source_indexes: Optional[List[int]] = None
 
 
 @dataclass

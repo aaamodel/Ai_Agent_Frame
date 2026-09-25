@@ -374,6 +374,45 @@ def test_correction_ignored_when_quota_exhausted():
     assert _apply(state, "tool:web_search", candidates) == {}
 
 
+def test_no_chained_correction_on_correction_task():
+    """纠偏任务（id 以 correction_ 开头）不再触发二层纠偏。
+
+    复现 2026-09 事故：correction_task_4（file_grep）未解决后又插入
+    correction_correction_task_4（file_read），空 hint 靠 FC 自由组参，
+    模型编出不存在的"线索管理规范.md"。即使模型给了合法候选标识也必须忽略。
+    """
+    state = _state(subtask_results=[_rec()])
+    candidates = build_candidates(state).candidates
+
+    update = _apply_step_correction(
+        state=state,
+        plan=[
+            {"id": "task_4", "title": "原任务", "action_type": "reasoning"},
+            {"id": "correction_task_4", "title": "调用 file_grep_tool",
+             "action_type": "tool", "tool_name": "file_grep_tool"},
+        ],
+        cursor=1,
+        skipped_ids=[],
+        candidates=candidates,
+        selected="tool:web_search",
+        deps=_DEPS,
+        trace_id="trace",
+        subtask_id="correction_task_4",
+        trigger="上一步未解决",
+    )
+    assert update == {}, "纠偏任务的二次纠偏指令必须被整体忽略"
+    # 跳过不写 step_corrections、不消耗配额
+    assert state["step_corrections"] == []
+    assert remaining_quota(state) >= 2
+
+
+def test_normal_task_id_with_same_prefix_text_is_not_blocked():
+    """普通任务只要不正好命中 correction_ 前缀就不受闸门影响。"""
+    state = _state(subtask_results=[_rec()])
+    update = _apply(state, "tool:web_search", build_candidates(state).candidates)
+    assert update and update["plan"][1]["id"] == "correction_t1"
+
+
 def test_correction_ignored_when_id_invalid():
     state = _state(subtask_results=[_rec()])
     assert _apply(state, "tool:完全不存在的工具", build_candidates(state).candidates) == {}

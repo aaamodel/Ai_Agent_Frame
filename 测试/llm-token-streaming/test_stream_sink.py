@@ -7,6 +7,7 @@ from app.core.agent.stream_sink import (
     current_sink,
     emit,
     has_sink,
+    structural_visible,
     use_sink,
 )
 
@@ -81,3 +82,33 @@ def test_plain_thread_does_not_inherit_context():
 
     assert seen == [False]
     assert sink.events == []
+
+
+# ---------------------------------------------------------------------------
+# show_structural 策略：答案阶段屏蔽内部结构化 JSON，改写阶段保持放行
+# ---------------------------------------------------------------------------
+def test_structural_visible_defaults_to_true():
+    assert structural_visible() is True
+    sink = RecordingSink()
+    with use_sink(sink):  # 不传 = 历史行为（改写阶段依赖结构化流）
+        assert structural_visible() is True
+
+
+def test_show_structural_false_scopes_and_restores():
+    sink = RecordingSink()
+    with use_sink(sink, show_structural=False):
+        assert has_sink() is True
+        assert structural_visible() is False
+    # 退出后恢复默认
+    assert structural_visible() is True
+    assert has_sink() is False
+
+
+def test_nested_structural_policy_restores_outer():
+    outer = RecordingSink()
+    with use_sink(outer, show_structural=False):
+        with use_sink(RecordingSink()):  # 内层默认 True（如改写阶段嵌套）
+            assert structural_visible() is True
+        # 内层退出后恢复外层的 False，而不是全局默认 True
+        assert structural_visible() is False
+    assert structural_visible() is True

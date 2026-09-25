@@ -132,7 +132,6 @@ class AgentOrchestrator:
     # ------------------------------------------------------------------
     # 门面主入口（签名与旧版完全一致）
     # ------------------------------------------------------------------
-    @langfuse_observe(name="AgentOrchestrator.run", as_type="agent", capture_input=False, capture_output=False)
     async def run(
             self,
             user_input: str,
@@ -146,10 +145,10 @@ class AgentOrchestrator:
         - mode/intent.preferred_mode 仅决定是否经过 plan 节点；
         - 记忆/技能/工具预算/审批闸门等全部在图节点内完成；
         - 危险工具审批开启且命中时，返回 ``awaiting_approval=True`` 的挂起响应，
-          调用方需凭 ``run_id`` 走审批恢复端点续跑。
+         调用方需凭 ``run_id`` 走审批恢复端点续跑。
 
-        ⚠️ 与改造前**完全等价**：真正的执行循环在 :meth:`run_stream` 里，
-        这里只把它抽干并返回终局。需要"过程可见"的调用方改用 :meth:`run_stream`。
+        ⚠️ Langfuse 根 trace 挂在 :meth:`run_stream`（SSE 与本入口的共同底层）：
+        本方法只是其消费者，不再重复装饰，避免双层 agent span。
         """
         async for event in self.run_stream(
             user_input=user_input,
@@ -162,6 +161,7 @@ class AgentOrchestrator:
                 return event["response"]
         raise RuntimeError("run_stream 未产出终局响应（不应发生）")
 
+    @langfuse_observe(name="AgentOrchestrator.run", as_type="agent", capture_input=False, capture_output=False)
     async def run_stream(
             self,
             user_input: str,

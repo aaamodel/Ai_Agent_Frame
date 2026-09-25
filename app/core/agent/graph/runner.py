@@ -30,7 +30,13 @@ from app.core.agent.graph.checkpoint import (
     snapshot_values,
 )
 from app.core.agent.graph.deps import GraphDeps, with_deps
+from app.core.agent.graph.approval import RESUME_APPROVALS_CONFIG_KEY
 from app.core.agent.graph.state import dict_to_intent, make_initial_state
+
+# Langfuse 可观测性：审批恢复路由（agent_runs.py）直接调用 GraphRunner.resume，
+# 不经过 orchestrator 的 @observe 根；这里为恢复续跑补一条独立根 trace，
+# 使续跑期间的 llm.* generation / tool span 仍然聚合（未配置密钥时为 no-op）。
+from langfuse import observe as langfuse_observe
 
 if TYPE_CHECKING:  # 避免与 orchestrator → runner 的顶层循环导入
     from app.core.agent.orchestrator import AgentResponse, IntentContext
@@ -276,6 +282,7 @@ class GraphRunner:
         deps.tracer.end_span(execution_span, error=None)
         yield {"type": "outcome", "outcome": outcome}
 
+    @langfuse_observe(name="AgentOrchestrator.resume", as_type="agent", capture_input=False, capture_output=False)
     async def resume(
         self,
         *,
@@ -312,6 +319,12 @@ class GraphRunner:
         snapshot: Any = await aget_snapshot(self._graph, run_id)
         if not snapshot_exists(snapshot):
             raise KeyError(f"未找到 run_id={run_id} 的检查点（可能已过期或后端已重启为内存模式）")
+        # 把待处理审批载荷（含**完整**入参，非 2000 字截断预览）注入 config：
+        # 节点重放时 plan 路径据此短路参数重解析，杜绝 FC 重跑漂移导致
+        # "审批卡片字段 ≠ 实际执行字段"（2026-09-23 实测事故）。
+        config.setdefault("configurable", {})[RESUME_APPROVALS_CONFIG_KEY] = (
+            snapshot_interrupts(snapshot)
+        )
         values: Dict[str, Any] = snapshot_values(snapshot)
         trace_id: str = values.get("trace_id", "")
         intent_context: IntentContext = dict_to_intent(values.get("intent") or {})

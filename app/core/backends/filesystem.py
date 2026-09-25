@@ -134,6 +134,21 @@ class FilesystemBackend:
         self.virtual_mode = virtual_mode
         self.max_file_size_bytes = max_file_size_mb * 1024 * 1024
 
+    #: trace_to_markdown 调试落盘文件的首行标记。这类文件是 Agent 运行时
+    #: 自身产生的"观测回声"，grep 命中它们会把任务标题/历史结论当成业务证据
+    #: （2026-09 实测：file_grep '线索更新' 命中的全是 trace md，真实文档零命中）。
+    _TRACE_FILE_MARKER: str = "# 🔍 函数变量追踪报告"
+
+    def _is_trace_artifact(self, path: Path) -> bool:
+        """识别 trace_to_markdown 落盘的调试文件（按首行标记，仅限 .md）。"""
+        if path.suffix.lower() != ".md":
+            return False
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                return self._TRACE_FILE_MARKER in handle.readline()
+        except OSError:
+            return False
+
     def _resolve_path(self, key: str) -> Path:
         """路径边界安全审查与安全沙箱防护"""
         if self.virtual_mode:
@@ -395,6 +410,7 @@ class FilesystemBackend:
 
         results: Dict[str, List[Tuple[int, str]]] = {}
         base_resolved = base_full.resolve()
+        trace_verdict: Dict[str, bool] = {}
 
         for line in proc.stdout.splitlines():
             try:
@@ -416,6 +432,13 @@ class FilesystemBackend:
             try:
                 p.resolve().relative_to(base_resolved)
             except (ValueError, OSError):
+                continue
+
+            # 排除运行期 trace_to_markdown 落盘的调试文件（观测回声）
+            cache_key = str(p)
+            if cache_key not in trace_verdict:
+                trace_verdict[cache_key] = self._is_trace_artifact(p)
+            if trace_verdict[cache_key]:
                 continue
 
             if self.virtual_mode:
@@ -457,6 +480,9 @@ class FilesystemBackend:
                         continue
                     # 匹配用户传入的文件过滤规则
                     if include_glob and not fp.match(include_glob):
+                        continue
+                    # 排除运行期 trace_to_markdown 落盘的调试文件（观测回声）
+                    if self._is_trace_artifact(fp):
                         continue
                 except OSError:
                     continue

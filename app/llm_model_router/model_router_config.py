@@ -28,9 +28,11 @@ logger = logging.getLogger(__name__)
 #   （json_schema 仅其 Responses API 支持），自动降级 json_object；
 #   如改用支持 json_schema 的第三方 DeepSeek 兼容网关，可在该模型条目显式配
 #   "supports_json_schema": true 覆盖家族默认。
-# - 智谱 GLM-4.7 及更高版本（open.bigmodel.cn / Z.AI api.z.ai）原生支持
-#   strict json_schema（全字段必须进 required）；GLM-4.6 及更老版本不支持，
-#   需在条目显式配 "supports_json_schema": false。
+# - 智谱 GLM-4.7（open.bigmodel.cn）2026-09-23 实测：json_schema（strict 有/无、
+#   strict=false 三种写法）均被【静默忽略】——HTTP 200 但不按 schema 出键名，
+#   只有 json_object 被真正执行。故 .env 中 glm-4.7 条目显式配
+#   "supports_json_schema": false；家族默认保留 True 以兼容后续确实支持的
+#   GLM 新模型/其它端点，换模型时请以实测为准。
 # - 智谱 GLM-5.3/5.3-flash 强制思考，传 thinking.type=disabled 会报错
 #   → 用 thinking_can_disable=False 标注。
 STYLE_OPENAI = "openai"
@@ -51,7 +53,7 @@ _STYLE_JSON_DEFAULTS: Dict[str, Dict[str, bool]] = {
     STYLE_OPENAI: {"json_schema": True, "json_object": True},
     STYLE_DASHSCOPE: {"json_schema": True, "json_object": True},
     STYLE_DEEPSEEK: {"json_schema": False, "json_object": True},
-    STYLE_ZHIPU: {"json_schema": True, "json_object": True},  # GLM-4.7+ 原生 strict 支持
+    STYLE_ZHIPU: {"json_schema": True, "json_object": True},  # 家族默认 True；GLM-4.7 实测不执行，用条目级 false 覆盖
 }
 
 

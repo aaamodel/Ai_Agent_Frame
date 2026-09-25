@@ -38,6 +38,10 @@ from app.core.agent.graph.builder import (
 )
 from app.core.agent.graph.deps import GraphDeps
 from app.core.agent.graph.runner import GraphRunner
+from app.core.agent.graph.checkpoint import aget_snapshot
+from app.core.agent.graph.nodes._common import agent_goal_from_state
+from app.core.agent.evidence import ingest_observation
+from app.core.agent.evidence.view import plan_view_uids
 from app.core.agent.orchestrator import IntentContext
 from app.core.agent.react_agent import _parse_react_step
 from app.core.agent.toolcall import (
@@ -146,9 +150,18 @@ class FakeModelRouter:
         plan_tools: Optional[List[str]] = None,
         summary_verdicts: Optional[List[dict]] = None,
         subtask_outcomes: Optional[List[dict]] = None,
+        plan_fc_args: Optional[Dict[str, dict]] = None,
+        plan_fc_arg_sequences: Optional[Dict[str, List[dict]]] = None,
     ) -> None:
         """``subtask_outcomes``：脚本化「子任务提炼」的控制协议返回，
-        用于验证跳过 / 提前收尾是否真的让后续子任务不再执行。"""
+        用于验证跳过 / 提前收尾是否真的让后续子任务不再执行。
+
+        ``plan_fc_args``：按工具名脚本化 planner FC 强制取参的返回
+        （默认 {"q": "x"}），用于验证下游写工具用前序结论重组参数。
+
+        ``plan_fc_arg_sequences``：按工具名给出 FC 返回序列，每次调用
+        消费一个（耗尽后停在最后一个）。用于模拟真实 LLM 在 interrupt
+        重放时的非确定性漂移——修复后重放根本不应再调 FC。"""
         self._react_tool = react_tool
         self._react_args = react_args or {"q": "北京天气"}
         self._plan_tools = list(plan_tools if plan_tools is not None else ["echo_tool"])
@@ -158,6 +171,13 @@ class FakeModelRouter:
         self.summary_call_count = 0  # 对外只读：实际发生的 summarize 调用次数
         self._subtask_calls = 0
         self._subtask_outcomes = list(subtask_outcomes or [])
+        self._plan_fc_args = dict(plan_fc_args or {})
+        self._plan_fc_sequences = {
+            name: list(seq) for name, seq in (plan_fc_arg_sequences or {}).items()
+        }
+        self._plan_fc_taken: Dict[str, int] = {}
+        # 对外只读：planner 用途的 FC 取参被调了几次、分别给哪个工具
+        self.fc_plan_calls: List[str] = []
 
     async def chat(self, messages: Any, *, purpose_hint: str = "", **kwargs: Any) -> Any:
         system_text = messages[0].get("content", "") if messages else ""
@@ -221,11 +241,19 @@ class FakeModelRouter:
             candidates = self._plan_tools + [self._react_tool]
             chosen = next((n for n in candidates if n and n in blob),
                           self._plan_tools[0] if self._plan_tools else self._react_tool)
+            self.fc_plan_calls.append(chosen)
+            sequence = self._plan_fc_sequences.get(chosen)
+            if sequence:
+                idx = min(self._plan_fc_taken.get(chosen, 0), len(sequence) - 1)
+                self._plan_fc_taken[chosen] = idx + 1
+                fc_arguments = sequence[idx]
+            else:
+                fc_arguments = self._plan_fc_args.get(chosen, {"q": "x"})
             return SimpleNamespace(
                 content="", reasoning_content="",
                 tool_calls=[{"id": "fc-plan-1", "function": {
                     "name": chosen,
-                    "arguments": json.dumps({"q": "x"}, ensure_ascii=False),
+                    "arguments": json.dumps(fc_arguments, ensure_ascii=False),
                 }}],
             )
 
@@ -628,6 +656,160 @@ async def test_danger_tool_pause_and_deny() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 3c-2. plan_execute 路径：危险工具 interrupt 同样必须真正暂停图
+#   历史事故（2026-09-23，langgraph 1.2.11）：GraphInterrupt 继承 Exception，
+#   _execute_plan_step 的宽 except Exception 把审批中断当成步级错误吞掉，
+#   图没暂停、继续跑完并友好降级，前端永远收不到 awaiting_approval。
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_plan_danger_tool_pause_and_approve() -> None:
+    cfg = _base_config(agent_approval_enabled=True, agent_danger_tools="danger_tool")
+    runner, deps, registry, _ = _build_runner(
+        {"danger_tool": FakeTool("danger_tool", "危险报告已导出，结果OK")},
+        cfg, model_router=FakeModelRouter(plan_tools=["danger_tool"]),
+    )
+    outcome = await runner.run(
+        deps=deps, user_input="查数并导出危险报告", session_id="s-plan-approve",
+        mode="plan_execute", intent=IntentContext(),
+    )
+
+    # 首次运行：必须真正挂起等审批，工具一次都没执行
+    assert outcome.paused is True
+    assert outcome.response.awaiting_approval is True
+    assert len(outcome.approval_payloads) == 1
+    payload = outcome.approval_payloads[0]
+    assert payload["tool_name"] == "danger_tool"
+    assert payload["subtask_id"] == "t1"
+    assert registry.invocations == []
+
+    resume_deps = GraphDeps(
+        config=cfg, model_router=deps.model_router, memory=FakeMemory(),
+        tools=registry, skill_manager=FakeSkillManager(), tracer=FakeTracer(),
+    )
+    resumed = await runner.resume(run_id=outcome.run_id, deps=resume_deps, approved=True)
+    assert resumed.paused is False
+    assert resumed.response.success is True
+    # 批准后节点重放、闸门放行：工具恰好执行 1 次（不能因重放重复执行）
+    assert len(registry.invocations) == 1
+
+
+@pytest.mark.asyncio
+async def test_plan_danger_tool_pause_and_deny() -> None:
+    cfg = _base_config(agent_approval_enabled=True, agent_danger_tools="danger_tool")
+    runner, deps, registry, _ = _build_runner(
+        {"danger_tool": FakeTool("danger_tool", "不应出现的结果")},
+        cfg, model_router=FakeModelRouter(plan_tools=["danger_tool"]),
+    )
+    outcome = await runner.run(
+        deps=deps, user_input="查数并导出危险报告", session_id="s-plan-deny",
+        mode="plan_execute", intent=IntentContext(),
+    )
+    assert outcome.paused is True
+
+    resume_deps = GraphDeps(
+        config=cfg, model_router=deps.model_router, memory=FakeMemory(),
+        tools=registry, skill_manager=FakeSkillManager(), tracer=FakeTracer(),
+    )
+    resumed = await runner.resume(
+        run_id=outcome.run_id, deps=resume_deps, approved=False, comment="禁止",
+    )
+    assert resumed.paused is False
+    # 拒绝：工具零执行、不触发再次暂停、不崩溃；plan 路径会诚实告知导出未完成
+    # （react 路径则由模型把拒绝观测推理成 Final Answer，两者收尾形态不同）
+    assert registry.invocations == []
+    assert resumed.response.awaiting_approval is False
+    assert resumed.response.degraded is True
+
+
+# ---------------------------------------------------------------------------
+# 3c-3. plan_execute 下游写工具：必须用 FC 结合前序真实结论重组参数
+#   历史事故（2026-09-23）：planner 看不到运行结果，给导出工具的正文只写了
+#   "××排名数据"标题性占位；hint 必填齐全 → 零 LLM 直达工具 → 空报表。
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_plan_downstream_danger_tool_composes_args_from_prior_results() -> None:
+    cfg = _base_config(agent_approval_enabled=True, agent_danger_tools="danger_tool")
+    router = FakeModelRouter(
+        plan_tools=["echo_tool", "danger_tool"],
+        plan_fc_args={"danger_tool": {"q": "基于前序结论组织的真实正文：张伟4单"}},
+    )
+    runner, deps, registry, _ = _build_runner(
+        {"echo_tool": FakeTool("echo_tool", "排名：张伟4单、王强4单"),
+         "danger_tool": FakeTool("danger_tool", "报表已导出")},
+        cfg, model_router=router,
+    )
+    outcome = await runner.run(
+        deps=deps, user_input="查数并导出报告", session_id="s-compose",
+        mode="plan_execute", intent=IntentContext(),
+    )
+
+    # 首次运行在 danger_tool 审批闸门暂停
+    assert outcome.paused is True
+    # 第一个只读工具零 FC 直用 hint；下游写工具即便 hint 齐全也强制 FC 组参
+    assert router.fc_plan_calls == ["danger_tool"]
+    danger_calls_before = [i for i in registry.invocations if i["name"] == "danger_tool"]
+    assert danger_calls_before == []  # 未批准前不执行
+
+    resume_deps = GraphDeps(
+        config=cfg, model_router=router, memory=FakeMemory(),
+        tools=registry, skill_manager=FakeSkillManager(), tracer=FakeTracer(),
+    )
+    resumed = await runner.resume(run_id=outcome.run_id, deps=resume_deps, approved=True)
+    assert resumed.paused is False
+
+    danger_calls = [i for i in registry.invocations if i["name"] == "danger_tool"]
+    assert len(danger_calls) == 1  # 节点重放不重复执行
+    # 实际入参必须是 FC 基于前序结论生成的值，而不是 planner 的占位 hint
+    assert danger_calls[0]["arguments"]["q"] == "基于前序结论组织的真实正文：张伟4单"
+
+
+@pytest.mark.asyncio
+async def test_plan_danger_tool_approved_arguments_stable_across_replay() -> None:
+    """审批卡片上看到的字段必须与批准后实际执行的字段逐字一致。
+
+    历史事故（2026-09-23 实测）：interrupt 恢复时整个 execute 节点从头
+    重放，plan 路径再次调用非确定性 FC 参数填充 LLM——首次生成正文 A
+    （审批卡片显示 A），重放漂移成正文 B，工具最终带着 B 落盘。
+    修复后：重放必须复用审批载荷中的入参，且不再发生第二次 FC 调用。
+    """
+    cfg = _base_config(agent_approval_enabled=True, agent_danger_tools="danger_tool")
+    body_a = "结论：张伟4单（审批卡片上看到的正文）"
+    body_b = "结论：张伟4单（重放漂移出来的另一段正文，绝不能被执行）"
+    router = FakeModelRouter(
+        plan_tools=["echo_tool", "danger_tool"],
+        plan_fc_arg_sequences={"danger_tool": [{"q": body_a}, {"q": body_b}]},
+    )
+    runner, deps, registry, _ = _build_runner(
+        {"echo_tool": FakeTool("echo_tool", "排名：张伟4单"),
+         "danger_tool": FakeTool("danger_tool", "报表已导出")},
+        cfg, model_router=router,
+    )
+    outcome = await runner.run(
+        deps=deps, user_input="查数并导出报告", session_id="s-approve-replay",
+        mode="plan_execute", intent=IntentContext(),
+    )
+    assert outcome.paused is True
+    payload = outcome.approval_payloads[0]
+    assert payload["arguments"]["q"] == body_a
+    assert router.fc_plan_calls == ["danger_tool"]  # 暂停前仅 1 次 FC
+
+    resume_deps = GraphDeps(
+        config=cfg, model_router=router, memory=FakeMemory(),
+        tools=registry, skill_manager=FakeSkillManager(), tracer=FakeTracer(),
+    )
+    resumed = await runner.resume(run_id=outcome.run_id, deps=resume_deps, approved=True)
+    assert resumed.paused is False
+    assert resumed.response.success is True
+
+    # 重放不得再次调用 FC（非确定性漂移源被物理消除）
+    assert router.fc_plan_calls == ["danger_tool"]
+    danger_calls = [i for i in registry.invocations if i["name"] == "danger_tool"]
+    assert len(danger_calls) == 1
+    # 实际执行入参 = 审批时看到的正文 A，不能是漂移的 B
+    assert danger_calls[0]["arguments"]["q"] == body_a
+
+
+# ---------------------------------------------------------------------------
 # 3d. 控制协议：跳过子任务 / 提前收尾 —— 后续子任务必须**不再执行**
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
@@ -811,3 +993,187 @@ async def test_no_injection_when_step_is_healthy_so_plan_is_untouched() -> None:
 
     assert outcome.paused is False
     assert [inv["name"] for inv in registry.invocations] == ["t1_tool", "t2_tool"]
+
+
+# ---------------------------------------------------------------------------
+# 9. 证据板 T5（D10）：plan 延迟一步证据回取端到端
+# ---------------------------------------------------------------------------
+_RESTORE_BODIES = [
+    "退款审批须上传签收凭证与发票照片，财务在材料齐全后三个工作日内完成审核，"
+    "审核通过的款项原路退回付款账户，遇法定节假日顺延，跨月提交的单据并入下一结算周期统一处理。",
+    "退货商品入库验收由仓储岗负责，外包装破损或附件缺失的包裹需现场拍照登记，"
+    "验收不通过的退货单退回客服跟进，客户补充材料后重新发起流程，验收通过才释放退款额度。",
+    "运费险理赔在退款完成后自动触发，理赔金额按收货与退货两段实际运费计算，"
+    "三个工作日内发放至客户下单时使用的支付账户，客户可在订单详情页查看理赔进度与到账记录。",
+    "大额退款（单笔超过一千元）须财务主管二次复核，复核内容包括订单真实性与发票状态，"
+    "每月五日与二十日为大额退款集中打款日，紧急情形可申请单独走款但需分管总监邮件审批。",
+    "优惠券与积分抵扣部分按原渠道分别退回：平台券退回卡券包且有效期不延长，"
+    "积分退回会员账户并恢复成长值，第三方支付的差额部分按原路退回，组合支付订单逐笔算清。",
+    "跨境订单退款涉及汇率波动，按下单时锁定的结算汇率折算外币，"
+    "关税与清关服务费不在退款范围内，银行端国际汇款一般需要五到七个工作日，到账短信可能延迟。",
+    "质量问题导致的退货运费由商家承担，客户先行垫付后凭快递底单报销，"
+    "七天无理由退货的往返运费由客户自行承担，拒收包裹产生的退回运费同样从退款金额中扣减。",
+    "退款纠纷统一由售后专员建单跟进，协商记录全程留痕，"
+    "超过十五天未达成一致的工单升级至平台介入，平台依据聊天记录与物流凭证在七个工作日内作出裁决。",
+]
+
+
+def _restore_rag_obs() -> str:
+    body = "".join(
+        f"[{i + 1}] 来源文献: policy_{i + 1}.txt\n内容片段: {text}\n"
+        for i, text in enumerate(_RESTORE_BODIES)
+    )
+    return f"--- 知识库检索结果 (查询: 退款政策) ---\n{body}"
+
+
+class _RestoreModelRouter(FakeModelRouter):
+    """记录每次子任务提炼的入参消息，供断言恢复步确实再提炼了一次。"""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.subtask_distill_messages: List[Any] = []
+
+    async def chat(self, messages: Any, *, purpose_hint: str = "", **kwargs: Any) -> Any:
+        system_text = messages[0].get("content", "") if messages else ""
+        if "子任务执行专家" in system_text:
+            self.subtask_distill_messages.append(messages)
+        return await super().chat(messages, purpose_hint=purpose_hint, **kwargs)
+
+
+class _RecordingTracer(FakeTracer):
+    def __init__(self) -> None:
+        self.events: List[tuple] = []
+
+    def log_event(self, trace_id: str, event: str, payload: Any = None) -> None:
+        self.events.append((event, payload or {}))
+
+
+@pytest.mark.asyncio
+async def test_plan_evidence_restore_inserts_internal_step_and_redistills() -> None:
+    """t1 提炼时索取 2 个被省略证据编号 → 插入零外部调用的内部恢复步 →
+    回填原文 → 再走一次提炼；恢复步再次请求必须被忽略（每子任务一次）。"""
+    rag_name = "rag_knowledge_search"
+    inner_obs = _restore_rag_obs()
+    full_obs = f'{rag_name} <- {json.dumps({"q": "x"}, ensure_ascii=False)} => {inner_obs}'
+
+    # 与节点完全同参地预算本步单元，取出稳定的 omitted 编号
+    plan_query = " ".join(part for part in (
+        "取数1", f"调用 {rag_name} 取数",
+        agent_goal_from_state({"intent": IntentContext()}), "查退款政策",
+    ) if part)
+    pre_units, _, _ = ingest_observation(
+        existing_units=[], meta={"next_seq": 1, "rounds": []},
+        tool_name=rag_name, round_idx=0, observation=full_obs,
+        current_query=plan_query, user_question="查退款政策",
+        action_input={"q": "x"}, call_id="plan_0_t1",
+    )
+    _, omitted = plan_view_uids(pre_units, round_idx=0)
+    assert len(omitted) >= 2
+    requested = sorted(omitted)[:2]
+    unit_text = {u["uid"]: u["text"] for u in pre_units}
+
+    tracer = _RecordingTracer()
+    router = _RestoreModelRouter(
+        plan_tools=[rag_name],
+        subtask_outcomes=[
+            {"conclusion": "部分退款政策已看到", "solved": "no",
+             "next_action": "continue", "requested_evidence_uids": requested},
+            # 恢复步的再提炼：回填已看到；再次索取必须被忽略
+            {"conclusion": "回填证据已纳入，退款政策结论完整", "solved": "yes",
+             "next_action": "continue", "requested_evidence_uids": ["e1"]},
+        ],
+        summary_verdicts=[
+            {"sufficient": True, "answer": "已完成", "missing_info": "", "suggestion": ""}
+        ],
+    )
+    runner, deps, registry, _ = _build_runner(
+        {rag_name: FakeTool(rag_name, inner_obs)},
+        _base_config(enable_evidence_board=True),
+        model_router=router,
+    )
+    deps.tracer = tracer
+
+    outcome = await runner.run(
+        deps=deps, user_input="查退款政策", session_id="s-evidence-restore",
+        mode="plan_execute", intent=IntentContext(),
+    )
+    assert outcome.paused is False
+
+    # 真实工具只被调用一次：恢复步不经过注册表
+    assert [inv["name"] for inv in registry.invocations] == [rag_name]
+    # t1 与恢复步各提炼一次
+    assert router._subtask_calls == 2
+
+    snapshot = await aget_snapshot(runner._graph, outcome.run_id)
+    values = snapshot.values
+    results = values.get("subtask_results") or []
+    restore_recs = [r for r in results if r.get("tool_name") == "evidence_restore"]
+    assert len(restore_recs) == 1
+    rec = restore_recs[0]
+    assert rec["internal_evidence_restore"] is True
+    assert rec["restore_hits"] == 2
+    restore_text = rec["observation"]
+    for uid in requested:
+        assert f"回填 [{uid}｜来源：policy_" in restore_text
+        assert unit_text[uid] in restore_text
+
+    # 回填内容不二次入管：证据单元仍是 t1 的 8 条
+    assert len(values.get("evidence_units") or []) == len(pre_units)
+
+    # 计划里恰好一个内部恢复步（恢复步的再次请求被忽略，未连环插入）
+    restore_task_ids = [t["id"] for t in values.get("plan") or []
+                        if str(t.get("id", "")).startswith("correction_evidence_")]
+    assert restore_task_ids == ["correction_evidence_t1"]
+
+    # 恢复步的提炼提示词里确实看到了回填原文
+    second_distill_blob = json.dumps(router.subtask_distill_messages[1],
+                                     ensure_ascii=False, default=str)
+    assert "回填 [" in second_distill_blob
+    assert unit_text[requested[0]] in second_distill_blob
+
+    # trace：evidence.round 带 exempt 计数；evidence.restore 受理 1 次 +
+    # 恢复步再次请求被忽略 1 次
+    round_events = [p for e, p in tracer.events if e == "evidence.round"]
+    assert round_events and all("exempt" in p for p in round_events)
+    restore_events = [p for e, p in tracer.events if e == "evidence.restore"]
+    applied = [p for p in restore_events if p.get("applied")]
+    skipped = [p for p in restore_events if not p.get("applied")]
+    assert len(applied) == 1
+    assert applied[0]["accepted"] == requested
+    assert applied[0]["rejected"] == []
+    assert applied[0]["chars"] > 0
+    assert len(skipped) == 1
+    assert "每子任务最多一次" in skipped[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_plan_evidence_restore_off_when_switch_disabled() -> None:
+    """特性开关关闭时：模型即使填了 requested_evidence_uids 也零行为变化。"""
+    rag_name = "rag_knowledge_search"
+    inner_obs = _restore_rag_obs()
+    router = FakeModelRouter(
+        plan_tools=[rag_name],
+        subtask_outcomes=[
+            {"conclusion": "已完成", "solved": "yes", "next_action": "continue",
+             "requested_evidence_uids": ["e1", "e2"]},
+        ],
+        summary_verdicts=[
+            {"sufficient": True, "answer": "已完成", "missing_info": "", "suggestion": ""}
+        ],
+    )
+    runner, deps, registry, _ = _build_runner(
+        {rag_name: FakeTool(rag_name, inner_obs)},
+        _base_config(),  # 不开 enable_evidence_board
+        model_router=router,
+    )
+    outcome = await runner.run(
+        deps=deps, user_input="查退款政策", session_id="s-evidence-restore-off",
+        mode="plan_execute", intent=IntentContext(),
+    )
+    assert outcome.paused is False
+    assert [inv["name"] for inv in registry.invocations] == [rag_name]
+    snapshot = await aget_snapshot(runner._graph, outcome.run_id)
+    values = snapshot.values
+    assert not values.get("evidence_units")
+    assert all("correction_evidence_" not in str(t.get("id"))
+               for t in values.get("plan") or [])

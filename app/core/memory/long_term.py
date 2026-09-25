@@ -21,6 +21,8 @@ import http
 import dashscope
 from dashscope import TextEmbedding
 
+from app.infrastructure.trace.langfuse import embedding_span
+
 @runtime_checkable
 class LTMEmbedProtocol(Protocol):
     """嵌入模型接口。"""
@@ -83,12 +85,14 @@ class QwenEmbeddingImpl:
     def embed_query(self, text: str) -> list[float]:
         """将文本转化为通义千问稠密向量"""
         try:
-            # 调用百炼平台的文本向量服务
-            response = TextEmbedding.call(
-                model=self.model,
-                input=text,
-                api_key=self.api_key
-            )
+            # Langfuse 门控：会话内召回时挂 embedding observation，会话外建库 no-op
+            with embedding_span("embedding.longterm_qwen", model=self.model):
+                # 调用百炼平台的文本向量服务
+                response = TextEmbedding.call(
+                    model=self.model,
+                    input=text,
+                    api_key=self.api_key
+                )
 
             # 百炼平台标准状态码校验
             if response.status_code == http.HTTPStatus.OK:
@@ -125,10 +129,11 @@ class OpenAIEmbeddingImpl:
     def embed_query(self, text: str) -> list[float]:
         """将文本转化为稠密向量"""
         try:
-            response = self.client.embeddings.create(
-                input=[text],
-                model=self.model
-            )
+            with embedding_span("embedding.longterm_openai", model=self.model):
+                response = self.client.embeddings.create(
+                    input=[text],
+                    model=self.model
+                )
             return response.data[0].embedding
         except Exception as e:
             logger.error(f"Embedding 转化失败: {e}")

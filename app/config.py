@@ -242,6 +242,12 @@ class Settings(BaseSettings):
         description="异步数据库 SQLAlchemy URL（postgresql+asyncpg）",
     )
     redis_url: str = Field(default="redis://localhost:6379/0", description="Redis URL")
+    checkpoint_redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="状态图 checkpointer 专用 Redis 连接（独立于业务客户端）。"
+                    "注意：开源 RediSearch 只允许在 db0 建索引，故与短期记忆"
+                    "同库但以 agent_cp 前缀隔离；如需物理隔离请指向另一实例。",
+    )
 
     milvus_host: str = Field(default="localhost", description="Milvus 主机")
     milvus_port: int = Field(default=19530, description="Milvus 端口")
@@ -340,6 +346,11 @@ class Settings(BaseSettings):
     agent_node_retry_max: int = Field(
         default=1, ge=0,
         description="reflect 不通过时回 execute 重做的最大次数。",
+    )
+
+    enable_evidence_board : bool =Field(
+        default=True,
+        description="开关打开后模型眼前只剩最多 2400 字的相关块 + 索引；ReAct 丢了能按编号取回，plan 取不回",
     )
 
     log_level: str = Field(default="INFO", description="日志级别")

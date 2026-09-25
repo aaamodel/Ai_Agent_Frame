@@ -22,6 +22,7 @@ from app.core.chat_recognizer.recognizer import IntentRecognizer
 from app.llm_model_router.model_router import ModelRouter
 from app.llm_model_router.model_router_config import AIModelProperties
 from app.infrastructure.trace.tracer import Tracer
+from app.infrastructure.trace.langfuse import generation_span
 from app.infrastructure.database.session import get_async_session
 from app.models.agent_schemas import ChatRequest, ChatResponse, MemoryContext, Message  # 保持原有的标准对话模型
 
@@ -668,7 +669,11 @@ async def _agent_stream_generator(
     attempt_count = 0
 
     orchestrator_result: Any = None
-    with use_sink(answer_sink):
+    # show_structural=False：图运行期间 planner 计划 / 子任务控制协议 / summarize
+    # 判定等内部 JSON 调用一律走非流式，不进 answer 通道——否则内部 JSON 会被当
+    # 正文显示，且每次内部调用的 attempt_start 会把上一段成功输出误划成"模型切换
+    # 废弃"。给用户的最终答案由本函数尾部的 _stream_final_answer 统一逐字推送。
+    with use_sink(answer_sink, show_structural=False):
         graph_events = agent_orchestrator.run_stream(
             user_input=effective_user_input,
             session_id=active_session_id,
@@ -919,23 +924,35 @@ async def _stream_generator(request: ChatRequest, trace_id: str) -> AsyncIterato
     messages = [m.model_dump() for m in request.messages]
     model = request.model or settings.openai_llm_model
 
-    try:
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            stream=True,
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content if chunk.choices else None
-            if delta:
-                payload = {"content": delta, "trace_id": trace_id}
-                yield b"data: " + json.dumps(payload, ensure_ascii=False).encode() + b"\n\n"
-        yield b"data: " + json.dumps({"done": True}, ensure_ascii=False).encode() + b"\n\n"
-    except Exception as exc:
-        logger.exception("chat_stream 失败: {}", exc)
-        yield b"data: " + json.dumps({"error": str(exc)}, ensure_ascii=False).encode() + b"\n\n"
+    # 统一门控：本端点是 AgentOrchestrator 之外的独立直连聊天，会话外 →
+    # no-op（不产生游离根 trace）；若将来在某条 trace 内被调用则自动挂入。
+    with generation_span(
+        name="llm.chat_stream",
+        model=model,
+        input={"messages": messages, "temperature": request.temperature,
+               "max_tokens": request.max_tokens, "stream": True},
+    ) as generation:
+        try:
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                stream=True,
+            )
+            content_parts: list[str] = []
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    content_parts.append(delta)
+                    payload = {"content": delta, "trace_id": trace_id}
+                    yield b"data: " + json.dumps(payload, ensure_ascii=False).encode() + b"\n\n"
+            if generation is not None and content_parts:
+                generation.update(output={"content": "".join(content_parts)})
+            yield b"data: " + json.dumps({"done": True}, ensure_ascii=False).encode() + b"\n\n"
+        except Exception as exc:
+            logger.exception("chat_stream 失败: {}", exc)
+            yield b"data: " + json.dumps({"error": str(exc)}, ensure_ascii=False).encode() + b"\n\n"
 
 
 @router.post("/chat/stream")

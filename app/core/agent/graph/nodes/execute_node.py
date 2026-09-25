@@ -20,7 +20,11 @@ from typing import Any, Dict, List, Optional, Sequence
 from langchain_core.runnables import RunnableConfig
 from loguru import logger
 
-from app.core.agent.graph.approval import gate_tool_approval
+from app.core.agent.graph.approval import (
+    danger_tool_names,
+    gate_tool_approval,
+    take_resume_approval_arguments,
+)
 from app.core.agent.graph.deps import get_deps
 from app.core.agent.graph.nodes._common import (
     agent_goal_from_state,
@@ -86,6 +90,164 @@ from app.core.agent.toolcall import (
     tool_call_from_text,
     tool_calls_from_fc,
 )
+from app.core.agent.evidence import (
+    FETCH_TOOL_NAME,
+    fetch_tool_definition,
+    handle_fetch_evidence,
+    ingest_observation,
+    is_fetch_call,
+    render_fc_messages,
+    render_plan_observation,
+    render_text_history_lines,
+)
+from app.core.agent.evidence.fetch import (
+    EVIDENCE_RESTORE_TOOL,
+    build_plan_restore_text,
+    parse_fetch_arguments,
+)
+from app.core.agent.evidence.models import KIND_CONTENT, KIND_TABLE
+from app.core.agent.evidence.view import plan_view_uids
+from app.core.agent.evidence.pipeline import extract_query_text
+from app.core.trace_to_markdown import trace_to_markdown
+
+# 控制协议（SubTaskOutcomeSchema）的提示词版输出契约。
+# ⚠️ 与 planner 同理：GLM-4.7 实测静默忽略 response_format=json_schema，
+# 不写死字段名模型就自由发挥（2026-09-23 事故：输出散文 → 控制协议不可解析）。
+PLAN_CONTROL_OUTPUT_CONTRACT = """
+【输出格式·强制契约】
+整个回复只能是一个 JSON 对象，不要输出 JSON 之外的任何文字、Markdown 围栏或思考过程。
+字段固定为：
+- "conclusion"：字符串，本子任务的最终结论或分析结果；
+- "solved"：只能是 "yes"（已拿到所需答案）、"partial"（只拿到部分）或 "no"；
+- "next_action"：只能是 "continue"（继续后续子任务）或 "finish"（结论已足以收尾）；
+- "skip_task_ids"：要跳过的子任务 id 字符串数组，没有则为 null；
+- "selected_alternative_id"：需要换数据源/换工具时，从给定「可选的替代方向」原样照抄的标识，没有则为 null；
+- "requested_evidence_uids"：本步某条被省略的工具结果需要查看全文时，填其证据编号字符串数组（最多 3 条），没有则为 null；
+- "reason"：字符串，调度判断的简短理由。
+示例：{"conclusion":"2026年7月业绩第一的是张三，销售额120万","solved":"yes","next_action":"finish","skip_task_ids":null,"selected_alternative_id":null,"requested_evidence_uids":null,"reason":"排名结果已取得，剩余导出步骤仍需执行时置 continue"}
+严禁自造 conclusion/solved/next_action 之外的顶层结构，严禁输出散文。
+"""
+
+
+# ── 证据板辅助（enable_evidence_board 默认关；任何异常回退现状压缩）────────
+def _evidence_rounds(meta: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return list((meta or {}).get("rounds") or [])
+
+
+def _evidence_ingest(
+    deps: Any,
+    trace_id: str,
+    *,
+    existing_units: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+    user_question: str,
+    tool_name: str,
+    round_idx: int,
+    observation: str,
+    current_query: str,
+    action_input: Any,
+    call_id: Optional[str],
+) -> tuple:
+    """入管一次工具观测并留痕 evidence.round；失败返回 (None, None) 静默降级。"""
+    try:
+        all_units, new_meta, report = ingest_observation(
+            existing_units=existing_units,
+            meta=meta,
+            tool_name=tool_name,
+            round_idx=round_idx,
+            observation=observation or "",
+            current_query=current_query or "",
+            user_question=user_question or "",
+            action_input=action_input if isinstance(action_input, dict) else None,
+            call_id=call_id,
+        )
+        trace_event(deps.tracer, trace_id, "evidence.round", report.to_dict())
+        return all_units, new_meta
+    except Exception as exc:  # noqa: BLE001 - 证据板是增值压缩，绝不允许打断主链路
+        logger.warning("证据板入管失败，本轮回退现状压缩: {}", exc)
+        trace_event(
+            deps.tracer, trace_id, "evidence.fallback",
+            {"stage": "ingest", "error": str(exc)[:200]},
+        )
+        return None, None
+
+
+def _evidence_fetch(
+    deps: Any,
+    trace_id: str,
+    *,
+    state: Dict[str, Any],
+    arguments: Any,
+    next_round: int,
+) -> tuple:
+    """拦截 fetch_evidence：纯本地回取，零注册表调用。返回 (obs_text, units|None)。"""
+    uid, window, parse_error = parse_fetch_arguments(arguments)
+    try:
+        if parse_error is not None:
+            trace_event(
+                deps.tracer, trace_id, "evidence.fetch",
+                {"uid": "", "window": 0, "chars": len(parse_error), "hit": False},
+            )
+            return parse_error, None
+        obs_text, units = handle_fetch_evidence(
+            state, uid=uid, window=window, round_idx=next_round
+        )
+        trace_event(
+            deps.tracer, trace_id, "evidence.fetch",
+            {"uid": uid, "window": window, "chars": len(obs_text), "hit": True},
+        )
+        return obs_text, units
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("证据板回取失败，返回确定性错误文本: {}", exc)
+        trace_event(
+            deps.tracer, trace_id, "evidence.fallback",
+            {"stage": "fetch", "error": str(exc)[:200]},
+        )
+        return f"fetch_evidence 执行失败：{exc}", None
+
+
+def _evidence_fc_view(
+    deps: Any,
+    trace_id: str,
+    *,
+    messages: List[Dict[str, Any]],
+    units: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+    step_idx: int,
+) -> List[Dict[str, Any]]:
+    try:
+        return render_fc_messages(
+            messages, units, _evidence_rounds(meta), round_idx=step_idx
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("证据板 FC 视图渲染失败，回退 compact_tool_observations: {}", exc)
+        trace_event(
+            deps.tracer, trace_id, "evidence.fallback",
+            {"stage": "fc_view", "error": str(exc)[:200]},
+        )
+        return compact_tool_observations(messages)
+
+
+def _evidence_text_view(
+    deps: Any,
+    trace_id: str,
+    *,
+    history_lines: List[str],
+    units: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+    step_idx: int,
+) -> List[str]:
+    try:
+        return render_text_history_lines(
+            history_lines, units, _evidence_rounds(meta), round_idx=step_idx
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("证据板文本视图渲染失败，回退 compact_history_lines: {}", exc)
+        trace_event(
+            deps.tracer, trace_id, "evidence.fallback",
+            {"stage": "text_view", "error": str(exc)[:200]},
+        )
+        return compact_history_lines(history_lines)
 
 
 async def execute_node(state: AgentGraphState, config: RunnableConfig) -> dict:
@@ -171,6 +333,14 @@ def _apply_step_correction(
     if remaining_quota(state) <= 0:
         return _skip("纠偏配额已耗尽")
 
+    # 链式纠偏闸门：纠偏任务（id 形如 ``correction_xxx``）执行后即使仍未解决，
+    # 也**不再插入第二层纠偏**——否则会出现 correction_correction_xxx 连锁插步，
+    # 且空 hint 的工具候选只能靠 FC 自由组参，层数越深模型越靠臆造参数硬凑
+    # （2026-09 实测：二次纠偏给 file_read_tool 编出不存在的"线索管理规范.md"）。
+    # 本步结论照常保留，交计划级闸门/最终汇总裁决。
+    if str(subtask_id or "").startswith("correction_"):
+        return _skip("纠偏任务不再触发二次纠偏（禁止链式插步）")
+
     action = translate_candidate(
         selected,
         candidates=candidates,
@@ -221,6 +391,143 @@ def _apply_step_correction(
     return {
         "plan": new_plan,
         # 留痕与配额计数共用同一条记录
+        "step_corrections": list(state.get("step_corrections") or []) + [record],
+    }
+
+
+def _restore_uids_from_hint(task: Dict[str, Any]) -> List[str]:
+    """从内部恢复步的 tool_args_hint 取出 uids（插入时写入，零 LLM）。"""
+    hint = task.get("tool_args_hint")
+    data: Any = hint
+    if isinstance(hint, str):
+        try:
+            data = json.loads(hint)
+        except (json.JSONDecodeError, ValueError):
+            return []
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("uids") or []
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _apply_evidence_restore(
+    *,
+    state: Dict[str, Any],
+    plan: List[Dict[str, Any]],
+    cursor: int,
+    subtask_id: Any,
+    requested: Any,
+    unit_dicts: List[Dict[str, Any]],
+    deps: Any,
+    trace_id: str,
+) -> Dict[str, Any]:
+    """应用一次 plan 延迟证据回取（D10）；不满足条件时返回空 dict。
+
+    与 _apply_step_correction 同构：只在 cursor+1 插入一个内部恢复步，
+    受同一配额与链式闸门约束；恢复步不注册工具、分发前拦截、零外部调用。
+    """
+    sid = str(subtask_id or "")
+    record: Dict[str, Any] = {
+        "subtask_id": sid,
+        "trigger": "evidence_restore",
+        "remaining_quota": remaining_quota(state),
+    }
+
+    def _skip(reason: str, rejected: Optional[List[str]] = None) -> Dict[str, Any]:
+        record.update({
+            "applied": False,
+            "reason": reason,
+            "requested": [str(x) for x in (requested or [])][:3],
+            "accepted": [],
+            "rejected": rejected or [],
+            "chars": 0,
+        })
+        trace_event(deps.tracer, trace_id, "evidence.restore", record)
+        return {}
+
+    # 链式闸门：纠偏/恢复步自身不再受理证据请求（每子任务最多恢复一次）
+    if sid.startswith("correction_"):
+        return _skip("恢复/纠偏步不再触发证据回取（每子任务最多一次）")
+    if remaining_quota(state) <= 0:
+        return _skip("纠偏配额已耗尽")
+
+    raw_uids = requested if isinstance(requested, list) else []
+    candidates: List[str] = []
+    for item in raw_uids:
+        uid = str(item or "").strip()
+        if uid and uid not in candidates:
+            candidates.append(uid)
+    candidates = candidates[:3]
+    if not candidates:
+        return {}
+
+    unit_dicts = list(unit_dicts or [])
+    units_by_uid = {
+        str(d.get("uid")): d for d in unit_dicts if d.get("uid")
+    }
+    _, omitted_uids = plan_view_uids(unit_dicts, round_idx=cursor)
+
+    accepted: List[str] = []
+    rejected: List[str] = []
+    for uid in candidates:
+        unit = units_by_uid.get(uid)
+        unit_round = unit.get("round_idx") if unit is not None else None
+        if (
+            unit is not None
+            and unit_round is not None
+            and int(unit_round) == cursor
+            and str(unit.get("kind") or "") in (KIND_CONTENT, KIND_TABLE)
+            and not unit.get("dupe_of")
+            and uid in omitted_uids
+        ):
+            accepted.append(uid)
+        else:
+            rejected.append(uid)
+
+    if not accepted:
+        return _skip("没有属于本步已省略集合的合法编号", rejected=rejected)
+
+    existing_ids = {str(entry.get("id")) for entry in plan}
+    base_id = f"correction_evidence_{sid}"
+    new_id = base_id
+    suffix = 2
+    while new_id in existing_ids:
+        new_id = f"{base_id}_{suffix}"
+        suffix += 1
+
+    new_task: Dict[str, Any] = {
+        "id": new_id,
+        "title": "回填本步被省略证据原文（内部步，零外部调用）",
+        "action_type": "tool",
+        "tool_name": EVIDENCE_RESTORE_TOOL,
+        "tool_args_hint": json.dumps({"uids": accepted}, ensure_ascii=False),
+        "description": (
+            "内部恢复步：从本请求已保存观测回填被省略证据原文，"
+            "不调用任何外部工具。"
+        ),
+    }
+    new_plan: List[Dict[str, Any]] = [dict(entry) for entry in plan]
+    new_plan.insert(cursor + 1, new_task)
+
+    restore_chars = sum(
+        len(str(units_by_uid[uid].get("text") or "")) for uid in accepted
+    )
+    record.update({
+        "applied": True,
+        "inserted": True,
+        "insert_at": cursor + 1,
+        "target_subtask_id": new_id,
+        "requested": candidates,
+        "accepted": accepted,
+        "rejected": rejected,
+        "chars": restore_chars,
+    })
+    trace_event(deps.tracer, trace_id, "evidence.restore", record)
+
+    return {
+        "plan": new_plan,
         "step_corrections": list(state.get("step_corrections") or []) + [record],
     }
 
@@ -342,7 +649,10 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
 
     update: Dict[str, Any] = {}
     budget = budget_from_ledger(state.get("budget") or {})
-    print(f"解析到了哪些事实：{state.get("extracted_facts",None)}")
+    evidence_on: bool = bool(deps.cfg("enable_evidence_board", False))
+    # 本步入管结果（整体替换写回 state；None 表示开关关或入管降级）
+    evidence_units: Optional[List[Dict[str, Any]]] = None
+    evidence_meta: Optional[Dict[str, Any]] = None
     # ── 游标快进：跳过被模型决定跳过的子任务 ──────────────────────────────
     # 与 builder.route_after_execute **共用** next_pending_cursor，避免两处各写一份
     # "怎么算下一个待执行" 的逻辑（历史上工具白名单就因三处同口径而漂移过）。
@@ -402,8 +712,25 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                     f"子任务 [{task.get('id')}] 声明为 tool 类型，但未指定 tool_name"
                 )
 
+            # 内部证据恢复步（D10）：分发前拦截，不耗预算、不过注册表、
+            # 不重新入管，回填文本即本步观测，随后正常走一次提炼。
+            if tool_name == EVIDENCE_RESTORE_TOOL:
+                restore_uids = _restore_uids_from_hint(task)
+                obs_str, restore_hits = build_plan_restore_text(
+                    state, restore_uids
+                )
+                rec["kind"] = "plan_tool_call"
+                rec["action"] = EVIDENCE_RESTORE_TOOL
+                rec["action_input"] = {"uids": restore_uids}
+                rec["observation"] = obs_str[:8000]
+                rec["internal_evidence_restore"] = True
+                rec["restore_hits"] = restore_hits
+                logger.info(
+                    "Planner 内部恢复步 [{}] 回填证据 {} 条（零外部调用）。",
+                    task.get("id"), restore_hits,
+                )
             # 预算熔断：文本留痕、记坏状态，不再做本步提炼（计划继续推进）
-            if not budget.can_call(tool_name):
+            elif not budget.can_call(tool_name):
                 obs_str = budget.deny_text(tool_name)
                 rec["budget_denied"] = True
                 rec["status"] = "budget_denied"
@@ -415,6 +742,21 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                     task.get("id"), tool_name,
                 )
             else:
+                # interrupt 恢复重放：优先复用审批时已确认的入参。
+                # LangGraph 恢复时整个节点从头重跑，若再次执行 hint/FC 解析，
+                # 非确定性 LLM 可能漂移出与审批卡片**不同的字段**——实测事故
+                # （2026-09-23）：审批正文 A，批准后 FC 重跑变成正文 B 落盘，
+                # 人工审批在字段层面被架空。runner 已把审批载荷注入 config。
+                args: Optional[Dict[str, Any]] = take_resume_approval_arguments(
+                    config, tool_name=tool_name, subtask_id=task.get("id"),
+                )
+                if args is not None:
+                    logger.info(
+                        "Planner 子任务 [{}] 工具 [{}] 审批恢复重放：复用已审批入参，"
+                        "跳过 hint/FC 参数重解析（审批所见=实际执行）。",
+                        task.get("id"), tool_name,
+                    )
+
                 # 参数解析优先级：planner 的 tool_args_hint（零 LLM）
                 #   → FC 强制取参（1 次 LLM）→ 文本解析 + user_query 兜底。
                 # 旧顺序是 FC 优先，每个 tool 子任务都白花一次「参数填充器」LLM 调用
@@ -423,25 +765,53 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                 # ⚠️ 但 hint 直用有一个前提：**先把前序任务占位符替换掉**。
                 # 实测故障：hint 里写 "<从 task_2 获取的路径>"，占位符是"非空字符串"
                 # 能通过必填校验，于是一路直达工具 → "找不到文件: <从 task_2 获取的路径>"。
-                resolved_hint: Any = substitute_task_refs(
-                    task.get("tool_args_hint"), artifacts_by_task
-                )
-                args: Optional[Dict[str, Any]] = resolve_tool_args_from_hint(
-                    deps.tools, tool_name, resolved_hint
-                )
                 if args is None:
-                    args = await resolve_tool_args_via_function_call(
-                        deps.model_router,
-                        deps.tools,
-                        tool_name=tool_name,
-                        title=str(task.get("title") or ""),
-                        description=str(task.get("description") or ""),
-                        # 给 FC 的也必须是**替换后**的 hint：否则模型会把占位符原样抄回来
-                        tool_args_hint=resolved_hint,
-                        query=query,
-                        prior_context_str=ctx_str,
-                        purpose_hint="planner",
+                    resolved_hint: Any = substitute_task_refs(
+                        task.get("tool_args_hint"), artifacts_by_task
                     )
+                    args = resolve_tool_args_from_hint(
+                        deps.tools, tool_name, resolved_hint
+                    )
+                    # 下游写/审批工具且已有前序子任务结果：即便 hint 必填参数齐全，
+                    # 也强制用 FC 结合前序真实结论重组一次参数。
+                    # 实测事故（2026-09-23）：planner 计划时看不到运行结果，给导出
+                    # 工具的 content 只写了标题性占位"2026年7月销售及负责人产品销量
+                    # 排名数据"——非空且通过必填校验，零 LLM 直达工具 → 导出只有
+                    # 一行占位语的空报表，还白烧一次人工审批。写操作的代价（审批+
+                    # 落盘）远高于一次参数填充 LLM。
+                    compose_from_prior: bool = (
+                        args is not None
+                        and bool(prior_results)
+                        and tool_name in danger_tool_names(deps)
+                    )
+                    if args is None or compose_from_prior:
+                        fc_args: Optional[Dict[str, Any]] = (
+                            await resolve_tool_args_via_function_call(
+                                deps.model_router,
+                                deps.tools,
+                                tool_name=tool_name,
+                                title=str(task.get("title") or ""),
+                                description=str(task.get("description") or ""),
+                                # 给 FC 的也必须是**替换后**的 hint：否则模型会把占位符原样抄回来
+                                tool_args_hint=resolved_hint,
+                                query=query,
+                                prior_context_str=ctx_str,
+                                purpose_hint="planner",
+                            )
+                        )
+                        if args is None:
+                            args = fc_args
+                        elif isinstance(fc_args, dict) and fc_args:
+                            # FC 值（基于真实结论的正文）覆盖 hint；FC 省略的计划期
+                            # 已知字段（report_title/file_name 等）保留 hint 值。
+                            args = {
+                                **args,
+                                **{
+                                    key: value
+                                    for key, value in fc_args.items()
+                                    if value not in (None, "", [], {})
+                                },
+                            }
                 if args is None:
                     args = {}
                     hint = task.get("tool_args_hint")
@@ -494,6 +864,29 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                     )
                     obs_str = tool_result.observation
                     rec["observation"] = obs_str[:8000]
+                    # 证据板：ok/error/empty 真实工具观测都入管（审批/熔断的
+                    # 合成短文本不属证据，不入管）。
+                    if evidence_on:
+                        plan_query = " ".join(
+                            part for part in (
+                                str(task.get("title") or ""),
+                                str(task.get("description") or ""),
+                                agent_goal_from_state(state),
+                                query,
+                            ) if part
+                        )
+                        evidence_units, evidence_meta = _evidence_ingest(
+                            deps, trace_id,
+                            existing_units=state.get("evidence_units") or [],
+                            meta=state.get("evidence_meta") or {},
+                            user_question=query,
+                            tool_name=tool_name,
+                            round_idx=cursor,
+                            observation=obs_str,
+                            current_query=plan_query,
+                            action_input=args,
+                            call_id=f"plan_{cursor}_{task.get('id')}",
+                        )
                     if tool_result.budget_denied:
                         rec["budget_denied"] = True
                         rec["status"] = "budget_denied"
@@ -555,7 +948,16 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
 
             correction_candidates: List[Candidate] = []
             candidates_text: str = ""
-            if correction_reason and remaining_quota(state) > 0:
+            # 纠偏步不再给候选：链式纠偏已被 _apply_step_correction 硬闸门禁止，
+            # 这里不渲染候选列表，避免诱导模型输出必然被忽略的选择。
+            correction_chain_blocked: bool = str(
+                task.get("id") or ""
+            ).startswith("correction_")
+            if (
+                correction_reason
+                and remaining_quota(state) > 0
+                and not correction_chain_blocked
+            ):
                 correction_candidates = correction_set.candidates
                 candidates_text = render_candidates(correction_candidates)
                 if evidence_gap:
@@ -563,6 +965,11 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                         "子任务 [{}] 证据缺口置位：问题核心词覆盖率={:.2f} < 阈值 {}",
                         task.get("id"), coverage, EVIDENCE_COVERAGE_THRESHOLD,
                     )
+            elif correction_reason and correction_chain_blocked:
+                logger.info(
+                    "纠偏子任务 [{}] 仍未解决，按链式闸门不再注入候选、不再二次纠偏。",
+                    task.get("id"),
+                )
             if correction_set.excluded:
                 # 留痕：存在已提取资产、但白名单里没有能消费它的工具。这同时是
                 # "白名单过窄"的观测点（本 trace 即为此情形）。
@@ -581,7 +988,19 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                 + f"历史子任务结论：\n{ctx_str}\n"
             )
             if obs_str:
-                prompt_content += f"\n本步骤工具调用返回的原始数据：\n{obs_str[:6000]}\n请结合工具数据完成本子任务。"
+                obs_for_distill = obs_str[:6000]
+                if evidence_on and evidence_units is not None:
+                    try:
+                        obs_for_distill = render_plan_observation(
+                            obs_str, evidence_units, round_idx=cursor
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("证据板 plan 视图渲染失败，回退 [:6000]: {}", exc)
+                        trace_event(
+                            deps.tracer, trace_id, "evidence.fallback",
+                            {"stage": "plan_view", "error": str(exc)[:200]},
+                        )
+                prompt_content += f"\n本步骤工具调用返回的原始数据：\n{obs_for_distill}\n请结合工具数据完成本子任务。"
             else:
                 prompt_content += "\n请根据历史上下文推理并完成本子任务。"
 
@@ -591,8 +1010,9 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                 "针对当前子任务给出简洁、准确的最终结论或分析结果。"
             )
             if control_enabled:
+                system_text += PLAN_CONTROL_OUTPUT_CONTRACT
                 system_text += (
-                    "\n同时在 JSON 的 next_action / skip_task_ids 字段给出下一步调度判断：\n"
+                    "\n同时按以下规则填写 JSON 的 next_action / skip_task_ids 字段：\n"
                     "- 若现有结论已足以回答【原始总问题】，把 next_action 置为 finish；\n"
                     "- 若某个尚未执行的子任务、其答案已由其它子任务取得"
                     "（见台账的『是否解决』列），把它的 id 放进 skip_task_ids；\n"
@@ -600,8 +1020,12 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                     "而提示词里给出了「可选的替代方向」，请把其中**一项**的方括号内容"
                     "**原样照抄**进 selected_alternative_id（形如 asset:xxx 或 tool:xxx）；"
                     "不需要换方向时置为 null；\n"
-                    "- ⚠️ 严禁自行编造标识、工具名、参数或路径——只能从给定列表里选，"
-                    "编造的会被忽略；也不允许自行新增或修改子任务。"
+                    "- selected_alternative_id 是候选的资产/工具方向；"
+                    "requested_evidence_uids 是索取本步某条工具观测结果的全文"
+                    "（填「已省略」清单里的证据编号，可多条）；两者互不影响，"
+                    "都不需要时均留空；\n"
+                    "- ⚠️ 严禁自行编造标识、工具名、参数、路径或证据编号——"
+                    "只能从给定列表/清单里选，编造的会被忽略；也不允许自行新增或修改子任务。"
                 )
             subtask_msgs = [
                 {"role": "system", "content": system_text},
@@ -651,6 +1075,26 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                     update.update(correction_update)
                     # 计划已被就地改写 → 后续的计划级闸门必须基于新计划判定
                     plan = correction_update.get("plan") or plan
+
+                # ── 延迟一步证据回取：独立字段，与纠偏互不影响（D10） ──────
+                if evidence_on:
+                    restore_update = _apply_evidence_restore(
+                        state=state,
+                        plan=plan,
+                        cursor=cursor,
+                        subtask_id=task.get("id"),
+                        requested=outcome.get("requested_evidence_uids"),
+                        unit_dicts=(
+                            evidence_units
+                            if evidence_units is not None
+                            else list(state.get("evidence_units") or [])
+                        ),
+                        deps=deps,
+                        trace_id=trace_id,
+                    )
+                    if restore_update:
+                        update.update(restore_update)
+                        plan = restore_update.get("plan") or plan
             else:
                 # 降级：控制指令解析不出来时**保留结论**、按"继续执行"处理。
                 # 控制是增值能力，绝不能因为它没解析出来就丢掉已取回的工具数据。
@@ -660,6 +1104,16 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
                 )
 
     except Exception as exc:  # noqa: BLE001 - 取参/调用异常同样记账继续，交计划级闸门统一决策
+        # ⚠️ 人工审批的 GraphInterrupt 必须原样穿透节点上抛给 LangGraph Pregel：
+        # 图才能真正暂停（快照写 next + interrupts，前端收到 awaiting_approval）。
+        # langgraph 1.2.x 中 GraphInterrupt 的 MRO 是
+        # GraphInterrupt → GraphBubbleUp → Exception（不是 BaseException），
+        # 会被本宽异常捕获。2026-09-23 事故：审批中断在此被当成步级错误吞掉，
+        # 图未暂停、继续跑完走友好降级，危险工具的人工审批永远等不到人。
+        # react FC/文本两条路径不经过本宽 except，天然能穿透，无需处理。
+        from langgraph.errors import GraphInterrupt
+        if isinstance(exc, GraphInterrupt):
+            raise
         rec["status"] = "error"
         rec["error"] = str(exc)[:200]
         skip_distill = True
@@ -717,7 +1171,9 @@ async def _execute_plan_step(state: AgentGraphState, config: RunnableConfig) -> 
         )
     else:
         update["insufficiency_signal"] = None
-    print(f"更新了哪些事实：{update.get("extracted_facts",None)}")
+    if evidence_units is not None and evidence_meta is not None:
+        update["evidence_units"] = evidence_units
+        update["evidence_meta"] = evidence_meta
 
     return update
 
@@ -778,7 +1234,7 @@ def _bootstrap_fc_messages(state: AgentGraphState) -> List[Dict[str, Any]]:
     messages.append({"role": "user", "content": "\n\n".join(user_parts)})
     return messages
 
-
+@trace_to_markdown(output_file="_react_fc_turn.md")
 async def _react_fc_turn(state: AgentGraphState, config: RunnableConfig) -> dict:
     """FC 路径单轮：chat_with_tools → Final Answer 或 若干 tool_calls 执行闭环。"""
     deps = get_deps(config)
@@ -788,6 +1244,9 @@ async def _react_fc_turn(state: AgentGraphState, config: RunnableConfig) -> dict
     active_names: List[str] = state.get("active_tool_names") or []
 
     budget = budget_from_ledger(state.get("budget") or {})
+    evidence_on: bool = bool(deps.cfg("enable_evidence_board", False))
+    evidence_units: List[Dict[str, Any]] = list(state.get("evidence_units") or [])
+    evidence_meta: Dict[str, Any] = dict(state.get("evidence_meta") or {})
 
     persisted: List[Dict[str, Any]] = state.get("react_messages") or []
     messages: List[Dict[str, Any]] = list(persisted)
@@ -796,17 +1255,30 @@ async def _react_fc_turn(state: AgentGraphState, config: RunnableConfig) -> dict
         messages = _bootstrap_fc_messages(state)
         new_messages.extend(messages)
 
-    # 发送视图：较早轮次的工具观察降级为短桩（state 里仍保留完整原文供 trace）。
-    # 这是 ReAct 历史随步数线性膨胀的主要收口点——每多一步都会把全部旧观察
-    # 重发一次，压缩后单轮 prompt 不再随步数线性增长。
-    send_messages: List[Dict[str, Any]] = compact_tool_observations(messages)
+    # fetch_evidence 只在证据板开启时注入，且不进工具注册表（循环内本地拦截）。
+    send_tools: List[Dict[str, Any]] = list(fc_tools)
+    if evidence_on and not any(
+        (t.get("function") or {}).get("name") == FETCH_TOOL_NAME for t in send_tools
+    ):
+        send_tools.append(fetch_tool_definition())
+
+    # 发送视图：证据板开启时按 tool_call_id 属主渲染（确定性选择替代位置型截断）；
+    # 关闭/降级时保持现状 compact_tool_observations。state 里始终保留完整原文。
+    if evidence_on:
+        send_messages: List[Dict[str, Any]] = _evidence_fc_view(
+            deps, trace_id,
+            messages=messages, units=evidence_units,
+            meta=evidence_meta, step_idx=step_idx,
+        )
+    else:
+        send_messages = compact_tool_observations(messages)
     live_prompt: str = budget.live_prompt() if state.get("budget") else ""
     if live_prompt:
         send_messages.append({"role": "system", "content": live_prompt})
 
     resp = await deps.model_router.chat_with_tools(
         messages=send_messages,
-        tools=fc_tools,
+        tools=send_tools,
         tool_choice="auto",
         purpose_hint="react",
         temperature=0.2,
@@ -879,28 +1351,63 @@ async def _react_fc_turn(state: AgentGraphState, config: RunnableConfig) -> dict
     new_messages.append(assistant_msg)
 
     for call in tool_calls_from_fc(tool_calls, step_idx):
-        denied_obs: Optional[str] = await gate_tool_approval(
-            deps, call, run_id=state["run_id"]
-        )
-        if denied_obs is not None:
-            obs_text = denied_obs
+        is_fetch = evidence_on and is_fetch_call(call)
+        if is_fetch:
+            # 回取：不进审批闸门、不进工具注册表、不耗工具预算；
+            # 强制保留轮标记为下一轮（取回结果在下一激活才被模型看到）。
+            fetch_state = {**state, "evidence_units": evidence_units}
+            obs_text, fetched_units = _evidence_fetch(
+                deps, trace_id,
+                state=fetch_state,
+                arguments=call.arguments,
+                next_round=step_idx + 1,
+            )
+            if fetched_units is not None:
+                evidence_units = fetched_units
+            denied_obs: Optional[str] = None
             budget_denied = False
         else:
-            tool_result: ToolResult = await execute_tool_call(
-                call,
-                deps.tools,
-                call_budget=budget,
-                allowed_names=active_names or None,
-                model_router=deps.model_router,
-                purpose_hint="react",
+            denied_obs = await gate_tool_approval(
+                deps, call, run_id=state["run_id"]
             )
-            obs_text = tool_result.observation
-            budget_denied = tool_result.budget_denied
+            if denied_obs is not None:
+                obs_text = denied_obs
+                budget_denied = False
+            else:
+                tool_result: ToolResult = await execute_tool_call(
+                    call,
+                    deps.tools,
+                    call_budget=budget,
+                    allowed_names=active_names or None,
+                    model_router=deps.model_router,
+                    purpose_hint="react",
+                )
+                obs_text = tool_result.observation
+                budget_denied = tool_result.budget_denied
+                # 真实工具观测入管（审批拒绝的合成短文本不入管）
+                if evidence_on and denied_obs is None:
+                    ingested_units, ingested_meta = _evidence_ingest(
+                        deps, trace_id,
+                        existing_units=evidence_units,
+                        meta=evidence_meta,
+                        user_question=state["user_input"],
+                        tool_name=call.tool_name,
+                        round_idx=step_idx,
+                        observation=obs_text,
+                        current_query=extract_query_text(
+                            call.arguments, call.tool_name
+                        ),
+                        action_input=call.arguments,
+                        call_id=call.call_id,
+                    )
+                    if ingested_units is not None:
+                        evidence_units = ingested_units
+                        evidence_meta = ingested_meta
 
         rec = {
             "step": step_idx,
             "phase": "react",
-            "kind": "fc_tool_call",
+            "kind": "fc_fetch_evidence" if is_fetch else "fc_tool_call",
             "tool_call": call.raw,
             "reasoning": reasoning_txt[:2000],
             "parsed": {"action": call.tool_name, "action_input": call.arguments},
@@ -919,7 +1426,7 @@ async def _react_fc_turn(state: AgentGraphState, config: RunnableConfig) -> dict
         messages.append(tool_msg)
         new_messages.append(tool_msg)
 
-    return {
+    update = {
         "react_messages": new_messages,
         "react_step": step_idx + 1,
         "react_empty_turns": 0,
@@ -929,6 +1436,10 @@ async def _react_fc_turn(state: AgentGraphState, config: RunnableConfig) -> dict
         "steps": [{"ts": time.time(), **rec} for rec in step_recs],
         **write_back_budget(budget),
     }
+    if evidence_on:
+        update["evidence_units"] = evidence_units
+        update["evidence_meta"] = evidence_meta
+    return update
 
 
 def _tool_catalog_text(tool_names: List[str], tool_schemas: Dict[str, str]) -> str:
@@ -960,13 +1471,30 @@ async def _react_text_turn(
     history_lines: List[str] = list(state.get("react_history_lines") or [])
 
     budget = budget_from_ledger(state.get("budget") or {})
+    evidence_on: bool = bool(deps.cfg("enable_evidence_board", False))
+    evidence_units: List[Dict[str, Any]] = list(state.get("evidence_units") or [])
+    evidence_meta: Dict[str, Any] = dict(state.get("evidence_meta") or {})
 
     tool_desc = _tool_catalog_text(active_names, tool_schemas)
-    # 与 FC 路径同口径：较早步骤的 Observation 降级为短桩，避免每轮重建
-    # user prompt 时把全部历史观察再背一遍（history_lines 只增不减）。
-    history_block = (
-        "\n".join(compact_history_lines(history_lines)) if history_lines else "（尚无）"
-    )
+    if evidence_on:
+        # 文本协议无 function 定义通道：以目录条目形式告知回取能力。
+        tool_desc += (
+            f"\n\n### {FETCH_TOOL_NAME}\n取回证据板上某条证据的完整原文。"
+            "Action Input JSON：{\"uid\": \"e编号（取自 Observation 中的 [eN｜来源:...] 标记）\", "
+            "\"window\": 0-5 的整数，可选，同时取回前后相邻片段}"
+        )
+    # 与 FC 路径同口径的历史收口：证据板开启时 Step 观测段切换属主渲染。
+    if evidence_on and history_lines:
+        compacted_lines = _evidence_text_view(
+            deps, trace_id,
+            history_lines=history_lines,
+            units=evidence_units,
+            meta=evidence_meta,
+            step_idx=step_idx,
+        )
+    else:
+        compacted_lines = compact_history_lines(history_lines)
+    history_block = "\n".join(compacted_lines) if history_lines else "（尚无）"
     user_prompt = build_react_user_prompt(
         query=state["user_input"],
         tool_descriptions=tool_desc,
@@ -1082,32 +1610,67 @@ async def _react_text_turn(
         # 理论不可达（action 存在），防御性按 FAIL 处理
         text_call = ToolCall(tool_name=str(action), arguments={}, source="text")
 
-    denied_obs: Optional[str] = await gate_tool_approval(
-        deps, text_call, run_id=state["run_id"]
-    )
-    if denied_obs is not None:
-        obs_text = denied_obs
-        tool_result = None
-    else:
-        tool_result = await execute_tool_call(
-            text_call,
-            deps.tools,
-            call_budget=budget,
-            allowed_names=active_names or None,
-            model_router=deps.model_router,
-            purpose_hint="react",
+    is_fetch_text = evidence_on and str(action) == FETCH_TOOL_NAME
+    if is_fetch_text:
+        # 文本协议回取：与 FC 同拦截器，零注册表调用、不耗预算
+        fetch_state = {**state, "evidence_units": evidence_units}
+        obs_text, fetched_units = _evidence_fetch(
+            deps, trace_id,
+            state=fetch_state,
+            arguments=action_input,
+            next_round=step_idx + 1,
         )
-        obs_text = tool_result.observation
-        if tool_result.denied and not tool_result.budget_denied:
-            rec["warn"] = f"工具 [{action}] 不在白名单，本轮按 FAIL 回注 Observation"
-        if tool_result.budget_denied:
-            rec["budget_denied"] = True
+        if fetched_units is not None:
+            evidence_units = fetched_units
+        denied_obs: Optional[str] = None
+        tool_result: Optional[ToolResult] = None
+    else:
+        denied_obs = await gate_tool_approval(
+            deps, text_call, run_id=state["run_id"]
+        )
+        if denied_obs is not None:
+            obs_text = denied_obs
+            tool_result = None
+        else:
+            tool_result = await execute_tool_call(
+                text_call,
+                deps.tools,
+                call_budget=budget,
+                allowed_names=active_names or None,
+                model_router=deps.model_router,
+                purpose_hint="react",
+            )
+            obs_text = tool_result.observation
+            if tool_result.denied and not tool_result.budget_denied:
+                rec["warn"] = f"工具 [{action}] 不在白名单，本轮按 FAIL 回注 Observation"
+            if tool_result.budget_denied:
+                rec["budget_denied"] = True
+            # 真实工具观测入管（白名单拒绝的 FAIL 观测是系统反馈，仍入管为 status；
+            # 审批拒绝的合成短文本不入管）
+            if evidence_on and denied_obs is None:
+                ingested_units, ingested_meta = _evidence_ingest(
+                    deps, trace_id,
+                    existing_units=evidence_units,
+                    meta=evidence_meta,
+                    user_question=state["user_input"],
+                    tool_name=str(action),
+                    round_idx=step_idx,
+                    observation=obs_text,
+                    current_query=extract_query_text(action_input, str(action)),
+                    action_input=action_input,
+                    call_id=f"text_call_{step_idx}",
+                )
+                if ingested_units is not None:
+                    evidence_units = ingested_units
+                    evidence_meta = ingested_meta
     if denied_obs is not None:
         rec["approval_denied"] = True
 
     rec["action"] = action
     rec["action_input"] = action_input
     rec["observation"] = obs_text
+    if is_fetch_text:
+        rec["kind"] = "text_fetch_evidence"
     new_history.append(
         f"Step {step_idx + 1}\nThought: {parsed.get('thought', '')}\n"
         f"Action: {action}\nObservation: {obs_text}\n"
@@ -1123,6 +1686,9 @@ async def _react_text_turn(
         "empty_data_signal": None,
         **write_back_budget(budget),
     }
+    if evidence_on:
+        update["evidence_units"] = evidence_units
+        update["evidence_meta"] = evidence_meta
     if forced_protocol:
         # FC 首轮降级：react_protocol 固化为 text（值已是 text，显式留痕）
         update["degraded"] = True

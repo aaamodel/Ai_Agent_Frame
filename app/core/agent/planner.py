@@ -174,11 +174,38 @@ def _is_empty_data(obs_text: str) -> bool:
     return False
 
 
+# 输出契约：结构说明独立成块，初始计划与重规划共用。
+# ⚠️ 不能只依赖 response_format=json_schema：2026-09-23 实测 GLM-4.7
+# （open.bigmodel.cn）对 json_schema（strict 有/无）一律静默忽略——HTTP 200
+# 但自由发挥成 {"plan":[{"step","task","args"}]} / {"sub_tasks":[...]}，
+# Pydantic 把缺失的 subtasks 当默认空数组 → len=0 两次 parse 失败 → fallback。
+# 提示词内嵌契约 + json_object（能力位关闭 json_schema 时的降级）双保险。
+PLAN_OUTPUT_CONTRACT = """
+【输出格式·强制契约】
+只输出一个 JSON 对象，不要输出 JSON 之外的任何文字、Markdown 围栏或思考过程。
+顶层必须且只能有 "subtasks" 一个键，值为按执行顺序排列的子任务数组（至少 1 项）。
+每个子任务对象的字段固定为：
+- "id"：字符串，子任务唯一 ID，如 "task_1"；
+- "title"：字符串，简短标题；
+- "description"：字符串，要做什么、怎么做、期望拿到什么；
+- "action_type"：只能是 "tool"（需调用工具）或 "reasoning"（纯推理/总结/写作）；
+- "tool_name"：action_type="tool" 时必填，且必须逐字取自上方可用工具清单，否则为 null；
+- "tool_args_hint"：工具参数提示（JSON 文本），没有则为 null。
+  只允许填写【规划阶段就能确定】的参数（如查询主题、时间范围、报表标题、文件名）；
+  依赖前序子任务运行结果的参数（如导出报表的正文 content、上游查出的数据）
+  【严禁凭标题编造】——不要写"××数据""××结果"这类占位短语，直接省略该字段
+  （给 {} 或只放已知字段），执行阶段会结合前序真实结果自动补全。
+- "covers_sub_questions"：本子任务覆盖的子问题序号数组（从 1 开始），不确定可填 null。
+示例（仅示意结构，内容按实际目标生成）：
+{"subtasks":[{"id":"task_1","title":"查询7月销售业绩排名","description":"用销售查询工具统计2026年7月各销售/负责人业绩并降序排名","action_type":"tool","tool_name":"sales_sql_query","tool_args_hint":"{\\"question\\":\\"2026年7月销售及负责人业绩排名\\"}","covers_sub_questions":[1]},{"id":"task_2","title":"导出业绩报告","description":"把排名结果导出为报表文件","action_type":"tool","tool_name":"sales_report_export_tool","tool_args_hint":"{}","covers_sub_questions":[2]}]}
+严禁使用 plan / tasks / sub_tasks 等其它顶层键名，严禁自造 step / task / args / params 等字段名。
+"""
+
 PLAN_SYSTEM_PROMPT = """你是规划专家。结合对话历史、长期记忆与可用技能，把用户目标拆解为可执行子任务。
 只输出计划本身，不要解释、Markdown 围栏或思考过程。
 工具选型与参数用法严格依据下方「可用工具清单」中各工具自己的描述，禁止使用清单外的工具。
 取数类工具有失败或返回空数据的可能（鉴权/权限/无记录）：风险明显时在计划中保留一个备用数据源，不要把成败压在单一来源上。
-"""
+""" + PLAN_OUTPUT_CONTRACT
 
 REPLAN_SYSTEM_PROMPT = """你是重规划专家。根据已有执行结果与错误信息，修订剩余子任务。
 已成功完成的子任务从新计划移除，只保留需要重做 / 调整顺序 / 新增的部分。
@@ -186,7 +213,7 @@ REPLAN_SYSTEM_PROMPT = """你是重规划专家。根据已有执行结果与错
 工具选型与参数用法严格依据下方「可用工具清单」中各工具自己的描述。
 - 工具返回【空数据】（非报错）：换另一个可用数据源重新取数，禁止基于空数据编造后续步骤。
 - 工具明确报错：按错误信息修正参数后重试，禁止原样重放已知会失败的调用。
-"""
+""" + PLAN_OUTPUT_CONTRACT
 
 
 '''replan备份：提示词你是一个动态调整与重规划专家。当执行过程中遭遇异常或无法达成预期时，你需要根据当前已有的执行结果以及发生的错误，对剩余的子任务进行修订和重新编排。

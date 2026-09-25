@@ -66,6 +66,44 @@ def parse_resume_decision(value: Any) -> Tuple[bool, str]:
     return False, f"无法识别的审批恢复值: {value!r}"
 
 
+RESUME_APPROVALS_CONFIG_KEY = "resume_approvals"
+
+
+def take_resume_approval_arguments(
+    config: Any,
+    *,
+    tool_name: str,
+    subtask_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """interrupt 恢复重放时，取回首次解析、已展示给人工审批的完整入参。
+
+    LangGraph 恢复时整个节点函数从头重跑。plan 路径若再次执行 hint 直用 /
+    FC 强制取参，非确定性 LLM 可能组出与审批卡片**不同**的入参——实测事故
+    （2026-09-23）：审批正文为 A，批准后 FC 重跑漂移成 B，工具带 B 落盘，
+    人工审批在字段层面被架空。``GraphRunner.resume_stream`` 会把快照里的
+    待处理审批载荷（含完整 ``arguments``，非截断预览）注入
+    ``RunnableConfig["configurable"]["resume_approvals"]``，plan 路径在
+    参数解析之前调用本函数短路，保证"审批所见 = 实际执行"。
+
+    Returns:
+        匹配当前 (tool_name, subtask_id) 的入参**副本**；未注入 / 不匹配 /
+        载荷异常时返回 ``None``（调用方回退正常解析流程，不劣于旧行为）。
+    """
+    configurable = (config or {}).get("configurable") or {}
+    payloads = configurable.get(RESUME_APPROVALS_CONFIG_KEY) or []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("tool_name") != tool_name:
+            continue
+        if payload.get("subtask_id") != subtask_id:
+            continue
+        arguments = payload.get("arguments")
+        if isinstance(arguments, dict) and arguments:
+            return dict(arguments)
+    return None
+
+
 def denied_observation(tool_name: str, comment: str = "") -> str:
     """审批拒绝后回注给模型的 Observation（走正常推理收尾，不触发 replan）。"""
     comment_part: str = f" 审批意见：{comment}" if comment else ""
