@@ -15,6 +15,7 @@
 - [核心特性](#核心特性)
 - [系统架构](#系统架构)
 - [状态图编排](#状态图编排)
+- [流式输出](#流式输出)
 - [技术栈](#技术栈)
 - [目录结构](#目录结构)
 - [快速开始](#快速开始)
@@ -56,6 +57,9 @@
 | 意图识别 Pipeline | 查询改写（多子问题拆分 + 目标锚点产出）、意图聚合分类、向量意图树召回、Plan/ReAct 模式决策 |
 | 状态图编排 | LangGraph `StateGraph`：`prepare → plan → execute ⇄ replan → reflect → summarize → persist`，条件路由为无副作用纯函数 |
 | 执行期控制协议 | 计划台账全貌可见、可跳过指定子任务、可在证据充分时提前收尾；控制指令**复用已有的结论提炼调用**，零额外模型开销 |
+| 证据板（Evidence Board） | 工具观测按类型确定性切分为**证据单元**：jieba + BM25 / 实体 / 结构先验 / 新鲜度固定权重打分 → hash + SimHash + Jaccard 跨轮去重 → 字符预算 + MMR 选择，每轮从全量单元重算证据板；错误块恒保留一行，短观测（≤300 字）限期原文豁免，被省略块可按证据编号 `fetch_evidence` 取回 |
+| 步骤纠偏（Step Correction） | 执行期**就地纠偏**：代码确定性产出候选方向（结构化事实 − 已试路径、工具白名单 − 已用工具），模型只能**选择**不能发明；含零 LLM 的证据缺口检测，纠偏受配额约束且必须留痕 |
+| 逐字流式输出 | LLM 输出经**旁观通道**（ContextVar，对外 HTTP/SSE 契约不变）旁路推送；增量 JSON 抽取器跨 chunk 边界解析 schema 字段，改写与答案阶段均逐字上屏，换候选时下发 `attempt_reset` / 废弃段落标注 |
 | 目标锚点 | 改写阶段产出 `agent_goal`（一句话、≤60 字），在 ReAct 系统段 / 规划提示词 / 子任务台账首行**三处注入同一份内容** |
 | 人工审批（HITL） | 危险工具（写表 / 导报表）执行前 `interrupt` 挂起，图状态落 Redis checkpoint；审批后按 `run_id` 从断点恢复并 SSE 续流 |
 | 检查点与续跑 | `langgraph-checkpoint-redis` 持久化图状态，支持运行快照查询与断点恢复；未配置 Redis 时自动降级为进程内内存后端 |
@@ -74,34 +78,51 @@
 
 ```mermaid
 flowchart LR
-    Client([客户端]) -->|POST /api/v1/chat/with_agent · SSE| API[FastAPI 应用<br/>app/main.py]
+    Client(["客户端"]) -->|"POST /api/v1/chat/with_agent · SSE"| API["FastAPI 应用<br/>app/main.py"]
 
-    subgraph 接入与决策
-      API --> Pipeline[AgentQueryIntentPipeline<br/>改写(含 agent_goal) → 分类 → 模式决策]
-      Pipeline -->|意图 / slots / mode| Orchestrator[AgentOrchestrator<br/>薄门面]
+    subgraph DECISION["接入与决策"]
+        Pipeline["AgentQueryIntentPipeline<br/>改写 + 分类 + 模式决策"]
+        Orchestrator["AgentOrchestrator<br/>薄门面"]
+        API --> Pipeline
+        Pipeline -->|"意图 / slots / mode"| Orchestrator
     end
 
-    subgraph 状态图编排
-      Orchestrator --> Runner[GraphRunner<br/>checkpoint + 门面适配]
-      Runner --> Graph{{LangGraph StateGraph<br/>prepare → plan → execute ⇄ replan<br/>→ reflect → summarize → persist}}
-      Graph --> Deps[deps: per-request GraphDeps]
+    subgraph ORCH["状态图编排"]
+        Runner["GraphRunner<br/>checkpoint + 门面适配"]
+        Graph["LangGraph StateGraph<br/>prepare / plan / execute / replan / reflect / summarize / persist"]
+        Deps["GraphDeps 每请求运行时依赖"]
+        Orchestrator --> Runner
+        Runner --> Graph
+        Graph --> Deps
     end
 
-    subgraph 能力层（经依赖注入消费）
-      Deps --> Tools[ToolRegistry<br/>工具注册中心]
-      Deps --> Memory[MemoryManager<br/>短期+长期]
-      Deps --> Router[ModelRouter<br/>多模型路由/熔断]
-      Deps --> Skills[SkillManager<br/>渐进式披露]
+    subgraph ABILITY["能力层"]
+        Tools["ToolRegistry 工具注册中心"]
+        Memory["MemoryManager 短期 + 长期"]
+        Router["ModelRouter 多模型路由 + 熔断"]
+        Skills["SkillManager 渐进式披露"]
+        Deps --> Tools
+        Deps --> Memory
+        Deps --> Router
+        Deps --> Skills
     end
 
-    subgraph 工具与数据
-      Tools --> RAG[RAGService<br/>向量+BM25+RRF]
-      Tools --> Web[Web / Graph / Excel / Feishu / File]
-      RAG --> MV[(Milvus)] & BM25[(内存 BM25)]
-      Memory --> RD[(Redis)] & MVL[(Milvus 长期记忆)]
+    subgraph DATA["工具与数据"]
+        RAG["RAGService<br/>向量 + BM25 + RRF"]
+        Extra["Web / Graph / SQL / Excel / Feishu / File"]
+        MV[("Milvus")]
+        BM[("内存 BM25")]
+        RD[("Redis")]
+        MVL[("Milvus 长期记忆")]
+        Tools --> RAG
+        Tools --> Extra
+        RAG --> MV
+        RAG --> BM
+        Memory --> RD
+        Memory --> MVL
     end
 
-    Router --> LLM[OpenAI 兼容 LLM<br/>单/多模型]
+    Router --> LLM["OpenAI 兼容 LLM<br/>单模型 / 多模型分层"]
     Pipeline -.-> Router
 ```
 
@@ -124,14 +145,25 @@ flowchart LR
 
 ### 拓扑
 
-```
-START → prepare ─┬─ should_plan ─→ plan ─→ execute ◀──────┐
-                 └──────────────→ execute ──▲              │
-                                        (ReAct 自环)       │
-replan  ─→ execute | summarize                             │
-reflect ─→ execute | summarize                             │
-summarize ─┬─ 证据不足且仍有余量 ─→ replan ────────────────┘
-           └─ 否则 ─→ persist → END
+```mermaid
+flowchart TD
+    S(["START"]) --> prepare["prepare<br/>组装系统提示 / 技能摘要 / 记忆"]
+    prepare --> rp{"route_after_prepare"}
+    rp -->|"should_plan"| plan["plan<br/>产出子任务计划"]
+    rp -->|"ReAct 态"| execute
+    plan --> execute["execute<br/>工具执行 + 结论提炼"]
+    execute --> re{"route_after_execute"}
+    re -->|"还有下一子任务 / 未达步数上限"| execute
+    re -->|"已有 Final Answer"| reflect["reflect<br/>可选质量门，默认关闭"]
+    re -->|"计划全坏且仍有重规划余量"| replan["replan<br/>补取证据"]
+    re -->|"本轮完成 / 兜底收尾"| summarize["summarize<br/>证据充分性 + 生成答案"]
+    replan -->|"新计划有效"| execute
+    replan -->|"失败或返回空计划"| summarize
+    reflect -->|"不通过且未超重试上限"| execute
+    reflect -->|"通过 / 超出重试"| summarize
+    summarize -->|"方向性错误且仍有候选"| replan
+    summarize -->|"证据充分"| persist["persist<br/>短期落库 + 长期异步沉淀"]
+    persist --> E(["END"])
 ```
 
 | 节点 | 职责 |
@@ -158,6 +190,39 @@ summarize ─┬─ 证据不足且仍有余量 ─→ replan ──────
 
 **提前收尾不绕过质量闸门**：剩余子任务被归一为"全部跳过"，但证据充分性判定仍在 `summarize` 执行，判定不足时依旧会 `replan` 补取——这不是绕过质量，只是不再执行冗余步骤。
 
+### 步骤纠偏（Step Correction）
+
+**问题**：一条真实 trace 里，两次重规划共占 **20,041 输入字符（全部输入的 53.5%）**，但它们要解决的其实是**步级**问题——某个子任务读了技能文档、摘要丢掉了其中的路径，于是重规划只能盲猜目录，连续两次扫 `/data` 均为空。根因不是"模型不聪明"，而是**纠偏通道缺一个输入**：重规划的输入里没有"可用的替代方向"，模型只能发明方向，而它发明的正是一个已被同一份输入证否的路径。
+
+**对策**：把纠偏从"**发明方向**"降级为"**在候选里选**"。
+
+- **系统侧**确定性产出候选集：① 已提取的结构化事实（数据资产及其位置）减去本轮已试路径；② 当前工具白名单减去本轮已用工具。候选必须与白名单求交，**已证否的方向结构性剔除**，总长受上限约束。
+- **模型侧**只输出所选候选的标识或"不选"，**MUST NOT** 自行构造工具名 / 参数 / 路径；系统负责把标识翻译为具体动作并应用到计划。
+- **只在需要时注入**：本步取数未取得有效数据，或上一步自评为未解决 / 部分解决。正常成功的步骤不注入（候选列表约 300 字符）。
+- **零 LLM 的证据缺口检测**：问题侧核心词在本步返回内容中的覆盖率低于阈值即置位，作为开放纠偏通道的补充触发条件——核心词取自系统已有的结构化文本，不新增模型调用、不引入向量化。
+- **受配额约束**，只改 cursor 之后的计划项，且必须留痕。
+
+> 这也修正了"仅失败态才纠偏"的原设想：本类 trace 的典型失败恰恰是**取到了数据但数据不对**（返回销售记录，问题问的是行业优先级），这种情形在原触发条件下根本不会开放纠偏通道。
+
+### 证据板（Evidence Board）
+
+**问题**：ReAct 多轮工具调用中，原始观测（尤其 RAG 每轮 5 条长片段）逐字累积进消息历史、每轮重发，实测 3 轮检索后最终答案轮的 input 已达约 5000 token，且随轮次线性膨胀。原有的 `compact_tool_observations` 是纯**位置型硬截断**（最近 3 条全文、更早的压成 200 字首段），**不看内容**——关键证据只要不在最近 3 条、或不在块首部，就会丢失。
+
+**对策**：一条**确定性证据管道**（零 LLM 调用；任何环节异常时自动降级回原压缩策略，主链路不中断）：
+
+1. **切分** —— 每次工具观测产生后，按工具类型确定性切分为统一的证据单元（Unit），只切分不改写；
+2. **打分** —— jieba 词项 + 自实现 BM25 / 实体 / 结构先验 / 新鲜度的固定权重；
+3. **去重** —— 精确 hash + SimHash + 短文本 Jaccard 跨轮去重；
+4. **选择** —— 按轮收紧的字符预算 + MMR，每轮从全量 Unit 重算证据板。
+
+三条保真机制保证"压缩不等于丢证据"：
+
+- 错误 / 状态块不参与打分但**恒保留一行**；低分块保留"一行索引"，失败与被省略的内容仍然可感知；
+- **短观测豁免**：整条观测 ≤300 字符时不切分、不打分，整体作为豁免单元原文发送并保留 3 轮（不占证据板预算），超期收敛为一行桩（工具名 + 原始字符数 + 证据编号 + 首句预览）；
+- **按需回取**：`fetch_evidence` 用证据编号取回被省略块原文或相邻块，**只读本请求已保存的观测、不重新调用外部工具**（仅在 ReAct 路径注入，不注册为业务工具）；plan_execute 则走**延迟一步回取**——子任务提炼输出新增独立字段 `requested_evidence_uids`（与选择候选资产的 `selected_alternative_id` 语义分离），节点据此插入一个不调外部工具的内部恢复步，复用既有纠偏配额与闸门，每个子任务最多恢复一次。
+
+原始观测仍全文保存在现有 state 中，**不引入新存储**；对外 HTTP / SSE API 与工具注册表均不变。同时新增每轮 trace 埋点（上板数 / 字符数 / 判重 / 低相关 / 无新增 / 回取 / 豁免 / 延迟恢复），用于在真实会话里验证压缩率与召回率。
+
 ### 人工审批与检查点
 
 危险工具（由 `AGENT_DANGER_TOOLS` 指定，默认 `sales_sql_write,sales_report_export_tool`）在**真正执行之前**命中闸门：
@@ -166,7 +231,33 @@ summarize ─┬─ 证据不足且仍有余量 ─→ replan ──────
 2. 本次工具**未执行、预算未扣**，`execute` 节点不返回任何 state 更新；
 3. 客户端拿到 `awaiting_approval` 事件后，调用 `POST /agent/runs/{run_id}/approval` 提交审批决定，`GraphRunner.resume()` 从断点重建依赖并续跑，SSE 继续推送。
 
-总开关默认关闭（`AGENT_APPROVAL_ENABLED=false`），此时该闸门直接放行，线上行为与未引入审批时完全一致。
+总开关默认**开启**（`AGENT_APPROVAL_ENABLED=true`）；置为 `false` 时该闸门直接放行，线上行为与未引入审批时完全一致。
+
+## 流式输出
+
+最终答案与**过程回显**走同一条 SSE 通道，但语义不同：答案是"结论"，改写与执行过程是"过程性回显"。
+
+### 逐字流式：旁观通道
+
+模型输出并不直接暴露给 HTTP 层，而是经过一条**旁观通道**——LLM 调用器在收流时把增量文本 emit 进 `ContextVar`，SSE 生成器以旁观者身份订阅。这样做的收益是**对外契约不变**：`ModelRouter.chat` 的返回结构不动，图节点也完全不需要感知"自己正在被流式"。
+
+链路上四个关键部件：
+
+| 部件 | 职责 |
+|------|------|
+| 旁观通道 | `ContextVar` + 安全 emit；无订阅者时零开销 |
+| 增量 JSON 抽取器 | 在流式 chunk 里**跨边界**抽取 schema 字段（含转义处理），让"改写 / 分类"这类 JSON 输出也能逐字上屏 |
+| 显示层文本分流 | 区分 JSON / 草稿 / `Final Answer` / 纯文本，抑制不该暴露的中间态 |
+| tool_calls 增量聚合 | 聚合分片的工具参数；遇到不支持流式参数的老网关**自动回落**为非流式 |
+
+### 换候选时的前端语义
+
+多模型路由会在候选失败时切换模型，此时**已推给前端的半截文本无法收回**，只能靠标记让前端丢弃：
+
+- **改写阶段**（过程性回显）→ 直接下发 `{"phase":"rewrite","attempt_reset":true}`，前端清空该段；
+- **答案阶段**（已是可见内容）→ 移入"废弃段落"并划线标注，而不是清空——用户能看到"这一版被换掉了"。
+
+分流器在换候选时**先复位再判定模式**，避免旧 `_raw` 污染新模式判断（旧内容若以 `{` 开头，会把新尝试锁死在 JSON 模式）。
 
 ---
 
@@ -211,14 +302,20 @@ Enterprise_aiagent/
 │   │   │   │   ├── state.py         #   AgentGraphState（TypedDict + reducer）
 │   │   │   │   ├── checkpoint.py    #   Redis / 内存 checkpointer
 │   │   │   │   ├── approval.py      #   人工审批闸门与载荷解析
+│   │   │   │   ├── replan_gate.py   #   重规划的 L2 规则闸门
 │   │   │   │   ├── deps.py          #   每请求运行时依赖（不进 state）
 │   │   │   │   └── nodes/           #   prepare / plan / execute / replan / reflect / summarize / persist
+│   │   │   ├── evidence/            # 证据板：切分 / 打分 / 去重 / 选择 / 回取
+│   │   │   ├── step_correction.py   # 执行期步骤纠偏（候选方向 + 证据缺口检测）
+│   │   │   ├── stream_sink.py       # LLM 输出旁观通道（ContextVar + 安全 emit）
+│   │   │   ├── delta_extract.py     # 增量 JSON 字段抽取器
 │   │   │   ├── planner.py           # 规划能力（被 plan / replan 节点复用）
 │   │   │   ├── react_agent.py       # 工具结果后处理与工具接口协议（ReAct 执行逻辑已入图节点）
 │   │   │   └── toolcall.py          # 工具调用统一结构（FC 与文本协议共用）
 │   │   ├── rag/                     # RAGService / HybridRetriever / BM25 / parse
 │   │   ├── memory/                  # 短期(Redis) / 长期(Milvus) / 管理器
 │   │   ├── tools/                   # 工具注册中心 + 内置工具（builtin/）
+│   │   ├── sales_db/                # 销售业务库：schema / seed / 口径知识 / Vanna 训练
 │   │   ├── skill/                   # 技能管理器（渐进式披露）
 │   │   ├── chat_recognizer/         # 意图识别（标准对话用）
 │   │   └── backends/                # 虚拟/物理文件系统后端
@@ -227,6 +324,7 @@ Enterprise_aiagent/
 │   ├── llm_model_router/            # 多模型路由器（熔断/选择/执行/校验）
 │   ├── query_intent/                # 意图 Pipeline（改写/分类/决策/引导/结构化 Schema）
 │   └── models/                      # Pydantic 领域模型与枚举
+├── web/                             # React 前端控制台（Vite + TS + Tailwind，构建产物由后端托管）
 ├── skills/                          # 高级技能（每个子目录一个 SKILL.md）
 ├── evals/                           # 评测：黄金集 + 指标 + 报告 + 门禁
 │   ├── golden/                      #   意图 / RAG / 工具黄金集与语料清单
@@ -236,8 +334,16 @@ Enterprise_aiagent/
 ├── benchmark/                       # 压测：locust 场景 + mock LLM 服务 + 熔断专项
 ├── monitoring/                      # 监控：成本计算 + Langfuse 日报 + 评测评分回推
 ├── docs/                            # 使用文档（评测/压测/监控/优化纪要）与技术提案
-├── openspec/                        # 规范驱动变更：proposals / designs / tasks / specs
-├── 测试/                             # 状态图、控制协议、台账、目标注入等单测
+├── openspec/                        # 规范驱动变更：proposals / designs / tasks / specs（已完成变更归档在 changes/archive/）
+├── 测试/                             # 单测，按变更提案分目录
+│   ├── plan-execute-control/        #   计划执行控制（跳过 / 提前收尾 / 台账）
+│   ├── replan-and-step-correction/  #   重规划与步骤纠偏
+│   ├── evidence-board/              #   证据板管道与按需回取
+│   ├── llm-token-streaming/         #   逐字流式（旁观通道 / 增量抽取 / 分流）
+│   ├── excel-to-sqlite/             #   业务库取数（Vanna）与 SQLite 存储
+│   ├── agent-goal/ query-rewrite/ kb-collection/ frontend-console/
+│   └── shared/                      #   跨提案共用夹具（如状态机）
+├── outputs/sales_reports/           # 报表导出产物（运行时生成）
 ├── rag_data/ rag_data_enterprise/ rag_data_graph/   # 示例语料（含图谱语料）
 ├── .github/workflows/eval.yml       # 评测门禁 CI
 ├── Dockerfile
@@ -372,7 +478,9 @@ Embedding 模型固定为 DashScope `text-embedding-v3`（dim=1024），**不进
 | `AGENT_CHECKPOINT_TTL_SECONDS` | `86400` | 检查点 TTL（秒） |
 | `AGENT_CHECKPOINT_PREFIX` | `agent_cp` | Redis key 前缀（多服务共库隔离） |
 | `AGENT_EVIDENCE_GATE_ENABLED` | `true` | 汇总阶段的证据充分性闸门；不足时触发重规划补取 |
-| `AGENT_APPROVAL_ENABLED` | `false` | 危险工具人工审批总开关；关闭时闸门直接放行 |
+| `ENABLE_EVIDENCE_BOARD` | `true` | 证据板总开关；开启后模型只见按相关性选出的证据块 + 索引（默认预算约 2400 字），ReAct 可按证据编号回取 |
+| `MAX_REPLAN_ATTEMPTS` | `1` | 最大重规划次数；已由 2 收窄为 1，步级问题改由执行期就地纠偏消化 |
+| `AGENT_APPROVAL_ENABLED` | `true` | 危险工具人工审批总开关，**默认开启**；置 false 时闸门直接放行 |
 | `AGENT_DANGER_TOOLS` | `sales_sql_write,sales_report_export_tool` | 需人工审批的工具名单（逗号分隔） |
 | `AGENT_REFLECT_ENABLED` | `false` | 反思质量门；开启后不通过会回到 `execute` 重试 |
 | `AGENT_REFLECT_MIN_SCORE` | `60` | 反思质量门通过分数线 |
@@ -414,6 +522,15 @@ data: {"content": "根", "trace_id": "..."}
 data: {"content": "据显示", "trace_id": "..."}
 ...
 data: {"done": true, "status": "success", "session_id": "sess_001", "trace_id": "..."}
+```
+
+过程回显（逐字流式）与答案流并行下发，`phase` 区分阶段：
+
+```
+data: {"delta": {"phase": "rewrite", "text": "上季度华东"}}
+data: {"delta": {"phase": "rewrite", "attempt_reset": true}}   # 换候选：清空该段
+data: {"delta": {"phase": "answer",  "text": "销售"}}
+data: {"delta": {"phase": "answer",  "abandoned": true}}       # 换候选：该段划线保留
 ```
 
 命中人工审批时，流以如下事件收尾（同一 `run_id` 继续审批）：
@@ -627,7 +744,7 @@ pytest 测试 evals benchmark -q
 
 项目约定：
 - 配置一律走 `app/config.py`，不散落硬编码；复杂字段（LLM 列表 / Tier）以 `str` 存、以 `*_parsed` 属性取。
-- 全局单例（ModelRouter / RAG / 技能树 / 意图向量索引 / GraphRunner）在 `lifespan` 中构建并挂到 `app.state`，请求期经 FastAPI `Depends` 注入。
+- 全局单例（ModelRouter / RAG / 技能树 / 意图向量索引 / GraphRunner）在 `lifespan` 中构建并挂到 `app.state`，请求期经 FastAPI `Depends` 注入。工具注册中心与 GraphRunner 另在**启动后台预热**——首个请求不再承担 lightrag / torch / sentence-transformers 的导入成本（原先实测可被卡住 30~40s），预热未完成时依赖侧仍保留懒构建兜底。
 - **运行时依赖不进图状态**：新增一个节点需要用到的依赖，请加到 `GraphDeps`，而不是 `AgentGraphState`——否则会污染 checkpoint 序列化。
 - 图的条件路由写成**无副作用纯函数**，便于单测；节点是否暂停由 `runner` 依据 checkpoint 快照判定，与路由无关。
 - Embedding 固定单模型，不进路由；Chat 模型统一走 `ModelRouter`。
